@@ -940,16 +940,35 @@ function revealNav() {
 new MutationObserver(() => requestAnimationFrame(revealNav)).observe($("[data-nav]"), { attributes: true, attributeFilter: ["aria-current"], subtree: true });   // route() marks the page; follow it
 window.addEventListener("resize", revealNav);
 sideBtn.addEventListener("click", () => setTimeout(revealNav, 250));
-// Wheel over the sidebar never scrolls the page: phone top bar = vertical wheel scrolls the row sideways;
-// desktop = only the nav list scrolls (contain), the head and footer swallow the wheel.
+// Desktop: the wheel over the sidebar's head or footer must not scroll the page (the nav list scrolls natively).
 sideRoot.addEventListener("wheel", (e) => {
-  const nav = $("[data-nav]");
-  if (matchMedia("(max-width: 760px)").matches) {
-    if (!nav.contains(e.target) || nav.scrollWidth <= nav.clientWidth || Math.abs(e.deltaX) >= Math.abs(e.deltaY)) return;
-    e.preventDefault();
-    nav.scrollLeft += e.deltaY;
-  } else if (!nav.contains(e.target)) e.preventDefault();
+  if (!matchMedia("(max-width: 760px)").matches && !$("[data-nav]").contains(e.target)) e.preventDefault();
 }, { passive: false });
+// Fade the nav's top/bottom edge while more pages are hidden there, so it is obvious the list scrolls.
+function navHint() {
+  const n = $("[data-nav]");
+  n.classList.toggle("more-above", n.scrollTop > 2);
+  n.classList.toggle("more-below", n.scrollTop + n.clientHeight < n.scrollHeight - 2);
+}
+$("[data-nav]").addEventListener("scroll", navHint, { passive: true });
+window.addEventListener("resize", navHint);
+new ResizeObserver(navHint).observe($("[data-nav]"));
+// Small screens: the Menu button opens the grouped page list as a drawer; picking a page, Esc or resizing closes it.
+const menuBtn = $("[data-side-menu]");
+function setMenu(open) {
+  sideRoot.classList.toggle("is-open", open);
+  document.body.classList.toggle("nav-open", open);
+  menuBtn.setAttribute("aria-expanded", String(open));
+  menuBtn.setAttribute("aria-label", open ? "Close the page menu" : "Open the page menu");
+  if (open) { requestAnimationFrame(() => { revealNav(); navHint(); $("[data-nav] a[aria-current=page]")?.focus({ preventScroll: true }); }); }
+}
+menuBtn.addEventListener("click", () => setMenu(!sideRoot.classList.contains("is-open")));
+$("[data-nav]").addEventListener("click", (e) => { if (e.target.closest("a")) setMenu(false); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && sideRoot.classList.contains("is-open")) { setMenu(false); menuBtn.focus(); } });
+matchMedia("(max-width: 760px)").addEventListener("change", () => setMenu(false));
+// the Menu button names the current page
+new MutationObserver(() => { const c = $("[data-nav] a[aria-current=page] .lbl"); $("[data-side-current]").textContent = c ? c.textContent : "Menu"; })
+  .observe($("[data-nav]"), { attributes: true, attributeFilter: ["aria-current"], subtree: true });
 
 // ---------------------------------------------------------------- router
 // ---------------------------------------------------------------- Proxy page: named hosts through nginx (vexor proxy)
