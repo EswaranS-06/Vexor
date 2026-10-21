@@ -497,14 +497,262 @@ async function vLogins() {
   };
 }
 
+// ---------------------------------------------------------------- map
+// Live map of the project's containers from /api/map: role layers top to bottom, edges only for connections the
+// server saw in /proc. Polls every 3 s while the page is visible and #map is open.
+const MAP_LAYERS = [
+  ["external", "Outside the project"], ["edge", "Edge"], ["ingest", "Managers and ingest"], ["data", "Indexers and storage"],
+  ["ui", "Dashboards"], ["tools", "Tools"], ["other", "Other containers"],
+];
+const MAP_STATUS = { ok: "running", issue: "issue", offline: "offline", missing: "missing" };
+const SVG_NS = "http://www.w3.org/2000/svg";
+let mapTimer = null, mapGen = 0, mapData = null, mapSel = null, mapRO = null;
+function stopMap() { clearTimeout(mapTimer); mapTimer = null; mapGen++; mapRO?.disconnect(); mapRO = null; }
+function mapLayer(n) {
+  const s = n.service || "";
+  if (n.id === "external") return "external";
+  if (/nginx|proxy/.test(s)) return "edge";
+  if (/^wazuh\d*\.(master|worker)$|^logstash/.test(s)) return "ingest";
+  if (/indexer$|^elasticsearch/.test(s)) return "data";
+  if (/dashboard$|^kibana/.test(s)) return "ui";
+  if (/^(n8n|grafana|portainer|suricata|zeek)/.test(s)) return "tools";
+  return "other";
+}
+const fmtRate = (b) => (b == null ? "–" : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB/s" : b >= 1e3 ? (b / 1e3).toFixed(1) + " KB/s" : Math.round(b) + " B/s");
+const nodeRate = (n) => (n?.traffic && n.traffic.rxRate != null ? n.traffic.rxRate + n.traffic.txRate : null);
+function nodeStateText(n) {
+  if (n.status === "missing") return "no container";
+  if (n.state === "exited") return `exited (${n.exitCode ?? "?"})`;
+  return n.state + (n.health ? ` · ${n.health}` : "");
+}
+function nodeRateText(n) {
+  if (!n.traffic) return n.status === "ok" || n.status === "issue" ? (n.note ? "host network" : "no counters") : "";
+  if (n.traffic.rxRate == null) return "measuring…";
+  return `↓${fmtRate(n.traffic.rxRate)} ↑${fmtRate(n.traffic.txRate)}`;
+}
+
+function mapLayout(d, W) {
+  const narrow = W < 560;
+  const nw = narrow ? Math.min(168, Math.floor((W - 26) / 2)) : 168, nh = narrow ? 58 : 64, gx = narrow ? 10 : 22, pad = narrow ? 8 : 16, labelH = 20, gapY = narrow ? 34 : 44, cg = narrow ? 24 : 32;
+  const ext = d.external || {};
+  const nodes = [...d.nodes];
+  if ((ext.inbound || 0) + (ext.outbound || 0) > 0) nodes.unshift({ id: "external", service: "External", status: "external", external: ext });
+  const perRow = Math.max(1, Math.floor((W - 2 * pad + gx) / (nw + gx)));
+  const pos = {}, labels = [];
+  let y = pad;
+  for (const [lid, label] of MAP_LAYERS) {
+    const row = nodes.filter((n) => mapLayer(n) === lid);
+    if (!row.length) continue;
+    labels.push({ y: y + 12, label });
+    let above = y - gapY / 2;            // middle of the gap above the row: where routed edges run sideways
+    y += labelH;
+    for (let i = 0; i < row.length; i += perRow) {
+      const chunk = row.slice(i, i + perRow), more = i + perRow < row.length;
+      const span = chunk.length * nw + (chunk.length - 1) * gx;
+      let x = Math.max(pad, (W - span) / 2);
+      const below = y + nh + (more ? cg : gapY) / 2;
+      for (const n of chunk) { pos[n.id] = { x, y, w: nw, h: nh, n, above, below }; x += nw + gx; }
+      y += nh + (more ? cg : gapY);
+      above = y - cg / 2;
+    }
+  }
+  return { pos, labels, W, H: Math.max(y - gapY + pad, 120), narrow };
+}
+
+function roundedPath(pts, r = 10) {
+  let d = `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const [px, py] = pts[i - 1], [cx, cy] = pts[i], [nx, ny] = pts[i + 1];
+    const d1 = Math.hypot(cx - px, cy - py), d2 = Math.hypot(nx - cx, ny - cy), rr = Math.min(r, d1 / 2, d2 / 2);
+    if (!d1 || !d2) continue;
+    const b = [cx - ((cx - px) / d1) * rr, cy - ((cy - py) / d1) * rr], a = [cx + ((nx - cx) / d2) * rr, cy + ((ny - cy) / d2) * rr];
+    d += ` L${b[0].toFixed(1)},${b[1].toFixed(1)} Q${cx.toFixed(1)},${cy.toFixed(1)} ${a[0].toFixed(1)},${a[1].toFixed(1)}`;
+  }
+  const z = pts[pts.length - 1];
+  return d + ` L${z[0].toFixed(1)},${z[1].toFixed(1)}`;
+}
+
+function drawMap(d) {
+  const wrap = $("[data-map-wrap]");
+  if (!wrap) return;
+  const W = Math.max(300, Math.round(wrap.clientWidth));
+  const L = mapLayout(d, W);
+  const live = (id) => (id === "external" ? true : (nodeRate(L.pos[id]?.n) || 0) > 0);
+  // one drawn edge per client -> server pair; ports and counts are summed into it
+  const pairs = {};
+  for (const e of d.edges || []) {
+    if (!L.pos[e.from] || !L.pos[e.to]) continue;
+    const k = e.from + "\u0000" + e.to;
+    (pairs[k] ||= { from: e.from, to: e.to, count: 0, ports: [] });
+    pairs[k].count += e.count;
+    pairs[k].ports.push(`${e.port}${e.proto === "udp" ? "/udp" : ""}${e.count > 1 ? " ×" + e.count : ""}`);
+  }
+  const lanes = { l: 0, r: 0 };
+  const edgeSvg = Object.values(pairs).map((p) => {
+    const a = L.pos[p.from], b = L.pos[p.to];
+    const back = pairs[p.to + "\u0000" + p.from] ? (p.from < p.to ? -6 : 6) : 0;
+    const ax = a.x + a.w / 2 + back, bx = b.x + b.w / 2 + back;
+    let path, mx, my;
+    if (Math.abs(a.y - b.y) < 1) {          // same row: arc over the top
+      const y0 = a.y, lift = Math.min(40, 14 + Math.abs(ax - bx) / 6);
+      path = `M${ax},${y0} C${ax},${y0 - lift} ${bx},${y0 - lift} ${bx},${y0 - 3}`;
+      mx = (ax + bx) / 2; my = y0 - lift * 0.75;
+    } else {
+      const down = b.y > a.y;
+      const [top, bot] = down ? [a, b] : [b, a];
+      const tx = down ? ax : bx, bx2 = down ? bx : ax;
+      const between = Object.values(L.pos).filter((q) => q.y > top.y + 1 && q.y < bot.y - 1);
+      if (!between.length) {                 // neighbouring rows: one curve
+        const y1 = down ? a.y + a.h : a.y, y2 = down ? b.y - 3 : b.y + b.h + 3, ym = (y1 + y2) / 2;
+        path = `M${ax},${y1} C${ax},${ym} ${bx},${ym} ${bx},${y2}`;
+        mx = (ax + bx) / 2; my = ym;
+      } else {                               // rows in between: run down a lane beside them, never through a node
+        const right = (ax + bx) / 2 >= L.W / 2;
+        const k = right ? lanes.r++ : lanes.l++;
+        const lx = Math.min(L.W - 3, Math.max(3, right ? Math.max(...between.map((q) => q.x + q.w)) + 12 + k * 7 : Math.min(...between.map((q) => q.x)) - 12 - k * 7));
+        let pts = [[tx, top.y + top.h + (down ? 0 : 3)], [tx, top.below], [lx, top.below], [lx, bot.above], [bx2, bot.above], [bx2, bot.y - (down ? 3 : 0)]];
+        if (!down) pts = pts.reverse();
+        path = roundedPath(pts);
+        mx = lx; my = (top.below + bot.above) / 2;
+      }
+    }
+    const isLive = live(p.from) && live(p.to);
+    const w = Math.min(7, 1.25 + Math.log2(p.count + 1) * 1.3).toFixed(2);
+    const title = `${a.n.service} → ${b.n.service}: ${p.ports.join(", ")} (${p.count} established)`;
+    return `<g class="medge ${isLive ? "is-live" : ""}"><title>${esc(title)}</title>
+      <path class="medge__line" d="${path}" stroke-width="${w}" marker-end="url(#map-arrow)"/>
+      ${L.narrow ? "" : `<text class="medge__lbl" x="${mx.toFixed(1)}" y="${(my + 4).toFixed(1)}" text-anchor="middle">${esc(p.ports.slice(0, 2).join(", ") + (p.ports.length > 2 ? " …" : ""))}</text>`}</g>`;
+  }).join("");
+  const cut = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+  const nodeSvg = Object.values(L.pos).map(({ x, y, w, h, n }) => {
+    const ext = n.id === "external";
+    const l2 = ext ? `${n.external.inbound} in · ${n.external.outbound} out` : nodeStateText(n);
+    const l3 = ext ? `${n.external.peers} peer${n.external.peers === 1 ? "" : "s"}` : nodeRateText(n);
+    const badge = !ext && n.restarts > 0 ? `<g class="mnode__badge"><rect x="${w - 34}" y="-9" width="40" height="18" rx="9"/><text x="${w - 14}" y="4" text-anchor="middle">↻${n.restarts}</text></g>` : "";
+    const room = w - 16;             // characters that fit: mono name ~7.6 px, body text ~6 px, mono rate ~6.4 px
+    return `<g class="mnode mnode--${n.status} ${mapSel === n.id ? "is-sel" : ""}" transform="translate(${x.toFixed(1)},${y.toFixed(1)})" data-node="${esc(n.id)}" tabindex="0" role="button" aria-label="${esc(n.service + ": " + (MAP_STATUS[n.status] || "outside connections") + ", " + l2)}">
+      <rect class="mnode__box" width="${w}" height="${h}" rx="6"/><rect class="mnode__bar" width="4" height="${h}" rx="2"/>
+      <text class="mnode__name" x="12" y="${L.narrow ? 18 : 20}">${esc(cut(n.service, Math.floor((room - (n.restarts > 0 ? 34 : 0)) / 7.6)))}</text>
+      <text class="mnode__st" x="12" y="${L.narrow ? 34 : 38}">${esc(cut(l2, Math.floor(room / 6)))}</text>
+      <text class="mnode__rate" x="12" y="${L.narrow ? 49 : 54}">${esc(cut(l3, Math.floor(room / 6.4)))}</text>${badge}</g>`;
+  }).join("");
+  const svg = $("[data-map-svg]");
+  svg.setAttribute("viewBox", `0 0 ${L.W} ${L.H}`);
+  svg.setAttribute("height", L.H);
+  svg.innerHTML = `<defs><marker id="map-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" class="medge__head"/></marker></defs>
+    ${L.labels.map((l) => `<text class="mlayer" x="${L.narrow ? 8 : 16}" y="${l.y}">${esc(l.label.toUpperCase())}</text>`).join("")}
+    <g>${edgeSvg}</g><g>${nodeSvg}</g>`;
+}
+
+function mapSummary(d) {
+  const ns = d.nodes, by = (s) => ns.filter((n) => n.status === s).length;
+  const rates = ns.filter((n) => n.traffic);
+  const measured = rates.filter((n) => n.traffic.rxRate != null);
+  const rx = measured.reduce((a, n) => a + n.traffic.rxRate, 0), tx = measured.reduce((a, n) => a + n.traffic.txRate, 0);
+  const ext = d.external || {};
+  $("[data-map-sum]").innerHTML = [
+    pill(`${ns.filter((n) => n.state === "running").length} running`, "ok"),
+    by("issue") ? pill(`${by("issue")} issue${by("issue") > 1 ? "s" : ""}`, "warn") : pill("0 issues"),
+    by("offline") + by("missing") ? pill(`${by("offline")} offline · ${by("missing")} missing`, "bad") : pill("0 offline"),
+    rates.length ? pill(measured.length ? `in ${fmtRate(rx)} · out ${fmtRate(tx)}` : "rates: measuring…") : "",
+    d.limits ? "" : pill(`external: ${ext.inbound || 0} in · ${ext.outbound || 0} out`),
+  ].join(" ");
+  $("[data-map-nets]").textContent = d.networks.length ? `Project ${d.project} · networks: ${d.networks.map((n) => `${n.name} (${n.containers})`).join(", ")}` : `Project ${d.project}`;
+  const lim = $("[data-map-limits]");
+  lim.hidden = !d.limits;
+  lim.textContent = d.limits || "";
+}
+
+function mapPanel(d) {
+  const panel = $("[data-map-panel]");
+  const n = mapSel === "external" ? { id: "external" } : d.nodes.find((x) => x.id === mapSel);
+  if (!n) { panel.innerHTML = `<p class="muted small">Select a container on the map to see its state, networks, ports and connections.</p>`; return; }
+  const dl = (rows) => `<dl class="kv">${rows.filter(([, v]) => v !== "" && v != null).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("")}</dl>`;
+  const name = (id) => esc(id === "external" ? "External" : d.nodes.find((x) => x.id === id)?.service || id);
+  if (n.id === "external") {
+    const ext = d.external || {};
+    const rows = d.nodes.flatMap((x) => (x.connections || []).filter((c) => c.peer === "external").map((c) => ({ ...c, svc: x.service })));
+    panel.innerHTML = `<h2>External</h2><p class="muted small">Connections to and from addresses outside the project's networks: agents, browsers, other hosts. Connections through a published port can show the Docker gateway as their address.</p>
+      ${dl([["Inbound", ext.inbound], ["Outbound", ext.outbound], ["Peers", ext.peers], ["Ports", esc(Object.entries(ext.ports || {}).map(([p, c]) => `${p} ×${c}`).join(", "))]])}
+      <h3>Connections</h3><ul class="conns">${rows.map((c) => `<li><span>${c.dir === "in" ? "in → " + esc(c.svc) : esc(c.svc) + " → out"} :${c.port}${c.proto === "udp" ? "/udp" : ""}</span><span class="muted">${c.count} · ${esc(c.ips.join(", "))}</span></li>`).join("") || '<li class="muted">None.</li>'}</ul>`;
+    return;
+  }
+  const t = n.traffic;
+  const svc = n.service;
+  const conns = n.connections;
+  panel.innerHTML = `<h2>${esc(svc)}</h2>
+    <p>${pill(MAP_STATUS[n.status] || n.status, { ok: "ok", issue: "warn", offline: "bad", missing: "bad" }[n.status])} ${n.reasons?.length ? `<span class="small">${esc(n.reasons.join("; "))}</span>` : ""}</p>
+    ${dl([["Container", esc(n.name)], ["State", esc(n.state)], ["Health", esc(n.health || "no healthcheck")], ["Restarts", n.restarts],
+      ["Exit code", n.state === "running" || n.exitCode == null ? "" : esc(n.exitCode)], ["Out of memory", n.oom ? "yes, OOM-killed" : ""],
+      ["Started", n.startedAt && !n.startedAt.startsWith("0001") ? esc(new Date(n.startedAt).toLocaleString()) : ""],
+      ["Image", n.image ? `<span class="mono small">${esc(n.image)}</span>` : ""],
+      ["Networks", (n.networks || []).map((x) => `<span class="mono small">${esc(x.name)} ${esc(x.ip || "")}${x.ip6 ? " " + esc(x.ip6) : ""}</span>`).join("<br>") || (n.networkMode === "host" ? "host" : "")],
+      ["Listening", n.listening ? esc(n.listening.map((l) => l.port + (l.proto === "udp" ? "/udp" : "")).join(", ") || "none") : ""],
+      ["Received", t ? `${esc(fmtBytes(t.rxBytes))} · ${esc(t.rxRate == null ? "rate on next sample" : fmtRate(t.rxRate))}` : ""],
+      ["Sent", t ? `${esc(fmtBytes(t.txBytes))} · ${esc(t.txRate == null ? "rate on next sample" : fmtRate(t.txRate))}` : ""],
+      ["Errors / drops", t ? `rx ${t.rxErrors} / ${t.rxDrops} · tx ${t.txErrors} / ${t.txDrops}` : ""]])}
+    ${n.note ? `<p class="muted small">${esc(n.note)}</p>` : ""}
+    ${conns ? `<h3>Connections</h3><ul class="conns">${conns.map((c) => `<li><span>${c.dir === "in" ? "← from" : "→ to"} ${name(c.peer)} :${c.port}${c.proto === "udp" ? "/udp" : ""}</span><span class="muted">${c.count}${c.ips ? " · " + esc(c.ips.join(", ")) : ""}</span></li>`).join("") || '<li class="muted">No established connections.</li>'}</ul>` : ""}
+    <div class="actions">${btn("Logs", ["logs", svc, "-n", "200"])}${n.state === "running" ? btn("Restart", ["restart", svc]) : btn("Start", ["start", svc], "btn--primary")}</div>`;
+  bindRunButtons(panel);
+}
+
+async function vMap() {
+  setTitle("Map", `<span class="muted small" data-map-age></span>`);
+  stopMap();
+  const gen = mapGen;
+  view().innerHTML = `
+    <p class="lede">Vexor's containers, their networks and the connections between them, read live from Docker and each container's network namespace. Lines appear only for connections that are open now; they move while both ends carry traffic.</p>
+    <div class="map-sum" data-map-sum><span class="muted">Loading the map…</span></div>
+    <p class="map-limits" data-map-limits hidden></p>
+    <div class="map-layout">
+      <figure class="map-canvas" data-map-wrap><svg class="map-svg" data-map-svg role="group" aria-label="Container map" width="100%"></svg></figure>
+      <aside class="map-panel" data-map-panel aria-live="polite"></aside>
+    </div>
+    <p class="muted small" data-map-nets></p>
+    <ul class="map-legend" aria-label="Legend">
+      <li><i class="lg lg--ok"></i>running</li><li><i class="lg lg--issue"></i>issue (unhealthy, restarting, 3+ restarts, OOM, network errors)</li>
+      <li><i class="lg lg--offline"></i>offline (exited, created)</li><li><i class="lg lg--missing"></i>missing (the layout expects it)</li>
+      <li><i class="lg lg--edge"></i>open connection, client → server (thicker = more)</li><li><i class="lg lg--live"></i>moving: both ends had traffic in the last 3 s</li>
+    </ul>`;
+  mapPanel({ nodes: [] });
+  const svg = $("[data-map-svg]");
+  const pick = (g) => { if (!g || !mapData) return; mapSel = g.dataset.node; drawMap(mapData); mapPanel(mapData); if (matchMedia("(max-width: 1080px)").matches) $("[data-map-panel]").scrollIntoView({ block: "nearest", behavior: "smooth" }); };
+  svg.addEventListener("click", (e) => pick(e.target.closest("[data-node]")));
+  svg.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(e.target.closest("[data-node]")); } });
+  let lastW = 0;
+  mapRO = new ResizeObserver(() => { const w = $("[data-map-wrap]")?.clientWidth || 0; if (mapData && Math.abs(w - lastW) > 4) { lastW = w; drawMap(mapData); } });
+  mapRO.observe($("[data-map-wrap]"));
+  const tick = async () => {
+    if (gen !== mapGen || location.hash !== "#map") return;
+    if (!document.hidden) {
+      try {
+        const { status, data } = await api("/api/map");
+        if (gen !== mapGen) return;
+        if (status === 200 && data.nodes) {
+          mapData = data;
+          if (mapSel && mapSel !== "external" && !data.nodes.some((n) => n.id === mapSel)) mapSel = null;
+          drawMap(data); mapSummary(data); mapPanel(data);
+          lastW = $("[data-map-wrap]").clientWidth;
+          $("[data-map-age]").textContent = `updated ${new Date(data.time * 1000).toLocaleTimeString()}`;
+          if (!data.nodes.length) $("[data-map-sum]").innerHTML = `<span class="muted">No containers in the Docker project <code>${esc(data.project)}</code>.</span>`;
+        }
+      } catch (e) { if (e.message === "login required") return; }
+    }
+    if (gen === mapGen) mapTimer = setTimeout(tick, 3000);
+  };
+  tick();
+}
+
 // ---------------------------------------------------------------- router
-const ROUTES = { overview: vOverview, containers: vContainers, ports: vPorts, volumes: vVolumes, stacks: vStacks, health: vHealth, logins: vLogins, settings: vSettings, terminal: vTerminal, activity: vActivity, reset: vReset };
+const ROUTES = { overview: vOverview, map: vMap, containers: vContainers, ports: vPorts, volumes: vVolumes, stacks: vStacks, health: vHealth, logins: vLogins, settings: vSettings, terminal: vTerminal, activity: vActivity, reset: vReset };
 let routing = false;
 async function route(soft = false) {
   if (routing) return;
   if (!soft) view().onclick = null;
   const key = (location.hash || "#overview").slice(1);
   const fn = ROUTES[key] || vOverview;
+  if (key !== "map") stopMap();
   $$("[data-nav] a").forEach((a) => a.setAttribute("aria-current", a.getAttribute("href") === "#" + key ? "page" : "false"));
   if (soft && ["settings", "terminal", "ports"].includes(key)) return;
   routing = true;

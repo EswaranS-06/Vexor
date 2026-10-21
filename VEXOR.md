@@ -172,6 +172,8 @@ Grafana gets an OpenSearch datasource and a **Wazuh alerts overview** dashboard 
 
 The web UI (`CONSOLE=true`, `https://PUBLIC_HOST:CONSOLE_PORT`). The README lists its pages. While `CONSOLE_PASSWORD` is still the generated one, every API call except sign-in returns 403 `password_change_required` until `POST /api/password` (`current`, `new`, `repeat`, header `X-Vexor-CSRF`) sets one the user chose; the console remembers that in `.state/console-password-set`. `vexor console password --generate` makes the next sign-in ask again.
 
+`GET /api/map` (same sign-in and password rules, cached 2.5 s) returns the Map page's data: the containers of `COMPOSE_PROJECT_NAME` from one `docker inspect` (state, health, restarts, exit code, OOM, image, networks and IPs), rx/tx bytes, packets, errors and drops from `/proc/<pid>/net/dev` with rates against the previous sample (none on the first), listening ports and established connections from `/proc/<pid>/net/tcp`, `tcp6`, `udp` and `udp6` turned into client → server edges, an aggregated `external` entry, and services the layout enables but no container runs (`missing`). Containers on the host network get no counters (they would be the host's). When `/proc` cannot be read, `traffic` and `connections` are null and `limits` says why.
+
 | Command | Description |
 |---|---|
 | `console [status]` | Whether the `vexor-console` service runs and the console answers. |

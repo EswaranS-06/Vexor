@@ -395,6 +395,274 @@ def pending():
     return {"known": True, "keys": keys}
 
 
+# ---------------------------------------------------------------- map: containers, networks, live traffic
+# Everything here is read, never invented: one `docker inspect` for the project's containers, then each running
+# container's own network namespace through /proc/<pid>/net (the console runs as root on the host). No exec and
+# no extra processes. Rates need two samples, so the first answer has none.
+TCP_STATE = {"01": "established", "0A": "listen", "07": "unconnected"}
+MAP_ISSUE_RESTARTS = 3          # from this many restarts (Docker's RestartCount) a container counts as an issue
+MAP_NO_PROC = ("Live traffic and connections need the console to run as root on the Docker host "
+               "(it reads /proc/<pid>/net). Showing container state only.")
+_map_lock = threading.Lock()
+_map_prev = {}                  # container id -> (time, rx bytes, tx bytes) of the previous sample
+_state_refresh = threading.Lock()
+
+
+def hex_ip(h):
+    """Address field of /proc/net/tcp ('0100007F', or 32 hex digits in tcp6) -> text. IPv4-mapped IPv6 -> IPv4."""
+    raw = bytes.fromhex(h)
+    if len(raw) == 4:
+        return socket.inet_ntop(socket.AF_INET, raw[::-1])
+    if len(raw) != 16:
+        raise ValueError("bad address")
+    raw = b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4))   # four 32-bit words in little-endian order
+    if raw[:12] == b"\0" * 10 + b"\xff\xff":
+        return socket.inet_ntop(socket.AF_INET, raw[12:])
+    return socket.inet_ntop(socket.AF_INET6, raw)
+
+
+def parse_proc_net(text, proto="tcp"):
+    """/proc/<pid>/net/{tcp,tcp6,udp,udp6} -> [{proto, local, lport, remote, rport, state}]."""
+    rows = []
+    for line in text.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 4 or f[1].count(":") != 1 or f[2].count(":") != 1:
+            continue
+        try:
+            (lh, lp), (rh, rp) = f[1].split(":"), f[2].split(":")
+            rows.append({"proto": proto, "local": hex_ip(lh), "lport": int(lp, 16), "remote": hex_ip(rh),
+                         "rport": int(rp, 16), "state": TCP_STATE.get(f[3].upper(), f[3].upper())})
+        except (ValueError, OSError):
+            continue
+    return rows
+
+
+def parse_net_dev(text):
+    """/proc/<pid>/net/dev -> totals over every interface except loopback."""
+    keys = ("rxBytes", "rxPackets", "rxErrors", "rxDrops", "txBytes", "txPackets", "txErrors", "txDrops")
+    tot = dict.fromkeys(keys, 0)
+    tot["interfaces"] = []
+    for line in text.splitlines()[2:]:
+        if ":" not in line:
+            continue
+        name, data = line.split(":", 1)
+        name, f = name.strip(), data.split()
+        if name == "lo" or len(f) < 16:
+            continue
+        try:
+            vals = [int(f[i]) for i in (0, 1, 2, 3, 8, 9, 10, 11)]
+        except ValueError:
+            continue
+        tot["interfaces"].append(name)
+        for k, v in zip(keys, vals):
+            tot[k] += v
+    return tot
+
+
+def is_loopback(ip):
+    return ip.startswith("127.") or ip == "::1"
+
+
+def is_local_ip(ip):
+    return is_loopback(ip) or ip in ("0.0.0.0", "::")
+
+
+def read_proc_net(pid, name):
+    with open(f"/proc/{pid}/net/{name}", errors="replace") as f:
+        return f.read()
+
+
+def own_netns(pid, cid):
+    """True when /proc/<pid> really is this container in a network namespace of its own (not a pid inside a Docker VM)."""
+    try:
+        if cid and cid in Path(f"/proc/{pid}/cgroup").read_text(errors="replace"):
+            return True
+        return os.stat(f"/proc/{pid}/ns/net").st_ino != os.stat("/proc/self/ns/net").st_ino
+    except OSError:
+        return False
+
+
+def expected_services():
+    """Services the current layout enables, from the cached `vexor json state` the Overview uses (refreshed in the background)."""
+    hit = _cache.get("state")
+    if not hit or time.time() - hit[0] > 10:
+        def refresh():
+            if _state_refresh.acquire(blocking=False):
+                try:
+                    _cache["state"] = (time.time(), state())
+                finally:
+                    _state_refresh.release()
+        threading.Thread(target=refresh, daemon=True).start()
+    svcs = hit[1].get("services") if hit and isinstance(hit[1], dict) else None
+    return svcs if isinstance(svcs, list) else None
+
+
+def inspect_project(project):
+    ids = run_quick(["docker", "ps", "-a", "-q", "--no-trunc", "--filter", f"label=com.docker.compose.project={project}"], timeout=15).split()
+    if not ids:
+        return []
+    try:
+        return json.loads(run_quick(["docker", "inspect", *ids], timeout=20) or "[]")
+    except ValueError:
+        return []
+
+
+def map_node(c):
+    st, cfg, hc = c.get("State") or {}, c.get("Config") or {}, c.get("HostConfig") or {}
+    name = (c.get("Name") or "").lstrip("/")
+    nets = [{"name": k, "ip": v.get("IPAddress") or "", "ip6": v.get("GlobalIPv6Address") or "", "gateway": v.get("Gateway") or ""}
+            for k, v in sorted(((c.get("NetworkSettings") or {}).get("Networks") or {}).items())]
+    return {"id": name or c.get("Id", "")[:12], "cid": c.get("Id", ""),
+            "service": (cfg.get("Labels") or {}).get("com.docker.compose.service") or name, "name": name,
+            "state": st.get("Status") or "unknown", "health": (st.get("Health") or {}).get("Status") or "",
+            "restarts": c.get("RestartCount") or 0, "exitCode": st.get("ExitCode"), "oom": bool(st.get("OOMKilled")),
+            "startedAt": st.get("StartedAt") or "", "finishedAt": st.get("FinishedAt") or "", "image": cfg.get("Image") or "",
+            "pid": st.get("Pid") or 0, "networkMode": hc.get("NetworkMode") or "", "networks": nets,
+            "traffic": None, "listening": None, "connections": None, "note": ""}
+
+
+def node_status(n):
+    """-> (ok | issue | offline, [reasons])"""
+    reasons = []
+    if n["state"] in ("exited", "dead", "created", "removing"):
+        if n["exitCode"] not in (None, 0):
+            reasons.append(f"exit code {n['exitCode']}")
+        if n["oom"]:
+            reasons.append("killed: out of memory")
+        return "offline", reasons
+    if n["state"] in ("restarting", "paused"):
+        reasons.append(n["state"])
+    if n["health"] == "unhealthy":
+        reasons.append("healthcheck failing")
+    if n["oom"]:
+        reasons.append("was killed: out of memory")
+    if n["restarts"] >= MAP_ISSUE_RESTARTS:
+        reasons.append(f"restarted {n['restarts']} times")
+    t = n["traffic"] or {}
+    if t.get("rxErrors") or t.get("txErrors"):
+        reasons.append(f"network errors: rx {t['rxErrors']}, tx {t['txErrors']}")
+    return ("issue" if reasons else "ok"), reasons
+
+
+def sample_netns(n, now):
+    """Traffic counters and sockets of one running container. Raises OSError when /proc cannot be read."""
+    dev = parse_net_dev(read_proc_net(n["pid"], "dev"))
+    prev = _map_prev.get(n["cid"])
+    _map_prev[n["cid"]] = (now, dev["rxBytes"], dev["txBytes"])
+    dev["rxRate"] = dev["txRate"] = None       # first sample, or the counters were reset by a restart
+    if prev and now - prev[0] >= 0.5 and dev["rxBytes"] >= prev[1] and dev["txBytes"] >= prev[2]:
+        dev["rxRate"] = round((dev["rxBytes"] - prev[1]) / (now - prev[0]), 1)
+        dev["txRate"] = round((dev["txBytes"] - prev[2]) / (now - prev[0]), 1)
+    n["traffic"] = dev
+    socks = []
+    for name in ("tcp", "tcp6", "udp", "udp6"):
+        try:
+            socks += parse_proc_net(read_proc_net(n["pid"], name), name.rstrip("6"))
+        except OSError:
+            continue       # e.g. IPv6 disabled in this namespace
+    return socks
+
+
+def link_sockets(nodes, socks, by_ip):
+    """Sockets of every sampled container -> listening ports, per-container connection lists, edges client -> server."""
+    listen = {nid: {(r["proto"], r["lport"]) for r in rows if r["state"] in ("listen", "unconnected") and r["rport"] == 0
+                    and not is_loopback(r["local"])}     # loopback-only listeners (e.g. Docker's DNS on 127.0.0.11) are internal
+              for nid, rows in socks.items()}
+    conns = {}          # (client, server, proto, port) -> {connection}; both ends see a connection, the set counts it once
+    for nid, rows in socks.items():
+        for r in rows:
+            if r["state"] != "established" or is_local_ip(r["remote"]):
+                continue
+            peer = by_ip.get(r["remote"])
+            if peer == nid:
+                continue
+            if peer is None:     # outside the project: agents, browsers, other hosts, the Docker gateway (published ports)
+                if (r["proto"], r["lport"]) in listen[nid]:
+                    key = ("external", nid, r["proto"], r["lport"])
+                else:
+                    key = (nid, "external", r["proto"], r["rport"])
+                conns.setdefault(key, set()).add((r["remote"], r["rport"], r["local"], r["lport"]))
+                continue
+            if (r["proto"], r["lport"]) in listen[nid]:
+                server_here = True
+            elif (r["proto"], r["rport"]) in listen.get(peer, set()):
+                server_here = False
+            else:                # neither side lists the port as listening: the lower port is the server's
+                server_here = (r["lport"], nid) < (r["rport"], peer)
+            key = (peer, nid, r["proto"], r["lport"]) if server_here else (nid, peer, r["proto"], r["rport"])
+            conns.setdefault(key, set()).add(tuple(sorted(((r["local"], r["lport"]), (r["remote"], r["rport"])))))
+    edges, per_node = [], {nid: [] for nid in socks}
+    ext = {"inbound": 0, "outbound": 0, "peers": set(), "ports": {}}
+    for (client, server, proto, port), tups in sorted(conns.items()):
+        edges.append({"from": client, "to": server, "proto": proto, "port": port, "count": len(tups)})
+        if "external" in (client, server):
+            inbound = client == "external"
+            ips = sorted({t[0] for t in tups})
+            ext["inbound" if inbound else "outbound"] += len(tups)
+            ext["peers"].update(ips)
+            ext["ports"][f"{port}/{proto}"] = ext["ports"].get(f"{port}/{proto}", 0) + len(tups)
+            per_node[server if inbound else client].append({"dir": "in" if inbound else "out", "peer": "external", "port": port,
+                                                            "proto": proto, "count": len(tups), "ips": ips[:5]})
+            continue
+        if client in per_node:
+            per_node[client].append({"dir": "out", "peer": server, "port": port, "proto": proto, "count": len(tups)})
+        if server in per_node:
+            per_node[server].append({"dir": "in", "peer": client, "port": port, "proto": proto, "count": len(tups)})
+    for n in nodes:
+        if n["id"] in socks:
+            n["listening"] = [{"port": p, "proto": pr} for pr, p in sorted(listen[n["id"]], key=lambda x: (x[1], x[0]))]
+            n["connections"] = per_node[n["id"]]
+    ext["peers"] = len(ext["peers"])
+    return edges, ext
+
+
+def build_map():
+    with _map_lock:      # one sample at a time: the rates depend on the previous one
+        return _build_map()
+
+
+def _build_map():
+    project = env_dict().get("COMPOSE_PROJECT_NAME") or "vexor"
+    now = time.time()
+    nodes = sorted((map_node(c) for c in inspect_project(project)), key=lambda n: (n["service"], n["name"]))
+    by_ip = {ip: n["id"] for n in nodes for net in n["networks"] for ip in (net["ip"], net["ip6"]) if ip}
+    socks, limits = {}, None
+    for n in nodes:
+        if n["state"] != "running" or not n["pid"]:
+            continue
+        if n["networkMode"] == "host":
+            n["note"] = "Uses the host network: its counters and sockets are the whole host's, so the map leaves them out."
+        elif n["networkMode"].startswith("container:"):
+            n["note"] = "Shares another container's network namespace."
+        elif not own_netns(n["pid"], n["cid"]):
+            limits = MAP_NO_PROC
+        else:
+            try:
+                socks[n["id"]] = sample_netns(n, now)
+            except OSError:
+                limits = MAP_NO_PROC
+    live = {n["cid"] for n in nodes}
+    for cid in [k for k in _map_prev if k not in live]:
+        _map_prev.pop(cid, None)
+    edges, external = link_sockets(nodes, socks, by_ip)
+    for n in nodes:
+        n["status"], n["reasons"] = node_status(n)
+        n.pop("pid", None)
+    expected = expected_services()
+    have = {n["service"] for n in nodes}
+    for svc in expected or []:
+        if svc not in have:
+            nodes.append({"id": "missing:" + svc, "service": svc, "name": "", "state": "missing", "status": "missing",
+                          "reasons": ["the current layout enables it, but it has no container"], "health": "", "restarts": 0,
+                          "networks": [], "traffic": None, "listening": None, "connections": None, "note": ""})
+    nets = {}
+    for n in nodes:
+        for net in n["networks"]:
+            nets[net["name"]] = nets.get(net["name"], 0) + 1
+    return {"project": project, "time": now, "expected": expected, "nodes": nodes, "edges": edges, "external": external,
+            "networks": [{"name": k, "containers": v} for k, v in sorted(nets.items())], "limits": limits}
+
+
 def logins():
     out = run_quick([str(VEXOR), "--no-color", "login", "--json"], timeout=30)
     try:
@@ -590,6 +858,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(cached("state", 10, state))
         if p == "/api/containers":
             return self.send_json(cached("containers", 5, containers))
+        if p == "/api/map":
+            return self.send_json(cached("map", 2.5, build_map))
         if p == "/api/disk":
             return self.send_json(cached("disk", 30, disk))
         if p == "/api/volumes":
