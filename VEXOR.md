@@ -12,7 +12,7 @@ vexor <command> [subcommand] [options]
 
 - [Installation](#installation) · [Conventions](#conventions) · [Change management](#change-management)
 - Stack commands: [Wazuh](#wazuh) · [ELK](#elk) · [n8n](#n8n) · [Suricata](#suricata) · [Zeek](#zeek) · [other tools](#other-tools) · [console](#console)
-- Platform commands: [setup](#setup) · [run](#run) · [what runs](#what-runs) · [troubleshoot](#troubleshoot) · [update](#update) · [certificates](#certificates) · [security](#security) · [data](#data) · [health automation](#health-automation) · [automation](#automation)
+- Platform commands: [setup](#setup) · [run](#run) · [what runs](#what-runs) · [troubleshoot](#troubleshoot) · [update](#update) · [certificates](#certificates) · [proxy routes](#proxy-routes) · [security](#security) · [data](#data) · [health automation](#health-automation) · [automation](#automation)
 - [What `doctor --fix` repairs](#what-doctor---fix-repairs) · [Files and state](#files-and-state) · [Exit codes](#exit-codes) · [Extending vexor](#extending-vexor)
 
 ---
@@ -245,6 +245,41 @@ nginx serves one certificate for the Wazuh dashboard, Kibana and every web tool.
 | `cert import <crt> <key> [chain]` / `cert letsencrypt <domain> [--email E] [--staging] [--dns]` | Your own certificate / a public one. |
 | `cert renew [--force]` / `cert use-default` / `cert internal-regen` | Renew under 30 days / built-in certificate / re-issue internal certificates. |
 
+## Proxy routes
+
+Open a Vexor service, or something on this host or your LAN, under its own name: `https://soc.example.com` instead of `https://<ip>:8080`. nginx answers on `ROUTES_HTTPS_PORT` (443) and `ROUTES_HTTP_PORT` (80, redirects to https and serves Let's Encrypt challenges). Both are published on `BIND_IP` only while at least one route exists. Names nginx does not know get no answer.
+
+| Command | Description |
+|---|---|
+| `proxy ls [--json]` / `proxy show <host>` | Routes with target, TLS mode, certificate expiry and status / one route, its certificate and a DNS check. |
+| `proxy add <host> <target> [--tls local\|letsencrypt\|off] [--websocket] [--max-body SIZE]` | Add a route. `<host>` is a domain, subdomain or IPv4 address. `<target>` is a Vexor service and port (`wazuh.dashboard:5601`, `n8n:5678`, `grafana:3000`, `kibana:5601`) or `[http(s)://]IP:PORT`; `127.0.0.1:PORT` means this host (through `host.docker.internal`, so the program must listen on `0.0.0.0` or the Docker bridge). Defaults: `--tls local`, `--max-body 100m`. |
+| `proxy edit <host> [--target T] [--tls M] [--websocket\|--no-websocket] [--max-body SIZE]` | Change a route. |
+| `proxy rm <host>` | Remove a route and its certificate. |
+| `proxy cert <host> [--renew]` | Issue or re-issue the certificate. `maintenance` renews any with less than 30 days left. |
+| `proxy cert-file <host> [ca\|cert]` / `proxy cert-file ca` | Path of the route certificate or the local CA (public files only; the console's downloads use it). |
+| `proxy apply` | Render, test and reload again, for example after restoring `routes.json`. |
+
+Every change renders `nginx.conf`, tests it with `nginx -t` (inside nginx, or in a one-off nginx container when the ports change), and only then reloads or recreates nginx. If the test fails, `routes.json`, `nginx.conf` and the override go back to what they were and nginx keeps running. The Wazuh dashboard, tool and agent servers are not touched.
+
+**Certificates.** `local` signs a certificate for the host (DNS or IP name) with the same local CA as `vexor cert create`, stored in `config/nginx/routes-certs/<host>.pem` (key `0600`). `letsencrypt` asks Let's Encrypt over HTTP-01: the name must resolve to this server and public port 80 must reach `ROUTES_HTTP_PORT`; until the certificate arrives the route answers 503 on http. `off` serves plain HTTP. Only one IP-address route can use TLS, because clients send no name for an IP address.
+
+**DNS.** Create an A record for each name pointing at this server's address (in your DNS provider, AD, Pi-hole or router), or for a test add `SERVER-IP soc.example.com` to the client's hosts file. Behind NAT, use the public address and forward the two ports. `doctor` warns when a name does not resolve to this machine.
+
+**Trust the local CA** once per device (download it from the console's Proxy page, or `vexor cert export-ca`):
+
+- Windows: double-click the `.crt` → Install → Local Machine → Trusted Root Certification Authorities, or `Import-Certificate -FilePath .\ca.crt -CertStoreLocation Cert:\LocalMachine\Root` in an admin PowerShell.
+- macOS: `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ca.crt`
+- Linux: `sudo cp ca.crt /usr/local/share/ca-certificates/vexor-local-ca.crt && sudo update-ca-certificates`; Firefox: Settings → Privacy & Security → Certificates → Authorities → Import.
+- Android: Settings → Security → Encryption & credentials → Install a certificate → CA certificate.
+- iPhone / iPad: open the file in Safari → install the profile in Settings, then General → About → Certificate Trust Settings → turn on full trust.
+- Company-wide: Group Policy → Public Key Policies → Trusted Root Certification Authorities → Import.
+
+```bash
+vexor proxy add soc.example.com wazuh.dashboard:5601
+vexor proxy add n8n.example.com n8n:5678 --websocket --tls letsencrypt
+vexor proxy add printer.lan http://192.168.1.50:80 --tls off
+```
+
 ## Security
 
 | Command | Description |
@@ -335,7 +370,8 @@ Problems reported with a hint only include:
 | Path | Content |
 |---|---|
 | `.env` | Settings and secrets (`chmod 600`) |
-| `docker-compose.override.yml` | Generated: nginx ports, single-indexer URL, sensor mounts |
+| `docker-compose.override.yml` | Generated: nginx ports, single-indexer URL, sensor mounts, proxy route ports and mounts |
+| `config/nginx/routes.json` | Proxy routes (`vexor proxy`); `routes-certs/` holds their certificates, `acme/` the Let's Encrypt challenge files. Saved by `backup` with the rest of `config/` |
 | `config/tools/` | Generated: `wazuh/custom-n8n.py` and the tool rules, `n8n/vexor-soc-alerts.workflow.json`, Grafana provisioning, the Zeek script, the Portainer password file |
 | `config/elk/` | Generated: Logstash settings and pipeline (follows `SOC`, sensors and the n8n link) |
 | `tools-data/` | Suricata and Zeek logs |

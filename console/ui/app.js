@@ -880,7 +880,153 @@ try { storedSide = localStorage.getItem("vx-side") === "1"; } catch { /* storage
 setSide(storedSide, false);
 
 // ---------------------------------------------------------------- router
-const ROUTES = { overview: vOverview, map: vMap, containers: vContainers, ports: vPorts, volumes: vVolumes, stacks: vStacks, health: vHealth, logins: vLogins, settings: vSettings, terminal: vTerminal, activity: vActivity, reset: vReset };
+// ---------------------------------------------------------------- Proxy page: named hosts through nginx (vexor proxy)
+const PX_HOST = /^(?=.{1,253}$)(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
+const PX_TARGET = /^(?:https?:\/\/)?[a-z0-9][a-z0-9._-]{0,62}:\d{1,5}\/?$/;
+const PX_SIZE = /^\d{1,5}[kmg]?$/;
+const PX_TLS = { local: "Local CA", letsencrypt: "Let's Encrypt", off: "Off (HTTP)" };
+const PX_STATUS = { active: ["active", "ok"], "no-cert": ["no certificate", "warn"], "bad-cert": ["bad certificate", "bad"], expired: ["expired", "bad"],
+  "not-rendered": ["not applied", "warn"], "nginx-down": ["nginx down", "bad"], invalid: ["invalid", "bad"] };
+function pxCert(r) {
+  if (r.tls === "off") return `<span class="muted">—</span>`;
+  const c = r.cert || {};
+  if (!c.exists) return pill("missing", "warn");
+  if (c.days === undefined) return pill("unreadable", "bad");
+  const when = c.expires ? new Date(c.expires * 1000).toLocaleDateString() : "";
+  return `${pill(c.days < 0 ? "expired" : `${c.days} days`, c.days < 0 ? "bad" : c.days < 21 ? "warn" : c.days < 30 ? "accent" : "ok")} <span class="muted small">${esc(when)}</span>`;
+}
+async function pxDownload(host, what) {
+  const r = await fetch(`/api/proxy/download?what=${encodeURIComponent(what)}${host ? "&host=" + encodeURIComponent(host) : ""}`, { credentials: "same-origin" });
+  if (r.status === 401) { showLogin(); return; }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); toast(d.error === "no certificate yet" ? "No certificate yet - issue one first." : d.error || "Download refused.", "bad"); return; }
+  const name = /filename="([^"]+)"/.exec(r.headers.get("Content-Disposition") || "")?.[1] || "certificate.crt";
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(await r.blob());
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+function pxArgs(f, mode) {
+  const v = Object.fromEntries(new FormData(f));
+  const host = mode === "add" ? (v.host || "").trim().toLowerCase() : f.dataset.host, target = (v.target || "").trim().toLowerCase(), size = (v.max_body || "").trim().toLowerCase() || "100m";
+  const errs = {};
+  if (mode === "add" && !PX_HOST.test(host)) errs.host = "A domain like soc.example.com or an IPv4 address (no wildcard).";
+  if (!PX_TARGET.test(target)) errs.target = "service:port (n8n:5678) or [http(s)://]IP:PORT.";
+  if (!PX_SIZE.test(size)) errs.max_body = "Like 100m, 512k, 1g or 0 (no limit).";
+  if (v.tls === "letsencrypt" && /^[\d.]+$/.test(host)) errs.tls = "Let's Encrypt needs a domain name.";
+  $$("[data-px-err]", f).forEach((e) => (e.textContent = errs[e.dataset.pxErr] || ""));
+  if (Object.keys(errs).length) return null;
+  return mode === "add"
+    ? ["proxy", "add", host, target, "--tls", v.tls, "--max-body", size, ...(v.websocket ? ["--websocket"] : [])]
+    : ["proxy", "edit", f.dataset.host, "--target", target, "--tls", v.tls, "--max-body", size, v.websocket ? "--websocket" : "--no-websocket"];
+}
+const pxFields = (r = {}, list = "px-targets") => `
+  <label class="px-field"><span>Target</span><input class="in" name="target" list="${list}" value="${esc(r.target || "")}" placeholder="wazuh.dashboard:5601" autocomplete="off" spellcheck="false" required><small class="field-err" data-px-err="target"></small></label>
+  <label class="px-field"><span>TLS</span><select class="in" name="tls">${Object.entries(PX_TLS).map(([k, l]) => `<option value="${k}" ${(r.tls || "local") === k ? "selected" : ""}>${esc(l)}</option>`).join("")}</select><small class="field-err" data-px-err="tls"></small></label>
+  <label class="px-field px-field--sm"><span>Max body</span><input class="in" name="max_body" value="${esc(r.max_body || "100m")}" spellcheck="false"><small class="field-err" data-px-err="max_body"></small></label>
+  <label class="px-check"><input type="checkbox" name="websocket" ${r.websocket ? "checked" : ""}> <span>WebSocket</span></label>`;
+async function vProxy() {
+  setTitle("Proxy");
+  loading("proxy routes");
+  const { data: d } = await api("/api/proxy");
+  const routes = d.routes || [];
+  const again = () => { if (location.hash === "#proxy") route(true); };
+  const portTxt = (p, def) => (String(p) === def ? "" : ":" + p);
+  $("[data-topmeta]").innerHTML = `${pill(`https${portTxt(d.https_port, "443")} · http${portTxt(d.http_port, "80")}`)} ${pill(d.nginx_running ? "nginx up" : "nginx down", d.nginx_running ? "ok" : "bad")}`;
+  view().innerHTML = `
+    <p class="lede">Open a Vexor service or anything on this host or your LAN under its own name, like <code>soc.example.com</code>. nginx answers on port ${esc(d.https_port || 443)} (HTTPS) and ${esc(d.http_port || 80)} (HTTP, redirects and Let's Encrypt) once the first route exists. Every change is tested with <code>nginx -t</code> before nginx reloads.</p>
+    ${d.error ? `<p class="err">${esc(d.error)}</p>` : ""}
+    <section class="px-ca">
+      <div><h2>Local CA certificate</h2><p class="muted small">Install it once on each computer or phone that opens these routes: browsers then trust every <b>Local CA</b> certificate without a warning.</p></div>
+      <button type="button" class="btn btn--sm btn--primary" data-px-ca ${d.ca ? "" : "disabled"}>CA certificate (install once on your computer/phone)</button>
+    </section>
+    <section class="block"><h2>Routes</h2>
+      ${routes.length ? `<div class="table-wrap px-wrap"><table class="table px-table">
+        <thead><tr><th>Host</th><th>Target</th><th>TLS</th><th>Certificate</th><th>WebSocket</th><th>Status</th><th><span class="vh">Actions</span></th></tr></thead>
+        <tbody>${routes.map((r, i) => { const st = PX_STATUS[r.status] || [r.status, ""]; return `<tr>
+          <td data-label="Host"><a class="mono px-host" href="${esc(r.url)}" target="_blank" rel="noopener noreferrer">${esc(r.host)}</a></td>
+          <td data-label="Target" class="mono small px-target">${esc(r.target)}<span class="muted"> · ${esc(r.max_body)}</span></td>
+          <td data-label="TLS">${pill(PX_TLS[r.tls] || r.tls, r.tls === "off" ? "warn" : "")}</td>
+          <td data-label="Certificate">${pxCert(r)}</td>
+          <td data-label="WebSocket">${r.websocket ? pill("on", "accent") : `<span class="muted small">off</span>`}</td>
+          <td data-label="Status">${pill(st[0], st[1])}</td>
+          <td class="px-acts"><div class="row-actions px-row-actions">
+            <button type="button" class="btn btn--xs" data-px-edit="${i}">Edit</button>
+            ${r.tls !== "off" ? `<button type="button" class="btn btn--xs" data-px-cert="${i}">${r.cert?.exists ? "Renew cert" : "Issue cert"}</button>` : ""}
+            ${r.tls !== "off" && r.cert?.exists ? `<button type="button" class="btn btn--xs" data-px-dl="${i}">Certificate</button>` : ""}
+            <button type="button" class="btn btn--xs btn--danger-ghost" data-px-rm="${i}">Remove</button>
+          </div></td></tr>`; }).join("")}</tbody></table></div>`
+        : `<p class="muted">No routes yet. Add one below - for example <code>soc.example.com</code> → <code>wazuh.dashboard:5601</code>.</p>`}
+    </section>
+    <section class="block"><h2>Add a route</h2>
+      <form class="px-form" data-px-add novalidate>
+        <label class="px-field"><span>Host</span><input class="in" name="host" placeholder="soc.example.com" autocomplete="off" spellcheck="false" autocapitalize="off" required><small class="field-err" data-px-err="host"></small></label>
+        ${pxFields()}
+        <button class="btn btn--sm btn--primary px-submit" type="submit">Add route</button>
+      </form>
+      <datalist id="px-targets">${(d.suggestions || []).map((s) => `<option value="${esc(s)}"></option>`).join("")}<option value="127.0.0.1:"></option><option value="https://192.168.1.10:443"></option></datalist>
+      <p class="muted small">Targets: a Vexor service and port (the list shows the enabled ones), <code>127.0.0.1:PORT</code> for a program on this host (it must listen on 0.0.0.0 or the Docker bridge), or <code>http(s)://IP:PORT</code> on your LAN.</p>
+    </section>
+    <section class="px-help">
+      <h2>Before it works</h2>
+      <details open><summary>DNS: point the name at this server</summary>
+        <p class="small">Create an <b>A record</b> for the host (e.g. <code>soc.example.com</code>) with this server's IP address in your DNS provider or internal DNS (AD, Pi-hole, router). For a quick test, a hosts-file line on the client works too: <code>SERVER-IP soc.example.com</code>. Behind NAT, use the public IP and forward ports ${esc(d.https_port || 443)} and ${esc(d.http_port || 80)} here. The doctor warns when a name does not resolve to this machine.</p></details>
+      <details><summary>Trust the local CA on each device</summary>
+        <ul class="px-os small">
+          <li><b>Windows</b> - double-click the downloaded <code>.crt</code> → Install certificate → Local Machine → "Trusted Root Certification Authorities". Or in an admin PowerShell: <code>Import-Certificate -FilePath .\\vexor-local-ca.crt -CertStoreLocation Cert:\\LocalMachine\\Root</code></li>
+          <li><b>macOS</b> - <code>sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain vexor-local-ca.crt</code> (or Keychain Access → System → import, then "Always Trust").</li>
+          <li><b>Linux</b> - <code>sudo cp vexor-local-ca.crt /usr/local/share/ca-certificates/ &amp;&amp; sudo update-ca-certificates</code>. Firefox: Settings → Privacy &amp; Security → Certificates → View → Authorities → Import.</li>
+          <li><b>Android</b> - Settings → Security → Encryption &amp; credentials → Install a certificate → CA certificate → pick the file.</li>
+          <li><b>iPhone / iPad</b> - open the file in Safari → Allow → Settings → Profile Downloaded → Install, then Settings → General → About → Certificate Trust Settings → turn on full trust for the CA.</li>
+          <li><b>Company-wide</b> - Group Policy → Public Key Policies → Trusted Root Certification Authorities → Import.</li>
+        </ul></details>
+      <details><summary>Let's Encrypt instead</summary>
+        <p class="small">Choose TLS <b>Let's Encrypt</b> for a public domain: the name must resolve to this server and port 80 must be reachable from the internet (HTTP-01 challenge on ROUTES_HTTP_PORT). Nothing to install on the devices. IP addresses need the local CA.</p></details>
+    </section>
+    <dialog class="confirm px-dialog" data-px-dialog>
+      <form class="confirm__box px-edit" data-px-editform novalidate>
+        <h2>Edit <span class="mono" data-px-edit-host></span></h2>
+        <div class="px-form px-form--stack" data-px-edit-fields></div>
+        <div class="confirm__actions"><button class="btn btn--ghost" type="button" data-px-cancel>Cancel</button><button class="btn btn--primary" type="submit">Save</button></div>
+      </form>
+    </dialog>`;
+  const runP = (args, text) => run(args, { text, onEnd: again });
+  $("[data-px-ca]").addEventListener("click", () => pxDownload("", "ca"));
+  $("[data-px-add]").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const args = pxArgs(e.target, "add");
+    if (args) runP(args, args.includes("letsencrypt") ? "Adds the route, then asks Let's Encrypt for a certificate (the name must point here, port 80 open)." : "Adds the route; nginx config is tested before the reload.");
+  });
+  const dlg = $("[data-px-dialog]"), ef = $("[data-px-editform]");
+  $("[data-px-cancel]").addEventListener("click", () => dlg.close());
+  ef.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const args = pxArgs(ef, "edit");
+    if (!args) return;
+    dlg.close();
+    runP(args, "nginx config is tested before the reload; a failing change is rolled back.");
+  });
+  $$("[data-px-edit]").forEach((b) => b.addEventListener("click", () => {
+    const r = routes[+b.dataset.pxEdit];
+    ef.dataset.host = r.host;
+    $("[data-px-edit-host]").textContent = r.host;
+    $("[data-px-edit-fields]").innerHTML = pxFields(r);
+    dlg.showModal();
+    $("[name=target]", ef).focus();
+  }));
+  $$("[data-px-cert]").forEach((b) => b.addEventListener("click", () => {
+    const r = routes[+b.dataset.pxCert];
+    runP(["proxy", "cert", r.host, ...(r.cert?.exists ? ["--renew"] : [])], r.tls === "letsencrypt" ? "Asks Let's Encrypt for a new certificate (HTTP-01 on port 80)." : "Issues a new certificate from the local CA and reloads nginx.");
+  }));
+  $$("[data-px-dl]").forEach((b) => b.addEventListener("click", () => pxDownload(routes[+b.dataset.pxDl].host, "cert")));
+  $$("[data-px-rm]").forEach((b) => b.addEventListener("click", () => {
+    const r = routes[+b.dataset.pxRm];
+    runP(["proxy", "rm", r.host], `Removes ${r.host} → ${r.target} and its certificate. ${routes.length === 1 ? "It is the last route: nginx stops publishing the route ports." : ""}`);
+  }));
+}
+
+const ROUTES = { overview: vOverview, map: vMap, containers: vContainers, ports: vPorts, volumes: vVolumes, stacks: vStacks, health: vHealth, logins: vLogins, settings: vSettings, terminal: vTerminal, activity: vActivity, reset: vReset, proxy: vProxy };
 let routing = false, again = null;
 async function route(soft = false) {
   closeMenu(false);
