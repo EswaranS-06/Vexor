@@ -6,6 +6,8 @@ dashboard certificate, and lets an authenticated admin see and change the stack.
 `vexor` itself (an allowlist of commands, run without a shell), so the console and the CLI behave identically.
 Standard library only.
 """
+import email.utils
+import gzip
 import hashlib
 import hmac
 import http.server
@@ -148,10 +150,11 @@ def classify(args):
 
 # ---------------------------------------------------------------- jobs (one vexor process each)
 class Job:
-    def __init__(self, args, user):
+    def __init__(self, args, user, level="change"):
         self.id = secrets.token_hex(6)
         self.args = args
         self.user = user
+        self.level = level
         self.started = time.time()
         self.ended = None
         self.code = None
@@ -179,6 +182,8 @@ class Job:
         with self.cond:
             self.ended = time.time()
             self.cond.notify_all()
+        if self.level != "read":
+            invalidate()     # the stack changed: the next read waits for fresh data
         audit(self.user, f"job {self.id} exit {self.code}: vexor {shlex.join(self.args)}")
 
     def stop(self):
@@ -194,8 +199,8 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 
 
-def start_job(args, user):
-    job = Job(args, user)
+def start_job(args, user, level="change"):
+    job = Job(args, user, level)
     with JOBS_LOCK:
         JOBS[job.id] = job
         if len(JOBS) > MAX_JOBS:
@@ -216,16 +221,109 @@ def run_quick(args, timeout=60):
         return ""
 
 
-_cache = {}
+# ---------------------------------------------------------------- cache (stale-while-revalidate)
+# The JSON endpoints run docker/vexor commands that take seconds on a real host. A read returns the last value at once
+# and refreshes it in a background thread; at most one refresh per key runs at a time, so `vexor json state` never runs
+# twice concurrently however many browsers poll. A change job bumps the generation: the next read of an older value
+# waits for one fresh refresh instead. While someone reads a key, a warmer thread keeps it fresh ahead of the next poll.
+_cache = {}             # key -> (time, value, generation)
+_cache_lock = threading.Lock()
+_inflight = {}          # key -> threading.Event of the refresh that is running
+_wanted = {}            # key -> (ttl, fn, last read time): what the warmer keeps fresh
+_gen = 0
+WARM_FOR = 45           # keep refreshing a key this long after its last read
+# seconds a value stays current; just under the browser's poll (Overview 15 s, Containers 10 s) so each poll finds a
+# value the warmer has just refreshed, and the host runs about one refresh per poll, not more
+TTL = {"state": 12, "containers": 8, "stats": 8, "disk": 60, "proxy": 30, "volumes": 300, "map": 2.5}
 
 
-def cached(key, ttl, fn):
-    hit = _cache.get(key)
-    if hit and time.time() - hit[0] < ttl:
-        return hit[1]
-    val = fn()
-    _cache[key] = (time.time(), val)
-    return val
+def invalidate():
+    global _gen
+    with _cache_lock:
+        _gen += 1
+
+
+def _refresh(key, fn):
+    """Compute key once; callers that arrive while it runs wait for the same result."""
+    with _cache_lock:
+        ev = _inflight.get(key)
+        owner = ev is None
+        if owner:
+            ev = _inflight[key] = threading.Event()
+            gen = _gen
+    if not owner:
+        ev.wait(timeout=180)
+        return
+    try:
+        val = fn()
+        with _cache_lock:
+            _cache[key] = (time.time(), val, gen)
+    except Exception as e:  # noqa: BLE001 - a failed refresh keeps the last value
+        print(f"refresh {key} failed: {e}", file=sys.stderr, flush=True)
+    finally:
+        with _cache_lock:
+            _inflight.pop(key, None)
+        ev.set()
+
+
+def _refresh_bg(key, fn):
+    if key not in _inflight:
+        threading.Thread(target=_refresh, args=(key, fn), daemon=True).start()
+
+
+def cached(key, ttl, fn, swr=True, fresh=False):
+    """Value of key. swr: an expired value is returned at once and refreshed in the background. fresh: wait for a new one."""
+    now = time.time()
+    with _cache_lock:
+        hit = _cache.get(key)
+        _wanted[key] = (ttl, fn, now)
+        current = hit is not None and hit[2] == _gen
+    if hit and current and not fresh:
+        if now - hit[0] >= ttl:
+            if swr:
+                _refresh_bg(key, fn)
+                return hit[1]
+        else:
+            return hit[1]
+    for _ in range(2):    # a refresh already running may have started before the change: then run one more
+        _refresh(key, fn)
+        with _cache_lock:
+            hit = _cache.get(key)
+            if hit and hit[2] == _gen and (not fresh or hit[0] >= now):
+                break
+    return hit[1] if hit else fn()
+
+
+def peek(key, ttl, fn):
+    """Last value of key (None before the first), refreshed in the background when older than ttl. Never waits."""
+    now = time.time()
+    with _cache_lock:
+        hit = _cache.get(key)
+        _wanted[key] = (ttl, fn, now)
+    if not hit or now - hit[0] >= ttl or hit[2] != _gen:
+        _refresh_bg(key, fn)
+    return hit[1] if hit else None
+
+
+def warmer():
+    """Refresh what browsers are reading before it expires, so a poll never waits for docker or vexor."""
+    while True:
+        time.sleep(1)
+        now = time.time()
+        with _cache_lock:
+            todo = [(k, fn) for k, (ttl, fn, seen) in _wanted.items() if now - seen < WARM_FOR and k not in _inflight
+                    and (k not in _cache or now - _cache[k][0] >= ttl or _cache[k][2] != _gen)]
+        for k, fn in todo:
+            _refresh_bg(k, fn)
+
+
+def warm_start():
+    """Fill the slow caches once at startup, so the first page after a restart does not wait. Not volumes: their du walks
+    every file of the indexer data, so it runs only when someone opens the Volumes page."""
+    for key, fn in (("state", state), ("containers", containers), ("disk", disk), ("proxy", proxy_routes)):
+        _refresh(key, fn)
+        with _cache_lock:
+            _wanted.setdefault(key, (TTL[key], fn, 0))
 
 
 # ---------------------------------------------------------------- data for the UI
@@ -252,17 +350,30 @@ def containers():
             rows.append({"service": c.get("Service"), "name": c.get("Name"), "state": c.get("State"),
                          "status": c.get("Status"), "health": c.get("Health"), "image": c.get("Image"),
                          "ports": c.get("Publishers") or [], "created": c.get("CreatedAt")})
+    return sorted(rows, key=lambda r: r["service"] or "")
+
+
+def with_stats(rows):
+    """Rows plus CPU/memory. Those come from their own cache: `docker stats` samples for ~2 s, so the list never waits."""
+    running = tuple(sorted(r["name"] for r in rows if r["state"] == "running" and r["name"]))
+    stats = peek("stats", TTL["stats"], lambda: container_stats(running)) or {}
+    if running and not set(running) <= set(stats):
+        _refresh_bg("stats", lambda: container_stats(running))      # a container started since the last sample
+    return [dict(r, **stats.get(r["name"], {})) for r in rows]
+
+
+def container_stats(names):
+    """One `docker stats` sample of the project's running containers only (not every container on the host)."""
     stats = {}
-    sout = run_quick(["docker", "stats", "--no-stream", "--format", "{{json .}}"], timeout=30)
-    for line in sout.splitlines():
+    if not names:
+        return stats
+    for line in run_quick(["docker", "stats", "--no-stream", "--format", "{{json .}}", *names], timeout=30).splitlines():
         try:
             s = json.loads(line)
             stats[s.get("Name")] = {"cpu": s.get("CPUPerc"), "mem": s.get("MemUsage"), "memPct": s.get("MemPerc")}
         except ValueError:
             pass
-    for r in rows:
-        r.update(stats.get(r["name"], {}))
-    return sorted(rows, key=lambda r: r["service"] or "")
+    return stats
 
 
 def df_row(path, roles):
@@ -414,7 +525,6 @@ MAP_NO_PROC = ("Live traffic and connections need the console to run as root on 
                "(it reads /proc/<pid>/net). Showing container state only.")
 _map_lock = threading.Lock()
 _map_prev = {}                  # container id -> (time, rx bytes, tx bytes) of the previous sample
-_state_refresh = threading.Lock()
 
 
 def hex_ip(h):
@@ -493,16 +603,8 @@ def own_netns(pid, cid):
 
 def expected_services():
     """Services the current layout enables, from the cached `vexor json state` the Overview uses (refreshed in the background)."""
-    hit = _cache.get("state")
-    if not hit or time.time() - hit[0] > 10:
-        def refresh():
-            if _state_refresh.acquire(blocking=False):
-                try:
-                    _cache["state"] = (time.time(), state())
-                finally:
-                    _state_refresh.release()
-        threading.Thread(target=refresh, daemon=True).start()
-    svcs = hit[1].get("services") if hit and isinstance(hit[1], dict) else None
+    st = peek("state", 60, state)      # the layout changes rarely: the map alone does not keep `vexor json state` busy
+    svcs = st.get("services") if isinstance(st, dict) else None
     return svcs if isinstance(svcs, list) else None
 
 
@@ -693,7 +795,7 @@ def proxy_cert_file(host, what):
     if what == "cert":
         if not ROUTE_HOST_RE.match(host or ""):
             return None, "bad host"
-        if host not in {r.get("host") for r in proxy_routes().get("routes", [])}:
+        if host not in {r.get("host") for r in cached("proxy", TTL["proxy"], proxy_routes).get("routes", [])}:
             return None, "no such route"
         args = ["proxy", "cert-file", host, "cert"]
     else:
@@ -806,20 +908,44 @@ def audit(user, msg):
 
 
 # ---------------------------------------------------------------- HTTP
+_static = {}
+
+
+def static_bytes(f, st, gz):
+    """-> (body, gzipped) of a UI file, compressed once per version of the file."""
+    key = (str(f), st.st_mtime_ns, st.st_size, gz)
+    hit = _static.get(key)
+    if hit is None:
+        data = f.read_bytes()
+        hit = (gzip.compress(data, 6), True) if gz and len(data) > 1024 else (data, False)
+        if len(_static) > 64:
+            _static.clear()
+        _static[key] = hit
+    return hit
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "VexorConsole"
     sys_version = ""
+    protocol_version = "HTTP/1.1"   # keep-alive: no new TLS handshake for every poll
     timeout = 60   # per connection: a client that stalls (also during the TLS handshake) frees its thread
 
     def log_message(self, fmt, *a):  # quiet access log; the audit log records actions
         pass
 
     # -- helpers
+    def gzip_ok(self, body):
+        return len(body) > 1024 and "gzip" in self.headers.get("Accept-Encoding", "")
+
     def send_json(self, obj, code=200, extra=None):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Vary", "Accept-Encoding")
+        if self.gzip_ok(body):
+            body = gzip.compress(body, 5)
+            self.send_header("Content-Encoding", "gzip")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.security_headers()
@@ -839,6 +965,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def body_json(self):
         n = int(self.headers.get("Content-Length") or 0)
         if n > 65536:
+            self.close_connection = True      # the unread body would be taken for the next request
             return None
         try:
             return json.loads(self.rfile.read(n) or b"{}")
@@ -884,17 +1011,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not f.is_file():
             return self.send_error(404)
         ctype = {".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml"}.get(f.suffix, "application/octet-stream")
-        data = f.read_bytes()
+        st = f.stat()
+        etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+        # no-cache = the browser revalidates every time: a 304 costs no body, and an updated console shows at once
+        head = {"Content-Type": ctype, "Cache-Control": "no-cache", "ETag": etag, "Vary": "Accept-Encoding",
+                "Last-Modified": email.utils.formatdate(st.st_mtime, usegmt=True)}
+        inm = self.headers.get("If-None-Match")
+        ims = self.headers.get("If-Modified-Since")
+        fresh = etag in [t.strip() for t in inm.split(",")] if inm else False
+        if not inm and ims:
+            try:
+                fresh = int(st.st_mtime) <= email.utils.parsedate_to_datetime(ims).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                fresh = False
+        if fresh:
+            self.send_response(304)
+            for k, v in head.items():
+                if k != "Content-Type":
+                    self.send_header(k, v)
+            self.security_headers()
+            return self.end_headers()
+        data = static_bytes(f, st, ctype.startswith(("text/", "image/svg")) and "gzip" in self.headers.get("Accept-Encoding", ""))
         self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-cache")
+        for k, v in head.items():
+            self.send_header(k, v)
+        if data[1]:
+            self.send_header("Content-Encoding", "gzip")
         self.security_headers()
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(len(data[0])))
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(data[0])
 
     # -- routes
     def do_GET(self):
+        if self.headers.get("Content-Length", "0") not in ("", "0"):
+            self.close_connection = True      # a GET body is never read
         u = urllib.parse.urlsplit(self.path)
         p = u.path
         if not p.startswith("/api/"):
@@ -908,16 +1059,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if password_temp():
             return self.must_change()
         q = urllib.parse.parse_qs(u.query)
+        fresh = "fresh" in q        # the Refresh button: wait for new data instead of the cached value
         if p == "/api/state":
-            return self.send_json(cached("state", 10, state))
-        if p == "/api/containers":
-            return self.send_json(cached("containers", 5, containers))
+            return self.send_json(cached("state", TTL["state"], state, fresh=fresh))
+        if p == "/api/containers":         # lite: without CPU/memory (the Overview), so no `docker stats` runs for it
+            rows = cached("containers", TTL["containers"], containers, fresh=fresh)
+            return self.send_json(rows if "lite" in q else with_stats(rows))
         if p == "/api/map":
-            return self.send_json(cached("map", 2.5, build_map))
+            return self.send_json(cached("map", TTL["map"], build_map, swr=False))     # fast; rates need real samples
         if p == "/api/disk":
-            return self.send_json(cached("disk", 30, disk))
-        if p == "/api/volumes":
-            return self.send_json(cached("volumes", 60, volumes) if "fresh" not in q else volumes())
+            return self.send_json(cached("disk", TTL["disk"], disk, fresh=fresh))
+        if p == "/api/volumes":            # du of every volume: slow, so kept for 5 minutes unless asked
+            return self.send_json(cached("volumes", TTL["volumes"], volumes, fresh=fresh))
         if p == "/api/ports":
             return self.send_json(ports())
         if p == "/api/settings":
@@ -925,7 +1078,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p == "/api/pending":
             return self.send_json(pending())
         if p == "/api/proxy":
-            return self.send_json(proxy_routes())
+            return self.send_json(cached("proxy", TTL["proxy"], proxy_routes, fresh=fresh))
         if p == "/api/proxy/download":
             what = (q.get("what") or ["cert"])[0]
             host = (q.get("host") or [""])[0].strip().lower()
@@ -971,6 +1124,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")    # no length: the stream ends with the connection
+        self.close_connection = True
         self.security_headers()
         self.end_headers()
         i = max(0, start)
@@ -999,8 +1154,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = urllib.parse.urlsplit(self.path).path
+        data = self.body_json()     # read the body first: on a kept-alive connection it must not be left unread
         if p == "/api/login":
-            return self.login()
+            return self.login(data)
         if p == "/api/logout":
             c = re.search(r"vexor_console=([a-f0-9]{64})", self.headers.get("Cookie", ""))
             if c:
@@ -1009,7 +1165,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         s = self.require(write=True)
         if not s:
             return
-        data = self.body_json()
         if data is None:
             return self.send_json({"error": "bad JSON"}, 400)
         if p == "/api/password":
@@ -1035,8 +1190,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if level == "danger" and data.get("confirmWord") != args[0]:
                 return self.send_json({"confirm": "danger", "word": args[0], "cmd": "vexor " + shlex.join(args)}, 409)
             audit(s["user"], f"run: vexor {shlex.join(args)}")
-            _cache.clear()
-            return self.send_json(start_job(args, s["user"]).summary())
+            if level != "read":
+                invalidate()
+            return self.send_json(start_job(args, s["user"], level).summary())
         m = re.fullmatch(r"/api/jobs/([a-f0-9]{12})/stop", p)
         if m:
             job = JOBS.get(m.group(1))
@@ -1127,7 +1283,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json({"confirm": "change", "cmd": "vexor config set … && vexor config apply"}, 409)
         script = [["config", "set", k, v] for k, v in changes.items()]
         audit(s["user"], "settings: " + ", ".join(f"{k}={v}" for k, v in changes.items()))
-        job = Job(["config", "apply"], s["user"])
+        job = Job(["config", "apply"], s["user"], "change")
         with JOBS_LOCK:
             JOBS[job.id] = job
 
@@ -1142,22 +1298,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     with job.cond:
                         job.code, job.ended = r.returncode, time.time()
                         job.cond.notify_all()
+                    invalidate()
                     return
             with job.cond:
                 job.lines.append("$ vexor config apply")
             job.run()
-        _cache.clear()
+        invalidate()
         threading.Thread(target=run_all, daemon=True).start()
         return self.send_json(job.summary())
 
-    def login(self):
+    def login(self, data):
         ip = self.client_address[0]
         now = time.time()
         fails = [t for t in FAILS.get(ip, []) if now - t < 300]
         FAILS[ip] = fails
         if len(fails) >= 5:
             return self.send_json({"error": "too many failed logins - wait 5 minutes"}, 429)
-        data = self.body_json() or {}
+        data = data or {}
         user, pw = console_creds()
         ok = bool(pw) and pw != "CHANGE_ME" and hmac.compare_digest(str(data.get("user", "")), user) \
             and hmac.compare_digest(hashlib.sha256(str(data.get("password", "")).encode()).digest(), hashlib.sha256(pw.encode()).digest())
@@ -1200,6 +1357,8 @@ def main():
     # handshake in the request thread, not in accept(): one client that connects and sends nothing must not block the console
     httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
     print(f"vexor console on https://{bind}:{port}  (cert {cert})", flush=True)
+    threading.Thread(target=warm_start, daemon=True).start()
+    threading.Thread(target=warmer, daemon=True).start()
     httpd.serve_forever()
 
 

@@ -357,3 +357,13 @@ td.row-more { width: 3.5rem; text-align: right; }
   .px-table td.px-acts { display: block; padding-top: var(--space-2); }
   .px-row-actions { justify-content: flex-start; }
 }
+
+/* ---- live refresh: quiet "updated Xs ago" indicator in the header (app.js liveShow) ---- */
+.live { display: inline-flex; align-items: center; gap: var(--space-2); font: 500 var(--text-xs)/1 var(--font-mono); color: var(--color-muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.live[hidden] { display: none; }
+.live__dot { width: 7px; height: 7px; border-radius: 50%; background: var(--color-ok); flex: none; }
+.live.is-busy .live__dot { background: var(--color-accent); animation: live-pulse 0.9s ease-in-out infinite alternate; }
+.live.is-err .live__dot { background: var(--color-warn); }
+@keyframes live-pulse { from { opacity: 1; } to { opacity: 0.25; } }
+@media (prefers-reduced-motion: reduce) { .live.is-busy .live__dot { animation: none; } }
+.skel { color: var(--color-muted); }

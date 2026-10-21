@@ -6,12 +6,15 @@ let CSRF = "";
 let STATE = {};
 
 // ---------------------------------------------------------------- API
+const FRESH_OK = /^\/api\/(state|containers|disk|volumes|proxy)$/;   // endpoints the server caches; fresh=1 waits for new data
 async function api(path, opts = {}) {
+  if (!opts.body && opts.fresh && FRESH_OK.test(path.split("?")[0])) path += (path.includes("?") ? "&" : "?") + "fresh=1";
   const r = await fetch(path, {
     method: opts.body ? "POST" : "GET",
     headers: { "Content-Type": "application/json", "X-Vexor-CSRF": CSRF },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
     credentials: "same-origin",
+    signal: opts.signal,
   });
   if (r.status === 401 && path !== "/api/login") { showLogin(); throw new Error("login required"); }
   const data = await r.json().catch(() => ({}));
@@ -20,8 +23,8 @@ async function api(path, opts = {}) {
 }
 
 // ---------------------------------------------------------------- login
-function showLogin() { $("[data-app]").hidden = true; $("[data-pw]").hidden = true; $("[data-login]").hidden = false; $("[name=password]").focus(); }
-function showPasswordChange() { $("[data-app]").hidden = true; $("[data-login]").hidden = true; $("[data-pw]").hidden = false; $("[name=current]").focus(); }
+function showLogin() { stopLive(); $("[data-app]").hidden = true; $("[data-pw]").hidden = true; $("[data-login]").hidden = false; $("[name=password]").focus(); }
+function showPasswordChange() { stopLive(); $("[data-app]").hidden = true; $("[data-login]").hidden = true; $("[data-pw]").hidden = false; $("[name=current]").focus(); }
 async function boot() {
   const { data } = await api("/api/session");
   if (!data.user) return showLogin();
@@ -118,7 +121,7 @@ function openJob(job, onEnd) {
     $("[data-out-stop]").hidden = true;
     es.close();
     onEnd?.(code);
-    if (["#overview", "#containers", "#ports", "#volumes", "#stacks"].includes(location.hash || "#overview")) setTimeout(() => route(true), 400);
+    afterJob();
   });
   es.onerror = () => { $("[data-out-st]").textContent = "disconnected"; es.close(); };
 }
@@ -148,20 +151,91 @@ function toast(msg, kind = "") {
 // ---------------------------------------------------------------- shared bits
 const pill = (txt, kind = "") => `<span class="pill ${kind ? "pill--" + kind : ""}">${esc(txt)}</span>`;
 const btn = (label, args, kind = "", extra = "") => `<button type="button" class="btn btn--sm ${kind}" data-run='${esc(JSON.stringify(args))}' ${extra}>${esc(label)}</button>`;
-function bindRunButtons(root) {
-  $$("[data-run]", root).forEach((b) => b.addEventListener("click", () => {
-    let args = JSON.parse(b.dataset.run);
-    const form = b.closest("[data-form]");
-    if (form) {
-      const vals = Object.fromEntries(new FormData(form));
-      args = args.flatMap((a) => { const m = /^\{(\w+)\}$/.exec(a); return m ? (vals[m[1]] ? [vals[m[1]]] : []) : [a]; });
-    }
-    run(args);
-  }));
-}
-function setTitle(t, meta = "") { $("[data-title]").textContent = t; $("[data-topmeta]").innerHTML = meta; document.title = `${t} · Vexor Console`; }
+// One delegated listener for every [data-run] button, so buttons that a quiet refresh adds work without re-binding.
+$("[data-view]").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-run]");
+  if (!b) return;
+  let args = JSON.parse(b.dataset.run);
+  const form = b.closest("[data-form]");
+  if (form) {
+    const vals = Object.fromEntries(new FormData(form));
+    args = args.flatMap((a) => { const m = /^\{(\w+)\}$/.exec(a); return m ? (vals[m[1]] ? [vals[m[1]]] : []) : [a]; });
+  }
+  run(args);
+});
+function setMeta(html) { const m = $("[data-topmeta]"); if (m.dataset.html !== html) { m.innerHTML = html; m.dataset.html = html; } }
+function setTitle(t, meta = "") { $("[data-title]").textContent = t; setMeta(meta); document.title = `${t} · Vexor Console`; }
 const view = () => $("[data-view]");
-const loading = (what) => (view().innerHTML = `<p class="muted">Loading ${esc(what)}…</p>`);
+// The placeholder shows only before a page's first paint; refreshes update the page in place.
+const loading = (what) => { if (view().dataset.page !== PAGE.key) view().innerHTML = `<p class="muted">Loading ${esc(what)}…</p>`; };
+const SK = '<span class="skel" aria-hidden="true">…</span>';
+
+// ---------------------------------------------------------------- quiet rendering
+// paint() replaces the view on a page's first render; after that it morphs the live DOM into the new markup, touching
+// only what changed. Nodes are matched by key (data-key, data-svc, data-node, id) or position, so focus, scroll, typed
+// text, checked boxes, open <details> and the row a ⋯ menu belongs to all survive a refresh.
+const KEY_ATTRS = ["data-key", "data-svc", "data-node", "id"];
+function keyOf(n) {
+  if (n.nodeType !== 1) return null;
+  for (const a of KEY_ATTRS) { const v = n.getAttribute(a); if (v != null) return `${n.nodeName}|${a}=${v}`; }
+  return null;
+}
+const keepAttr = (el, name) => name === "style" || name === "aria-expanded" || (name === "open" && (el.tagName === "DETAILS" || el.tagName === "DIALOG"));
+function syncAttrs(el, to) {
+  if (el === document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return;
+  for (const { name } of [...el.attributes]) if (!to.hasAttribute(name) && !keepAttr(el, name)) el.removeAttribute(name);
+  for (const { name, value } of [...to.attributes]) if (el.getAttribute(name) !== value && !keepAttr(el, name)) el.setAttribute(name, value);
+}
+function morphChildren(from, to) {
+  const old = [...from.childNodes], neu = [...to.childNodes], keyed = new Map(), used = new Set();
+  old.forEach((n) => { const k = keyOf(n); if (k) keyed.set(k, n); });
+  neu.forEach((nn, i) => {
+    const k = keyOf(nn), cand = old[i];
+    const match = k ? keyed.get(k) : cand && cand.nodeName === nn.nodeName && !keyOf(cand) ? cand : null;
+    const ref = from.childNodes[i] || null;
+    if (match && !used.has(match)) {
+      used.add(match);
+      if (match.nodeType === 1) {
+        syncAttrs(match, nn);
+        if (!(match === document.activeElement && match.tagName === "SELECT") && match.tagName !== "TEXTAREA") morphChildren(match, nn);
+      } else if (match.nodeValue !== nn.nodeValue) match.nodeValue = nn.nodeValue;
+      if (ref !== match) from.insertBefore(match, ref);
+    } else from.insertBefore(nn, ref);
+  });
+  while (from.childNodes.length > neu.length) from.lastChild.remove();
+}
+function morphInto(root, html, svg = false) {
+  const t = document.createElement("template");
+  t.innerHTML = svg ? `<svg xmlns="${SVG_NS}">${html}</svg>` : html;
+  morphChildren(root, svg ? t.content.firstElementChild : t.content);
+}
+function paint(html) {
+  const v = view();
+  if (v.dataset.page !== PAGE.key) { v.innerHTML = html; v.dataset.page = PAGE.key; } else morphInto(v, html);
+  $$("[data-w]", v).forEach((i) => (i.style.transform = `scaleX(${i.dataset.w})`));
+}
+// GET for the current page: aborted when the page changes, kept as the page's last data for an instant repaint.
+const LAST = {};
+async function get(path) {
+  const pg = PAGE;
+  const r = await api(path, { signal: pg.ctl.signal, fresh: pg.fresh });
+  if (pg.ctl.signal.aborted) throw new DOMException("page changed", "AbortError");
+  if (r.status === 200) LAST[path] = r.data;
+  return r;
+}
+// One endpoint: paint the last data at once (or a placeholder), then the new data.
+async function load1(path, what, render) {
+  if (!PAGE.soft) { if (LAST[path] !== undefined) render(LAST[path]); else loading(what); }
+  const { data } = await get(path);
+  render(data);
+}
+// Several endpoints fetched in parallel. A first render paints each part as it arrives; a refresh paints once at the end.
+async function progressive(paths, draw) {
+  const pg = PAGE, D = paths.map((p) => LAST[p]);
+  if (!pg.soft) draw(D);
+  await Promise.all(paths.map((p, i) => get(p).then(({ data }) => { D[i] = data; if (!pg.soft) draw(D); })));
+  if (pg.soft) draw(D);
+}
 function stateLine(c) {
   const st = c.state === "running" ? (c.health && c.health !== "healthy" ? "warn" : "ok") : "bad";
   return pill(c.state + (c.health ? ` · ${c.health}` : ""), st);
@@ -171,27 +245,31 @@ function stateLine(c) {
 const fmtBytes = (b) => (b >= 1e12 ? (b / 1e12).toFixed(1) + " TB" : b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(0) + " MB" : b >= 1e3 ? (b / 1e3).toFixed(0) + " KB" : (b || 0) + " B");
 async function vOverview() {
   setTitle("Overview");
-  loading("the stack");
-  const [{ data: s }, { data: cs }, { data: pend }, { data: dk }] = await Promise.all([api("/api/state"), api("/api/containers"), api("/api/pending"), api("/api/disk")]);
-  const fss = dk.filesystems || [];
+  await progressive(["/api/state", "/api/containers?lite=1", "/api/pending", "/api/disk"], ([s, cs, pend, dk]) => paint(overviewHtml(s, cs, pend, dk)));
+}
+// Any of the four parts may still be on its way (first visit): those show a placeholder until they arrive.
+function overviewHtml(st, csIn, pendIn, dk) {
+  const s = st || {}, cs = csIn || [], pend = pendIn || {};
+  const fss = dk?.filesystems || [];
   const worst = fss.reduce((a, f) => (!a || f.pct > a.pct ? f : a), null);
   const level = (pct) => (pct >= 95 ? "bad" : pct >= 85 ? "warn" : "");
-  STATE = s;
+  if (st) STATE = s;
   const exp = s.services || [];
   const running = cs.filter((c) => c.state === "running").length;
   const missing = exp.filter((x) => !cs.some((c) => c.service === x && c.state === "running"));
   const hl = s.health_last || {};
-  $("[data-topmeta]").innerHTML = `${pill("vexor " + (s.vexor || "?"))} ${pill("Wazuh " + (s.wazuh_version || "?"))}`;
+  if (st) setMeta(`${pill("vexor " + (s.vexor || "?"))} ${pill("Wazuh " + (s.wazuh_version || "?"))}`);
   const urls = Object.entries(s.urls || {}).filter(([, u]) => u);
-  view().innerHTML = `
+  const diskPct = worst?.pct ?? s.disk?.pct;
+  return `
     <section class="cards">
-      <article class="card"><h2>Stack</h2><p class="big">SOC=${esc(s.soc)}</p><p class="muted">${esc(s.layout || "")}</p></article>
-      <article class="card ${!missing.length ? "" : running === 0 && !s.stopped ? "card--bad" : "card--warn"}"><h2>Containers</h2><p class="big">${running} / ${exp.length} running</p>
-        <p class="muted">${!missing.length ? "every enabled service is up" : s.stopped ? "stopped with vexor stop - start it under Quick actions" : "not running: " + esc(missing.join(", "))}</p></article>
+      <article class="card"><h2>Stack</h2><p class="big">${st ? `SOC=${esc(s.soc)}` : SK}</p><p class="muted">${esc(s.layout || "")}</p></article>
+      <article class="card ${!st || !csIn || !missing.length ? "" : running === 0 && !s.stopped ? "card--bad" : "card--warn"}"><h2>Containers</h2><p class="big">${st && csIn ? `${running} / ${exp.length} running` : SK}</p>
+        <p class="muted">${!st || !csIn ? "" : !missing.length ? "every enabled service is up" : s.stopped ? "stopped with vexor stop - start it under Quick actions" : "not running: " + esc(missing.join(", "))}</p></article>
       <article class="card ${hl.fail > 0 ? "card--bad" : hl.warn > 0 ? "card--warn" : ""}"><h2>Last health check</h2>
-        <p class="big">${hl.epoch ? `${hl.pass} passed · ${hl.warn} warn · ${hl.fail} failed` : "not run yet"}</p>
-        <p class="muted">${hl.epoch ? new Date(hl.epoch * 1000).toLocaleString() : "the hourly timer runs it (vexor daemon install)"}</p></article>
-      <article class="card ${level(worst?.pct ?? s.disk?.pct ?? 0) ? "card--" + level(worst?.pct ?? s.disk?.pct ?? 0) : ""}"><h2>Disk</h2><p class="big">${esc(worst?.pct ?? s.disk?.pct ?? "?")}% used</p><p class="muted">${esc(worst ? worst.mount + " (fullest)" : s.disk?.path || "")}</p></article>
+        <p class="big">${!st ? SK : hl.epoch ? `${hl.pass} passed · ${hl.warn} warn · ${hl.fail} failed` : "not run yet"}</p>
+        <p class="muted">${!st ? "" : hl.epoch ? new Date(hl.epoch * 1000).toLocaleString() : "the hourly timer runs it (vexor daemon install)"}</p></article>
+      <article class="card ${level(diskPct ?? 0) ? "card--" + level(diskPct ?? 0) : ""}"><h2>Disk</h2><p class="big">${diskPct == null ? (st || dk ? "?% used" : SK) : `${esc(diskPct)}% used`}</p><p class="muted">${esc(worst ? worst.mount + " (fullest)" : s.disk?.path || "")}</p></article>
     </section>
     ${s.legacy_project ? `<section class="pending"><p><b>The Docker project is still named <code>${esc(s.project)}</code>.</b> Vexor 2 names it <code>vexor</code>. <code>vexor migrate</code> copies and checks every volume, then switches. The old volumes are kept; once the stack works, run <code>vexor migrate --yes</code> in the Terminal to remove them. Take a backup first.</p><div class="actions">${btn("Migrate to vexor", ["migrate"], "btn--danger-ghost")}</div></section>` : ""}
     ${pend.keys?.length ? `<section class="pending"><p><b>${pend.keys.length} .env change${pend.keys.length > 1 ? "s" : ""} not applied yet:</b> <code>${esc(pend.keys.join(" "))}</code></p><div class="actions">${btn("Show plan", ["plan"])}${btn("Apply", ["config", "apply"], "btn--primary")}</div></section>` : ""}
@@ -201,17 +279,15 @@ async function vOverview() {
         <tbody>${fss.map((f) => `<tr><td class="mono"><b>${esc(f.mount)}</b></td><td class="small">${esc((f.roles || []).join(", ") || "-")}</td>
           <td class="num">${esc(fmtBytes(f.used))} / ${esc(fmtBytes(f.size))}</td><td class="num">${esc(fmtBytes(f.avail))}</td>
           <td class="w-bar"><span class="bar ${level(f.pct) ? "bar--" + level(f.pct) : ""}"><i data-w="${Math.min(100, f.pct) / 100}"></i></span></td>
-          <td>${pill(f.pct + "%", level(f.pct) === "bad" ? "bad" : level(f.pct) === "warn" ? "warn" : "ok")}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">Disk usage is not available.</td></tr>'}</tbody></table></div>
+          <td>${pill(f.pct + "%", level(f.pct) === "bad" ? "bad" : level(f.pct) === "warn" ? "warn" : "ok")}</td></tr>`).join("") || `<tr><td colspan="6" class="muted">${dk ? "Disk usage is not available." : SK}</td></tr>`}</tbody></table></div>
       <p class="muted small">Amber from 85%, red from 95%. Free space with <a href="#reset">Reset</a> (prune unused volumes or images).</p></section>
     <section class="block"><h2>Open</h2>
-      <div class="links">${urls.map(([k, u]) => `<a class="linkcard" href="${esc(u)}" target="_blank" rel="noopener"><b>${esc(k)}</b><span>${esc(u)}</span></a>`).join("") || '<p class="muted">No web UIs enabled.</p>'}</div></section>
+      <div class="links">${urls.map(([k, u]) => `<a class="linkcard" href="${esc(u)}" target="_blank" rel="noopener"><b>${esc(k)}</b><span>${esc(u)}</span></a>`).join("") || (st ? '<p class="muted">No web UIs enabled.</p>' : `<p class="muted">${SK}</p>`)}</div></section>
     ${(s.reminders || []).length ? `<section class="block"><h2>Reminders</h2><ul class="list">${s.reminders.map((r) => `<li><b>${esc(r.msg)}</b><code>${esc(r.cmd)}</code></li>`).join("")}</ul></section>` : ""}
     <section class="block"><h2>Quick actions</h2><div class="actions">
       ${btn("Status", ["status"])}${btn("Wait until ready", ["wait-ready", "--timeout", "600"])}${btn("Doctor", ["doctor"])}${btn("Doctor --fix", ["doctor", "--fix"], "btn--primary")}${btn("Start stack", ["start"])}${btn("Backup now", ["backup", "run"])}${btn("AI report", ["ai-context", "--print"])}
     </div></section>
-    <section class="block"><h2>Services</h2><div class="svc-grid">${exp.map((x) => { const c = cs.find((y) => y.service === x); return `<a class="svc ${c?.state === "running" ? "" : "svc--down"}" href="#containers"><b>${esc(x)}</b>${c ? stateLine(c) : pill("missing", "bad")}</a>`; }).join("")}</div></section>`;
-  $$("[data-w]").forEach((i) => (i.style.transform = `scaleX(${i.dataset.w})`));
-  bindRunButtons(view());
+    <section class="block"><h2>Services</h2><div class="svc-grid">${st ? exp.map((x) => { const c = cs.find((y) => y.service === x); return `<a class="svc ${c?.state === "running" ? "" : "svc--down"}" href="#containers" data-key="${esc(x)}"><b>${esc(x)}</b>${c ? stateLine(c) : csIn ? pill("missing", "bad") : SK}</a>`; }).join("") : `<p class="muted">${SK}</p>`}</div></section>`;
 }
 
 // Row menu: one floating menu for the whole page, anchored to the button that opened it.
@@ -283,17 +359,59 @@ function showMenu(trigger, items, label) {
 }
 
 const SELECTED = new Set();   // container selection, keyed by service name; survives re-renders
+let CS = [];                  // the containers on the page, for the ⋯ menu and bulk actions
+function ctSync() {
+  const boxes = $$("[data-sel]", view()), all = $("[data-sel-all]", view()), bar = $("[data-bulk]", view());
+  if (!all || !bar) return;
+  const n = boxes.filter((b) => b.checked).length;
+  boxes.forEach((b) => b.closest("tr").classList.toggle("is-sel", b.checked));
+  all.checked = n > 0 && n === boxes.length;
+  all.indeterminate = n > 0 && n < boxes.length;
+  bar.hidden = n === 0;
+  $("[data-bulk-n]", bar).textContent = `${n} selected`;
+}
 async function vContainers() {
   setTitle("Containers");
-  loading("containers");
-  const { data: cs } = await api("/api/containers");
+  view().onchange = (e) => {
+    const b = e.target;
+    if (b.matches("[data-sel]")) b.checked ? SELECTED.add(b.dataset.sel) : SELECTED.delete(b.dataset.sel);
+    else if (b.matches("[data-sel-all]")) $$("[data-sel]", view()).forEach((x) => { x.checked = b.checked; b.checked ? SELECTED.add(x.dataset.sel) : SELECTED.delete(x.dataset.sel); });
+    else return;
+    ctSync();
+  };
+  view().onclick = (e) => {
+    const act = e.target.closest("[data-bulk-act]"), more = e.target.closest("[data-more]");
+    if (act) {
+      const sel = CS.map((c) => c.service).filter((n) => SELECTED.has(n)), k = act.dataset.bulkAct;
+      if (k === "clear") { SELECTED.clear(); $$("[data-sel]", view()).forEach((x) => (x.checked = false)); ctSync(); return; }
+      if (sel.length) run(k === "logs" ? ["logs", "-n", "300", ...sel] : [k, ...sel]);   // start/stop/restart/logs accept several services
+    }
+    if (more) {
+      if (openMenu?.btn === more) return closeMenu();
+      const c = CS.find((x) => x.service === more.dataset.more);
+      if (!c) return;
+      showMenu(more, [
+        { label: "Logs (last 300)", onSelect: () => run(["logs", c.service, "-n", "300"]) },
+        { label: "Follow logs", onSelect: () => run(["logs", c.service, "-f", "-n", "50"]) },
+        "-",
+        { label: "Restart", onSelect: () => run(["restart", c.service]) },
+        c.state === "running" ? { label: "Stop", onSelect: () => run(["stop", c.service]) } : { label: "Start", onSelect: () => run(["start", c.service]) },
+        "-",
+        { label: "Show on map", onSelect: () => { location.hash = "#map"; } },
+      ], `Actions for ${c.service}`);
+    }
+  };
+  await load1("/api/containers", "containers", containersPaint);
+}
+function containersPaint(cs) {
+  CS = cs;
   const names = cs.map((c) => c.service);
   [...SELECTED].forEach((n) => { if (!names.includes(n)) SELECTED.delete(n); });
-  view().innerHTML = `
+  paint(`
     <div class="actions actions--compact">${btn("Start all", ["start"])}${btn("Restart all", ["restart"])}${btn("Stop all", ["stop"], "btn--danger-ghost")}${btn("Errors (1h)", ["logs", "errors", "--since", "1h"])}</div>
     <div class="table-wrap"><table class="table">
       <thead><tr><th class="chk"><input type="checkbox" data-sel-all aria-label="Select all containers"></th><th>Service</th><th>State</th><th>Status</th><th>CPU</th><th>Memory</th><th>Ports</th><th>Image</th><th><span class="vh">Actions</span></th></tr></thead>
-      <tbody>${cs.map((c) => `<tr data-svc="${esc(c.service)}">
+      <tbody>${cs.map((c) => `<tr data-svc="${esc(c.service)}"${SELECTED.has(c.service) ? ' class="is-sel"' : ""}>
         <td class="chk"><input type="checkbox" data-sel="${esc(c.service)}" aria-label="Select ${esc(c.service)}"></td>
         <td><b>${esc(c.service)}</b></td><td>${stateLine(c)}</td><td class="muted">${esc(c.status)}</td>
         <td class="num">${esc(c.cpu || "-")}</td><td class="num">${esc(c.mem || "-")}</td>
@@ -301,54 +419,24 @@ async function vContainers() {
         <td class="mono small">${esc(c.image)}</td>
         <td class="row-more"><button type="button" class="btn btn--ghost more" data-more="${esc(c.service)}" aria-haspopup="menu" aria-expanded="false" aria-label="Actions for ${esc(c.service)}">${MORE_ICON}</button></td>
       </tr>`).join("") || '<tr><td colspan="9" class="muted">No containers yet.</td></tr>'}</tbody></table></div>
-    <div class="bulk" data-bulk role="region" aria-label="Bulk actions" hidden>
-      <b data-bulk-n></b>
+    <div class="bulk" data-bulk role="region" aria-label="Bulk actions"${SELECTED.size ? "" : " hidden"}>
+      <b data-bulk-n>${SELECTED.size} selected</b>
       <button type="button" class="btn btn--sm" data-bulk-act="start">Start</button>
       <button type="button" class="btn btn--sm" data-bulk-act="stop">Stop</button>
       <button type="button" class="btn btn--sm" data-bulk-act="restart">Restart</button>
       <button type="button" class="btn btn--sm" data-bulk-act="logs">Logs</button>
       <button type="button" class="btn btn--sm btn--ghost" data-bulk-act="clear">Clear</button>
     </div>
-    <p class="muted small">Managers are recreated on restart, so they load the current ossec.conf. Data stays in volumes. Bulk actions run one vexor command for all selected services.</p>`;
-  bindRunButtons(view());
-  const boxes = $$("[data-sel]", view()), all = $("[data-sel-all]", view()), bar = $("[data-bulk]", view());
-  const sync = () => {
-    const n = boxes.filter((b) => b.checked).length;
-    boxes.forEach((b) => b.closest("tr").classList.toggle("is-sel", b.checked));
-    all.checked = n > 0 && n === boxes.length;
-    all.indeterminate = n > 0 && n < boxes.length;
-    bar.hidden = n === 0;
-    $("[data-bulk-n]", bar).textContent = `${n} selected`;
-  };
-  boxes.forEach((b) => { b.checked = SELECTED.has(b.dataset.sel); b.addEventListener("change", () => { b.checked ? SELECTED.add(b.dataset.sel) : SELECTED.delete(b.dataset.sel); sync(); }); });
-  all.addEventListener("change", () => { boxes.forEach((b) => { b.checked = all.checked; all.checked ? SELECTED.add(b.dataset.sel) : SELECTED.delete(b.dataset.sel); }); sync(); });
-  $$("[data-bulk-act]", bar).forEach((b) => b.addEventListener("click", () => {
-    const sel = names.filter((n) => SELECTED.has(n)), k = b.dataset.bulkAct;
-    if (k === "clear") { SELECTED.clear(); boxes.forEach((x) => (x.checked = false)); sync(); return; }
-    if (!sel.length) return;
-    run(k === "logs" ? ["logs", "-n", "300", ...sel] : [k, ...sel]);   // start/stop/restart/logs accept several services
-  }));
-  $$("[data-more]", view()).forEach((b) => b.addEventListener("click", () => {
-    if (openMenu?.btn === b) return closeMenu();
-    const c = cs.find((x) => x.service === b.dataset.more);
-    showMenu(b, [
-      { label: "Logs (last 300)", onSelect: () => run(["logs", c.service, "-n", "300"]) },
-      { label: "Follow logs", onSelect: () => run(["logs", c.service, "-f", "-n", "50"]) },
-      "-",
-      { label: "Restart", onSelect: () => run(["restart", c.service]) },
-      c.state === "running" ? { label: "Stop", onSelect: () => run(["stop", c.service]) } : { label: "Start", onSelect: () => run(["start", c.service]) },
-      "-",
-      { label: "Show on map", onSelect: () => { location.hash = "#map"; } },
-    ], `Actions for ${c.service}`);
-  }));
-  sync();
+    <p class="muted small">Managers are recreated on restart, so they load the current ossec.conf. Data stays in volumes. Bulk actions run one vexor command for all selected services.</p>`);
+  $$("[data-sel]", view()).forEach((b) => (b.checked = SELECTED.has(b.dataset.sel)));
+  ctSync();
 }
 
 async function vPorts() {
   setTitle("Ports");
   loading("ports");
-  const { data: ps } = await api("/api/ports");
-  view().innerHTML = `
+  const { data: ps } = await get("/api/ports");
+  paint(`
     <p class="lede">Every port comes from <code>.env</code>. Change a value, check it, then apply: Vexor rewrites nginx and the compose override and recreates only what uses the port.</p>
     <form class="ports" data-ports-form>
       <div class="table-wrap"><table class="table">
@@ -360,7 +448,7 @@ async function vPorts() {
           <td>${pill(p.audience, { endpoints: "ok", admins: "accent", restricted: "warn", host: "" }[p.audience])}</td>
           <td>${!p.inUse ? pill("not in use") : p.listening ? pill("yes", "ok") : pill("no", "bad")}</td></tr>`).join("")}</tbody></table></div>
       <div class="actions"><button class="btn btn--sm" type="button" data-ports-check>Check</button><button class="btn btn--sm btn--primary" type="submit" data-ports-apply disabled>Apply changes</button><span class="muted small" data-ports-msg>No changes.</span></div>
-    </form>`;
+    </form>`);
   const form = $("[data-ports-form]");
   const changes = () => Object.fromEntries($$("input[data-orig]", form).filter((i) => i.value.trim() !== i.dataset.orig).map((i) => [i.name, i.value.trim()]));
   const refresh = () => {
@@ -404,30 +492,30 @@ async function applySettings(changes, text) {
     r = await api("/api/settings/apply", { body: { changes, confirmed: true } });
   }
   if (r.status !== 200) { toast(r.data.error || Object.entries(r.data.errors || {}).map(([k, v]) => `${k}: ${v}`).join("; ") || "Refused.", "bad"); return; }
-  openJob(r.data, () => route(true));
+  const key = PAGE.key;
+  openJob(r.data, (code) => { if (code === 0 && PAGE.key === key) route(); });
 }
 
 async function vVolumes() {
   setTitle("Volumes");
-  loading("volumes (sizes take a few seconds)");
-  const { data: vs } = await api("/api/volumes");
+  view().onclick = (e) => { if (e.target.closest("[data-vol-fresh]")) refresh({ fresh: true, force: true }); };
+  await load1("/api/volumes", "volumes (sizes take a few seconds)", volumesPaint);
+}
+function volumesPaint(vs) {
   const total = vs.reduce((a, v) => a + (v.bytes || 0), 0);
   const fmt = (b) => (b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(0) + " MB" : b >= 1e3 ? (b / 1e3).toFixed(0) + " KB" : b + " B");
   const max = Math.max(1, ...vs.map((v) => v.bytes || 0));
-  view().innerHTML = `
+  paint(`
     <p class="lede">${vs.length} volumes, ${fmt(total)} in total. Everything Vexor keeps lives here: alerts, agent keys, rules, workflows.</p>
     <div class="actions">${btn("Backup all (live)", ["volumes", "backup", "all"])}${btn("Full backup (snapshot + state)", ["backup", "run"], "btn--primary")}${btn("List backups", ["backup", "list"])}${btn("Show unused volumes", ["volumes", "orphans"])}${btn("Remove unused volumes", ["volumes", "prune"], "btn--danger-ghost")}<button class="btn btn--sm btn--ghost" type="button" data-vol-fresh>Recount sizes</button></div>
     <div class="table-wrap"><table class="table">
       <thead><tr><th>Volume</th><th>Size</th><th class="w-bar"><span class="vh">Share</span></th><th>Used by</th><th><span class="vh">Actions</span></th></tr></thead>
-      <tbody>${vs.map((v) => `<tr>
+      <tbody>${vs.map((v) => `<tr data-key="${esc(v.name)}">
         <td class="mono"><b>${esc(v.name)}</b></td><td class="num">${esc(fmt(v.bytes || 0))}</td>
         <td class="w-bar"><span class="bar"><i data-w="${(v.bytes || 0) / max}"></i></span></td>
         <td class="small">${v.users?.length ? esc(v.users.join(", ")) : pill("unused", "warn")}</td>
         <td class="row-actions">${btn("Backup", ["volumes", "backup", v.short])}${v.users?.length ? "" : btn("Remove", ["volumes", "rm", v.short], "btn--danger-ghost")}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">No volumes yet - they are created when the stack starts.</td></tr>'}</tbody></table></div>
-    <p class="muted small">A live volume backup of a running indexer can be inconsistent; the full backup uses an indexer snapshot. Restores run from the terminal: <code>vexor volumes restore &lt;volume&gt; &lt;file&gt;</code>.</p>`;
-  $$("[data-w]").forEach((i) => (i.style.transform = `scaleX(${i.dataset.w})`));
-  bindRunButtons(view());
-  $("[data-vol-fresh]").addEventListener("click", async () => { loading("volumes"); await api("/api/volumes?fresh=1"); route(true); });
+    <p class="muted small">A live volume backup of a running indexer can be inconsistent; the full backup uses an indexer snapshot. Restores run from the terminal: <code>vexor volumes restore &lt;volume&gt; &lt;file&gt;</code>.</p>`);
 }
 
 const STACKS = (s) => {
@@ -456,10 +544,11 @@ const STACKS = (s) => {
 };
 async function vStacks() {
   setTitle("Stacks");
-  loading("stacks");
-  const { data: s } = await api("/api/state");
+  await load1("/api/state", "stacks", stacksPaint);
+}
+function stacksPaint(s) {
   STATE = s;
-  view().innerHTML = `<div class="stacks">${STACKS(s).map((k) => `
+  paint(`<div class="stacks">${STACKS(s).map((k) => `
     <article class="stack ${k.on ? "" : "stack--off"}" id="stack-${k.id}">
       <header class="stack__head"><h2>${esc(k.name)}</h2>${k.on ? pill("on", "ok") : pill("off")}
         ${k.toggle ? btn(k.on ? "Disable" : "Enable", ["tools", k.on ? "disable" : "enable", k.toggle], k.on ? "btn--danger-ghost" : "btn--primary") : ""}</header>
@@ -470,26 +559,24 @@ async function vStacks() {
     <section class="block"><h2>Certificates, backups, automation</h2><div class="actions">
       ${btn("Certificate status", ["cert", "status"])}${btn("Create local-CA cert", ["cert", "create"])}${btn("Renew", ["cert", "renew"])}
       ${btn("Retention", ["retention", "status"])}${btn("Apply retention", ["retention", "apply"])}${btn("Daemon status", ["daemon", "status"])}${btn("Install daemon", ["daemon", "install"])}${btn("Update check", ["update", "check"])}
-    </div></section>`;
-  bindRunButtons(view());
+    </div></section>`);
 }
 
 async function vHealth() {
   setTitle("Health");
-  view().innerHTML = `
+  paint(`
     <p class="lede">The doctor runs about 60 checks. With --fix it repairs what it safely can, the same as the hourly timer.</p>
     <div class="actions">${btn("Run doctor", ["doctor"], "btn--primary")}${btn("Doctor --fix", ["doctor", "--fix"])}${btn("Health details", ["health"])}${btn("Recent errors", ["logs", "errors", "--since", "1h"])}${btn("Reminders", ["reminders"])}${btn("AI report", ["ai-context", "--print"])}${btn("Watchdog pass", ["watchdog"])}</div>
     <section class="block"><h2>Notifications</h2>
       <p class="muted">The hourly check sends problems it could not fix to <code>NOTIFY_URL</code> (Slack, Teams, Discord or any JSON webhook), or to your n8n webhook when that is empty. Set the URL and <code>NOTIFY_ON</code> under Settings.</p>
-      <div class="actions">${btn("Notification status", ["notify"])}${btn("Send a test", ["notify", "test"], "btn--primary")}</div></section>`;
-  bindRunButtons(view());
+      <div class="actions">${btn("Notification status", ["notify"])}${btn("Send a test", ["notify", "test"], "btn--primary")}</div></section>`);
 }
 
 async function vSettings() {
   setTitle("Settings");
   loading("settings");
-  const { data: rows } = await api("/api/settings");
-  view().innerHTML = `
+  const { data: rows } = await get("/api/settings");
+  paint(`
     <p class="lede">All of <code>.env</code>. Passwords and keys are hidden; change them with their commands (Security below). Ports have their own page.</p>
     <label class="search"><span class="vh">Filter</span><input class="in" placeholder="Filter settings" data-set-filter></label>
     <form data-set-form><div class="table-wrap"><table class="table">
@@ -502,7 +589,7 @@ async function vSettings() {
     </form>
     <section class="block"><h2>Security</h2><div class="actions">
       ${btn("New admin password", ["passwd", "admin", "--generate"], "btn--danger-ghost")}${btn("New API password", ["passwd", "api", "--generate"], "btn--danger-ghost")}${btn("New dashboard password", ["passwd", "kibanaserver", "--generate"], "btn--danger-ghost")}${btn("Enrollment password on", ["agents", "password", "on"])}${btn("New console password", ["console", "password", "--generate"], "btn--danger-ghost")}
-    </div><p class="muted small">New passwords appear in the output once; they are also stored in .env.</p></section>`;
+    </div><p class="muted small">New passwords appear in the output once; they are also stored in .env.</p></section>`);
   const form = $("[data-set-form]");
   const changes = () => Object.fromEntries($$("input[data-orig]", form).filter((i) => i.value !== i.dataset.orig).map((i) => [i.name, i.value]));
   form.addEventListener("input", () => {
@@ -513,7 +600,6 @@ async function vSettings() {
   });
   form.addEventListener("submit", (e) => { e.preventDefault(); applySettings(changes()); });
   $("[data-set-filter]").addEventListener("input", (e) => { const q = e.target.value.toLowerCase(); $$("[data-row]", form).forEach((r) => (r.hidden = q && !r.dataset.row.includes(q))); });
-  bindRunButtons(view());
 }
 
 const RESETS = [
@@ -528,22 +614,22 @@ const RESETS = [
 ];
 async function vReset() {
   setTitle("Reset");
-  view().innerHTML = `
+  paint(`
     <p class="lede">Remove Vexor, or free disk space. Each action shows the command and asks you to type its name before it runs. Take a backup first (Volumes page).</p>
     <div class="resets">${RESETS.map((r, i) => `<article class="reset"><h2>${esc(r.title)}</h2><p class="small">${esc(r.what)}</p><code class="mono small">vexor ${esc(r.args.join(" "))}</code>
-      <div class="actions"><button type="button" class="btn btn--sm btn--danger-ghost" data-reset="${i}">${esc(r.title)}…</button></div></article>`).join("")}</div>`;
+      <div class="actions"><button type="button" class="btn btn--sm btn--danger-ghost" data-reset="${i}">${esc(r.title)}…</button></div></article>`).join("")}</div>`);
   $$("[data-reset]").forEach((b) => b.addEventListener("click", () => { const r = RESETS[+b.dataset.reset]; run(r.args, { text: r.what }); }));
 }
 
 const SUGGEST = ["status", "doctor", "doctor --fix", "wazuh alerts -n 20", "agents list", "elk", "elk indices", "n8n", "n8n test", "suricata", "suricata alerts --since 1h", "suricata test", "zeek", "zeek top hosts", "tools", "soc", "volumes ls", "backup list", "cert status", "logs errors --since 1h", "logs nginx -n 100", "retention status", "disk", "volumes orphans", "wait-ready", "update check", "version", "reminders"];
 async function vTerminal() {
   setTitle("Terminal");
-  view().innerHTML = `
+  paint(`
     <p class="lede">Type any vexor command. Reading runs at once; changes ask first; commands that delete or switch layouts ask you to type their name. Interactive ones (shell, exec, logtest, config edit) stay in SSH.</p>
     <form class="term" data-term><span class="term__p">vexor</span><input class="in in--term" name="cmd" list="vx-suggest" placeholder="suricata alerts --since 1h" autocomplete="off" spellcheck="false" autofocus><button class="btn btn--primary btn--sm">Run</button></form>
     <datalist id="vx-suggest">${SUGGEST.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>
     <div class="chips">${SUGGEST.slice(0, 14).map((s) => `<button type="button" class="chip" data-fill="${esc(s)}">${esc(s)}</button>`).join("")}</div>
-    <h2 class="sub">History</h2><ol class="hist" data-hist></ol>`;
+    <h2 class="sub">History</h2><ol class="hist" data-hist></ol>`);
   const f = $("[data-term]"), inp = $("[name=cmd]", f);
   const hist = JSON.parse(sessionStorage.getItem("vx-hist") || "[]");
   const drawHist = () => ($("[data-hist]").innerHTML = hist.slice(0, 20).map((h) => `<li><button type="button" class="link-btn mono" data-fill="${esc(h)}">vexor ${esc(h)}</button></li>`).join("") || '<li class="muted">Nothing yet.</li>');
@@ -560,23 +646,24 @@ async function vTerminal() {
 
 async function vActivity() {
   setTitle("Activity");
-  loading("activity");
-  const [{ data: jobs }, { data: log }] = await Promise.all([api("/api/jobs"), api("/api/audit")]);
-  view().innerHTML = `
+  view().onclick = (e) => { const b = e.target.closest("[data-job]"); if (b) openJob(JSON.parse(b.dataset.job)); };
+  await progressive(["/api/jobs", "/api/audit"], ([jobsIn, logIn]) => {
+    const jobs = jobsIn || [], log = logIn || [];
+    paint(`
     <section class="block"><h2>Commands this session of the console</h2>
       <div class="table-wrap"><table class="table"><thead><tr><th>Started</th><th>Command</th><th>By</th><th>Result</th><th></th></tr></thead>
-      <tbody>${jobs.map((j) => `<tr><td class="num small">${new Date(j.started * 1000).toLocaleTimeString()}</td><td class="mono small">${esc(j.cmd)}</td><td>${esc(j.user)}</td>
+      <tbody>${jobs.map((j) => `<tr data-key="${esc(j.id)}"><td class="num small">${new Date(j.started * 1000).toLocaleTimeString()}</td><td class="mono small">${esc(j.cmd)}</td><td>${esc(j.user)}</td>
         <td>${j.ended ? pill(j.code === 0 ? "done" : "exit " + j.code, j.code === 0 ? "ok" : "bad") : pill("running", "warn")}</td>
-        <td><button type="button" class="btn btn--sm btn--ghost" data-job='${esc(JSON.stringify(j))}'>Output</button></td></tr>`).join("") || '<tr><td colspan="5" class="muted">No commands yet.</td></tr>'}</tbody></table></div></section>
-    <section class="block"><h2>Audit log</h2><pre class="audit">${esc(log.join("\n")) || "empty"}</pre><p class="muted small">Kept in .state/console-audit.log on the host.</p></section>`;
-  $$("[data-job]").forEach((b) => b.addEventListener("click", () => openJob(JSON.parse(b.dataset.job))));
+        <td><button type="button" class="btn btn--sm btn--ghost" data-job='${esc(JSON.stringify(j))}'>Output</button></td></tr>`).join("") || `<tr><td colspan="5" class="muted">${jobsIn ? "No commands yet." : SK}</td></tr>`}</tbody></table></div></section>
+    <section class="block"><h2>Audit log</h2><pre class="audit">${logIn ? esc(log.join("\n")) || "empty" : SK}</pre><p class="muted small">Kept in .state/console-audit.log on the host.</p></section>`);
+  });
 }
 
 async function vLogins() {
   setTitle("Logins");
   loading("logins");
-  const { data: rows } = await api("/api/logins");
-  view().innerHTML = `
+  const { data: rows } = await get("/api/logins");
+  paint(`
     <p class="lede">Every login Vexor manages, for the stacks and tools that are on. Passwords stay hidden until you show or copy one; each one you reveal is written to the audit log. Same as <code>vexor login</code> on the host.</p>
     <div class="table-wrap"><table class="table">
       <thead><tr><th>Service</th><th>Address</th><th>User</th><th>Password</th><th>About</th></tr></thead>
@@ -588,7 +675,7 @@ async function vLogins() {
             <button type="button" class="btn btn--xs btn--ghost" data-show="${esc(r.id)}">Show</button>
             <button type="button" class="btn btn--xs btn--ghost" data-copy-secret="${esc(r.id)}">Copy</button>` : r.key ? pill("not generated yet", "warn") : '<span class="muted">-</span>'}</td>
         <td class="small muted">${esc(r.note)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">Nothing enabled has a login.</td></tr>'}</tbody></table></div>
-    <p class="muted small">Grafana and Portainer apply their admin password on first start only; if you changed it inside the tool, Vexor no longer knows it. n8n keeps its own accounts.</p>`;
+    <p class="muted small">Grafana and Portainer apply their admin password on first start only; if you changed it inside the tool, Vexor no longer knows it. n8n keeps its own accounts.</p>`);
   const reveal = async (id) => {
     const { status, data } = await api("/api/logins/reveal", { body: { id } });
     if (status !== 200) { toast(data.error || "Could not read the password.", "bad"); return null; }
@@ -610,15 +697,14 @@ async function vLogins() {
 
 // ---------------------------------------------------------------- map
 // Live map of the project's containers from /api/map: role layers top to bottom, edges only for connections the
-// server saw in /proc. Polls every 3 s while the page is visible and #map is open.
+// server saw in /proc. Refreshed every 3 s by the live loop (see "live refresh"), updated in place.
 const MAP_LAYERS = [
   ["external", "Outside the project"], ["edge", "Edge"], ["ingest", "Managers and ingest"], ["data", "Indexers and storage"],
   ["ui", "Dashboards"], ["tools", "Tools"], ["other", "Other containers"],
 ];
 const MAP_STATUS = { ok: "running", issue: "issue", offline: "offline", missing: "missing" };
 const SVG_NS = "http://www.w3.org/2000/svg";
-let mapTimer = null, mapGen = 0, mapData = null, mapSel = null, mapRO = null;
-function stopMap() { clearTimeout(mapTimer); mapTimer = null; mapGen++; mapRO?.disconnect(); mapRO = null; }
+let mapData = null, mapSel = null, mapRO = null;
 function mapLayer(n) {
   const s = n.service || "";
   if (n.id === "external") return "external";
@@ -730,7 +816,7 @@ function drawMap(d) {
     const isLive = live(p.from) && live(p.to);
     const w = Math.min(7, 1.25 + Math.log2(p.count + 1) * 1.3).toFixed(2);
     const title = `${a.n.service} → ${b.n.service}: ${p.ports.join(", ")} (${p.count} established)`;
-    return `<g class="medge ${isLive ? "is-live" : ""}"><title>${esc(title)}</title>
+    return `<g class="medge ${isLive ? "is-live" : ""}" data-key="${esc(p.from + ">" + p.to)}"><title>${esc(title)}</title>
       <path class="medge__line" d="${path}" stroke-width="${w}" marker-end="url(#map-arrow)"/>
       ${L.narrow ? "" : `<text class="medge__lbl" x="${mx.toFixed(1)}" y="${(my + 4).toFixed(1)}" text-anchor="middle">${esc(p.ports.slice(0, 2).join(", ") + (p.ports.length > 2 ? " …" : ""))}</text>`}</g>`;
   }).join("");
@@ -750,9 +836,9 @@ function drawMap(d) {
   const svg = $("[data-map-svg]");
   svg.setAttribute("viewBox", `0 0 ${L.W} ${L.H}`);
   svg.setAttribute("height", L.H);
-  svg.innerHTML = `<defs><marker id="map-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" class="medge__head"/></marker></defs>
+  morphInto(svg, `<defs><marker id="map-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" class="medge__head"/></marker></defs>
     ${L.labels.map((l) => `<text class="mlayer" x="${L.narrow ? 8 : 16}" y="${l.y}">${esc(l.label.toUpperCase())}</text>`).join("")}
-    <g>${edgeSvg}</g><g>${nodeSvg}</g>`;
+    <g>${edgeSvg}</g><g>${nodeSvg}</g>`, true);
 }
 
 function mapSummary(d) {
@@ -761,13 +847,13 @@ function mapSummary(d) {
   const measured = rates.filter((n) => n.traffic.rxRate != null);
   const rx = measured.reduce((a, n) => a + n.traffic.rxRate, 0), tx = measured.reduce((a, n) => a + n.traffic.txRate, 0);
   const ext = d.external || {};
-  $("[data-map-sum]").innerHTML = [
+  morphInto($("[data-map-sum]"), [
     pill(`${ns.filter((n) => n.state === "running").length} running`, "ok"),
     by("issue") ? pill(`${by("issue")} issue${by("issue") > 1 ? "s" : ""}`, "warn") : pill("0 issues"),
     by("offline") + by("missing") ? pill(`${by("offline")} offline · ${by("missing")} missing`, "bad") : pill("0 offline"),
     rates.length ? pill(measured.length ? `in ${fmtRate(rx)} · out ${fmtRate(tx)}` : "rates: measuring…") : "",
     d.limits ? "" : pill(`external: ${ext.inbound || 0} in · ${ext.outbound || 0} out`),
-  ].join(" ");
+  ].join(" "));
   $("[data-map-nets]").textContent = d.networks.length ? `Project ${d.project} · networks: ${d.networks.map((n) => `${n.name} (${n.containers})`).join(", ")}` : `Project ${d.project}`;
   const lim = $("[data-map-limits]");
   lim.hidden = !d.limits;
@@ -777,21 +863,21 @@ function mapSummary(d) {
 function mapPanel(d) {
   const panel = $("[data-map-panel]");
   const n = mapSel === "external" ? { id: "external" } : d.nodes.find((x) => x.id === mapSel);
-  if (!n) { panel.innerHTML = `<p class="muted small">Select a container on the map to see its state, networks, ports and connections.</p>`; return; }
+  if (!n) { morphInto(panel, `<p class="muted small">Select a container on the map to see its state, networks, ports and connections.</p>`); return; }
   const dl = (rows) => `<dl class="kv">${rows.filter(([, v]) => v !== "" && v != null).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("")}</dl>`;
   const name = (id) => esc(id === "external" ? "External" : d.nodes.find((x) => x.id === id)?.service || id);
   if (n.id === "external") {
     const ext = d.external || {};
     const rows = d.nodes.flatMap((x) => (x.connections || []).filter((c) => c.peer === "external").map((c) => ({ ...c, svc: x.service })));
-    panel.innerHTML = `<h2>External</h2><p class="muted small">Connections to and from addresses outside the project's networks: agents, browsers, other hosts. Connections through a published port can show the Docker gateway as their address.</p>
+    morphInto(panel, `<h2>External</h2><p class="muted small">Connections to and from addresses outside the project's networks: agents, browsers, other hosts. Connections through a published port can show the Docker gateway as their address.</p>
       ${dl([["Inbound", ext.inbound], ["Outbound", ext.outbound], ["Peers", ext.peers], ["Ports", esc(Object.entries(ext.ports || {}).map(([p, c]) => `${p} ×${c}`).join(", "))]])}
-      <h3>Connections</h3><ul class="conns">${rows.map((c) => `<li><span>${c.dir === "in" ? "in → " + esc(c.svc) : esc(c.svc) + " → out"} :${c.port}${c.proto === "udp" ? "/udp" : ""}</span><span class="muted">${c.count} · ${esc(c.ips.join(", "))}</span></li>`).join("") || '<li class="muted">None.</li>'}</ul>`;
+      <h3>Connections</h3><ul class="conns">${rows.map((c) => `<li><span>${c.dir === "in" ? "in → " + esc(c.svc) : esc(c.svc) + " → out"} :${c.port}${c.proto === "udp" ? "/udp" : ""}</span><span class="muted">${c.count} · ${esc(c.ips.join(", "))}</span></li>`).join("") || '<li class="muted">None.</li>'}</ul>`);
     return;
   }
   const t = n.traffic;
   const svc = n.service;
   const conns = n.connections;
-  panel.innerHTML = `<h2>${esc(svc)}</h2>
+  morphInto(panel, `<h2>${esc(svc)}</h2>
     <p>${pill(MAP_STATUS[n.status] || n.status, { ok: "ok", issue: "warn", offline: "bad", missing: "bad" }[n.status])} ${n.reasons?.length ? `<span class="small">${esc(n.reasons.join("; "))}</span>` : ""}</p>
     ${dl([["Container", esc(n.name)], ["State", esc(n.state)], ["Health", esc(n.health || "no healthcheck")], ["Restarts", n.restarts],
       ["Exit code", n.state === "running" || n.exitCode == null ? "" : esc(n.exitCode)], ["Out of memory", n.oom ? "yes, OOM-killed" : ""],
@@ -804,15 +890,17 @@ function mapPanel(d) {
       ["Errors / drops", t ? `rx ${t.rxErrors} / ${t.rxDrops} · tx ${t.txErrors} / ${t.txDrops}` : ""]])}
     ${n.note ? `<p class="muted small">${esc(n.note)}</p>` : ""}
     ${conns ? `<h3>Connections</h3><ul class="conns">${conns.map((c) => `<li><span>${c.dir === "in" ? "← from" : "→ to"} ${name(c.peer)} :${c.port}${c.proto === "udp" ? "/udp" : ""}</span><span class="muted">${c.count}${c.ips ? " · " + esc(c.ips.join(", ")) : ""}</span></li>`).join("") || '<li class="muted">No established connections.</li>'}</ul>` : ""}
-    <div class="actions">${btn("Logs", ["logs", svc, "-n", "200"])}${n.state === "running" ? btn("Restart", ["restart", svc]) : btn("Start", ["start", svc], "btn--primary")}</div>`;
-  bindRunButtons(panel);
+    <div class="actions">${btn("Logs", ["logs", svc, "-n", "200"])}${n.state === "running" ? btn("Restart", ["restart", svc]) : btn("Start", ["start", svc], "btn--primary")}</div>`);
 }
 
+function mapShow(d) {
+  drawMap(d); mapSummary(d); mapPanel(d);
+  if (!d.nodes.length) morphInto($("[data-map-sum]"), `<span class="muted">No containers in the Docker project <code>${esc(d.project)}</code>.</span>`);
+}
 async function vMap() {
-  setTitle("Map", `<span class="muted small" data-map-age></span>`);
-  stopMap();
-  const gen = mapGen;
-  view().innerHTML = `
+  setTitle("Map");
+  if (view().dataset.page !== "map") {          // first paint: the frame, its listeners and the last map this browser saw
+    paint(`
     <p class="lede">Vexor's containers, their networks and the connections between them, read live from Docker and each container's network namespace. Lines appear only for connections that are open now; they move while both ends carry traffic.</p>
     <div class="map-sum" data-map-sum><span class="muted">Loading the map…</span></div>
     <p class="map-limits" data-map-limits hidden></p>
@@ -825,34 +913,23 @@ async function vMap() {
       <li><i class="lg lg--ok"></i>running</li><li><i class="lg lg--issue"></i>issue (unhealthy, restarting, 3+ restarts, OOM, network errors)</li>
       <li><i class="lg lg--offline"></i>offline (exited, created)</li><li><i class="lg lg--missing"></i>missing (the layout expects it)</li>
       <li><i class="lg lg--edge"></i>open connection, client → server (thicker = more)</li><li><i class="lg lg--live"></i>moving: both ends had traffic in the last 3 s</li>
-    </ul>`;
-  mapPanel({ nodes: [] });
-  const svg = $("[data-map-svg]");
-  const pick = (g) => { if (!g || !mapData) return; mapSel = g.dataset.node; drawMap(mapData); mapPanel(mapData); if (matchMedia("(max-width: 1080px)").matches) $("[data-map-panel]").scrollIntoView({ block: "nearest", behavior: "smooth" }); };
-  svg.addEventListener("click", (e) => pick(e.target.closest("[data-node]")));
-  svg.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(e.target.closest("[data-node]")); } });
-  let lastW = 0;
-  mapRO = new ResizeObserver(() => { const w = $("[data-map-wrap]")?.clientWidth || 0; if (mapData && Math.abs(w - lastW) > 4) { lastW = w; drawMap(mapData); } });
-  mapRO.observe($("[data-map-wrap]"));
-  const tick = async () => {
-    if (gen !== mapGen || location.hash !== "#map") return;
-    if (!document.hidden) {
-      try {
-        const { status, data } = await api("/api/map");
-        if (gen !== mapGen) return;
-        if (status === 200 && data.nodes) {
-          mapData = data;
-          if (mapSel && mapSel !== "external" && !data.nodes.some((n) => n.id === mapSel)) mapSel = null;
-          drawMap(data); mapSummary(data); mapPanel(data);
-          lastW = $("[data-map-wrap]").clientWidth;
-          $("[data-map-age]").textContent = `updated ${new Date(data.time * 1000).toLocaleTimeString()}`;
-          if (!data.nodes.length) $("[data-map-sum]").innerHTML = `<span class="muted">No containers in the Docker project <code>${esc(data.project)}</code>.</span>`;
-        }
-      } catch (e) { if (e.message === "login required") return; }
-    }
-    if (gen === mapGen) mapTimer = setTimeout(tick, 3000);
-  };
-  tick();
+    </ul>`);
+    mapPanel({ nodes: [] });
+    const svg = $("[data-map-svg]");
+    const pick = (g) => { if (!g || !mapData) return; mapSel = g.dataset.node; drawMap(mapData); mapPanel(mapData); if (matchMedia("(max-width: 1080px)").matches) $("[data-map-panel]").scrollIntoView({ block: "nearest", behavior: "smooth" }); };
+    svg.addEventListener("click", (e) => pick(e.target.closest("[data-node]")));
+    svg.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(e.target.closest("[data-node]")); } });
+    let lastW = $("[data-map-wrap]").clientWidth;
+    mapRO = new ResizeObserver(() => { const w = $("[data-map-wrap]")?.clientWidth || 0; if (mapData && Math.abs(w - lastW) > 4) { lastW = w; drawMap(mapData); } });
+    mapRO.observe($("[data-map-wrap]"));
+    PAGE.cleanup = () => { mapRO?.disconnect(); mapRO = null; };
+    if (mapData) mapShow(mapData);
+  }
+  const { status, data } = await get("/api/map");
+  if (status !== 200 || !data.nodes) throw new Error(data.error || "the map could not be read");
+  mapData = data;
+  if (mapSel && mapSel !== "external" && !data.nodes.some((n) => n.id === mapSel)) mapSel = null;
+  mapShow(data);
 }
 
 // ---------------------------------------------------------------- theme (auto -> light -> dark)
@@ -926,15 +1003,61 @@ const pxFields = (r = {}, list = "px-targets") => `
   <label class="px-field"><span>TLS</span><select class="in" name="tls">${Object.entries(PX_TLS).map(([k, l]) => `<option value="${k}" ${(r.tls || "local") === k ? "selected" : ""}>${esc(l)}</option>`).join("")}</select><small class="field-err" data-px-err="tls"></small></label>
   <label class="px-field px-field--sm"><span>Max body</span><input class="in" name="max_body" value="${esc(r.max_body || "100m")}" spellcheck="false"><small class="field-err" data-px-err="max_body"></small></label>
   <label class="px-check"><input type="checkbox" name="websocket" ${r.websocket ? "checked" : ""}> <span>WebSocket</span></label>`;
+let PX = { routes: [] };      // what the Proxy page shows, for its delegated buttons
 async function vProxy() {
   setTitle("Proxy");
-  loading("proxy routes");
-  const { data: d } = await api("/api/proxy");
+  const runP = (args, text, onEnd) => run(args, { text, onEnd });
+  const v = view();
+  v.onclick = (e) => {
+    const t = e.target, at = (a) => t.closest(`[${a}]`);
+    const routes = PX.routes || [];
+    if (at("data-px-ca")) return pxDownload("", "ca");
+    if (at("data-px-cancel")) return $("[data-px-dialog]").close();
+    let b = at("data-px-edit");
+    if (b) {
+      const r = routes[+b.dataset.pxEdit], ef = $("[data-px-editform]");
+      if (!r) return;
+      ef.dataset.host = r.host;
+      $("[data-px-edit-host]").textContent = r.host;
+      $("[data-px-edit-fields]").innerHTML = pxFields(r);
+      $("[data-px-dialog]").showModal();
+      $("[name=target]", ef).focus();
+      return;
+    }
+    if ((b = at("data-px-cert"))) {
+      const r = routes[+b.dataset.pxCert];
+      if (r) runP(["proxy", "cert", r.host, ...(r.cert?.exists ? ["--renew"] : [])], r.tls === "letsencrypt" ? "Asks Let's Encrypt for a new certificate (HTTP-01 on port 80)." : "Issues a new certificate from the local CA and reloads nginx.");
+      return;
+    }
+    if ((b = at("data-px-dl"))) { const r = routes[+b.dataset.pxDl]; if (r) pxDownload(r.host, "cert"); return; }
+    if ((b = at("data-px-rm"))) {
+      const r = routes[+b.dataset.pxRm];
+      if (r) runP(["proxy", "rm", r.host], `Removes ${r.host} → ${r.target} and its certificate. ${routes.length === 1 ? "It is the last route: nginx stops publishing the route ports." : ""}`);
+    }
+  };
+  v.onsubmit = (e) => {
+    const f = e.target;
+    if (f.matches("[data-px-add]")) {
+      e.preventDefault();
+      const args = pxArgs(f, "add");
+      if (args) runP(args, args.includes("letsencrypt") ? "Adds the route, then asks Let's Encrypt for a certificate (the name must point here, port 80 open)." : "Adds the route; nginx config is tested before the reload.",
+        (code) => { if (code === 0) f.reset(); });
+    } else if (f.matches("[data-px-editform]")) {
+      e.preventDefault();
+      const args = pxArgs(f, "edit");
+      if (!args) return;
+      $("[data-px-dialog]").close();
+      runP(args, "nginx config is tested before the reload; a failing change is rolled back.");
+    }
+  };
+  await load1("/api/proxy", "proxy routes", proxyPaint);
+}
+function proxyPaint(d) {
+  PX = d;
   const routes = d.routes || [];
-  const again = () => { if (location.hash === "#proxy") route(true); };
   const portTxt = (p, def) => (String(p) === def ? "" : ":" + p);
-  $("[data-topmeta]").innerHTML = `${pill(`https${portTxt(d.https_port, "443")} · http${portTxt(d.http_port, "80")}`)} ${pill(d.nginx_running ? "nginx up" : "nginx down", d.nginx_running ? "ok" : "bad")}`;
-  view().innerHTML = `
+  setMeta(`${pill(`https${portTxt(d.https_port, "443")} · http${portTxt(d.http_port, "80")}`)} ${pill(d.nginx_running ? "nginx up" : "nginx down", d.nginx_running ? "ok" : "bad")}`);
+  paint(`
     <p class="lede">Open a Vexor service or anything on this host or your LAN under its own name, like <code>soc.example.com</code>. nginx answers on port ${esc(d.https_port || 443)} (HTTPS) and ${esc(d.http_port || 80)} (HTTP, redirects and Let's Encrypt) once the first route exists. Every change is tested with <code>nginx -t</code> before nginx reloads.</p>
     ${d.error ? `<p class="err">${esc(d.error)}</p>` : ""}
     <section class="px-ca">
@@ -944,7 +1067,7 @@ async function vProxy() {
     <section class="block"><h2>Routes</h2>
       ${routes.length ? `<div class="table-wrap px-wrap"><table class="table px-table">
         <thead><tr><th>Host</th><th>Target</th><th>TLS</th><th>Certificate</th><th>WebSocket</th><th>Status</th><th><span class="vh">Actions</span></th></tr></thead>
-        <tbody>${routes.map((r, i) => { const st = PX_STATUS[r.status] || [r.status, ""]; return `<tr>
+        <tbody>${routes.map((r, i) => { const st = PX_STATUS[r.status] || [r.status, ""]; return `<tr data-key="${esc(r.host)}">
           <td data-label="Host"><a class="mono px-host" href="${esc(r.url)}" target="_blank" rel="noopener noreferrer">${esc(r.host)}</a></td>
           <td data-label="Target" class="mono small px-target">${esc(r.target)}<span class="muted"> · ${esc(r.max_body)}</span></td>
           <td data-label="TLS">${pill(PX_TLS[r.tls] || r.tls, r.tls === "off" ? "warn" : "")}</td>
@@ -990,60 +1113,119 @@ async function vProxy() {
         <div class="px-form px-form--stack" data-px-edit-fields></div>
         <div class="confirm__actions"><button class="btn btn--ghost" type="button" data-px-cancel>Cancel</button><button class="btn btn--primary" type="submit">Save</button></div>
       </form>
-    </dialog>`;
-  const runP = (args, text) => run(args, { text, onEnd: again });
-  $("[data-px-ca]").addEventListener("click", () => pxDownload("", "ca"));
-  $("[data-px-add]").addEventListener("submit", (e) => {
-    e.preventDefault();
-    const args = pxArgs(e.target, "add");
-    if (args) runP(args, args.includes("letsencrypt") ? "Adds the route, then asks Let's Encrypt for a certificate (the name must point here, port 80 open)." : "Adds the route; nginx config is tested before the reload.");
-  });
-  const dlg = $("[data-px-dialog]"), ef = $("[data-px-editform]");
-  $("[data-px-cancel]").addEventListener("click", () => dlg.close());
-  ef.addEventListener("submit", (e) => {
-    e.preventDefault();
-    const args = pxArgs(ef, "edit");
-    if (!args) return;
-    dlg.close();
-    runP(args, "nginx config is tested before the reload; a failing change is rolled back.");
-  });
-  $$("[data-px-edit]").forEach((b) => b.addEventListener("click", () => {
-    const r = routes[+b.dataset.pxEdit];
-    ef.dataset.host = r.host;
-    $("[data-px-edit-host]").textContent = r.host;
-    $("[data-px-edit-fields]").innerHTML = pxFields(r);
-    dlg.showModal();
-    $("[name=target]", ef).focus();
-  }));
-  $$("[data-px-cert]").forEach((b) => b.addEventListener("click", () => {
-    const r = routes[+b.dataset.pxCert];
-    runP(["proxy", "cert", r.host, ...(r.cert?.exists ? ["--renew"] : [])], r.tls === "letsencrypt" ? "Asks Let's Encrypt for a new certificate (HTTP-01 on port 80)." : "Issues a new certificate from the local CA and reloads nginx.");
-  }));
-  $$("[data-px-dl]").forEach((b) => b.addEventListener("click", () => pxDownload(routes[+b.dataset.pxDl].host, "cert")));
-  $$("[data-px-rm]").forEach((b) => b.addEventListener("click", () => {
-    const r = routes[+b.dataset.pxRm];
-    runP(["proxy", "rm", r.host], `Removes ${r.host} → ${r.target} and its certificate. ${routes.length === 1 ? "It is the last route: nginx stops publishing the route ports." : ""}`);
-  }));
+    </dialog>`);
 }
 
 const ROUTES = { overview: vOverview, map: vMap, containers: vContainers, ports: vPorts, volumes: vVolumes, stacks: vStacks, health: vHealth, logins: vLogins, settings: vSettings, terminal: vTerminal, activity: vActivity, reset: vReset, proxy: vProxy };
-let routing = false, again = null;
-async function route(soft = false) {
+// The page on screen: its fetches share one AbortController, aborted as soon as another page opens.
+let PAGE = { key: "", ctl: new AbortController(), soft: false, fresh: false };
+async function route() {
   closeMenu(false);
-  if (routing) { again = again === false ? false : soft; return; }   // a page change while one loads runs after it
-  if (!soft) view().onclick = null;
-  const key = (location.hash || "#overview").slice(1);
-  const fn = ROUTES[key] || vOverview;
-  if (key !== "map") stopMap();
+  const key = ROUTES[(location.hash || "#overview").slice(1)] ? (location.hash || "#overview").slice(1) : "overview";
+  PAGE.ctl.abort();
+  PAGE.cleanup?.();
+  clearTimeout(liveTimer);
+  const pg = (PAGE = { key, ctl: new AbortController(), soft: false, fresh: false });
+  const v = view();
+  v.onclick = v.onchange = v.onsubmit = null;
+  v.dataset.page = "";
+  liveAt = 0; liveErr = "";
   $$("[data-nav] a").forEach((a) => a.setAttribute("aria-current", a.getAttribute("href") === "#" + key ? "page" : "false"));
   if (matchMedia("(max-width: 760px)").matches) { const nav = $("[data-nav]"), cur = $("[data-nav] a[aria-current=page]"); if (cur) nav.scrollLeft = Math.max(0, cur.offsetLeft - 16); }   // top bar scrolls: keep the current page in view
-  if (soft && ["settings", "terminal", "ports"].includes(key)) return;
-  routing = true;
-  try { await fn(); } catch (e) { if (e.message !== "login required") view().innerHTML = `<p class="err">${esc(e.message)}</p>`; }
-  routing = false;
-  if (again !== null) { const s = again; again = null; route(s); }
+  liveShow();
+  try {
+    await ROUTES[key]();
+    if (PAGE === pg) liveAt = Date.now();
+  } catch (e) {
+    if (PAGE !== pg || e.name === "AbortError" || e.message === "login required") return;
+    if (v.dataset.page === key) liveErr = e.message || "update failed";      // keep what is on screen
+    else { v.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+  }
+  if (PAGE === pg) { liveShow(); liveSchedule(LIVE[key]); }
 }
+
+// ---------------------------------------------------------------- live refresh
+// Pages with live data refresh quietly in place: no placeholder, no scroll jump, focus and open menus stay. A tick is
+// skipped while the user is busy (menu or dialog open, typing, selecting text, pressing) or the tab is hidden, never
+// overlaps the previous one, and backs off when the server is slow. Forms (Settings, Ports, Terminal, ...) never refresh
+// on their own. A small indicator in the header says when the data was read.
+const LIVE = { overview: 15000, containers: 10000, map: 3000 };
+const AFTER_JOB = new Set(["overview", "containers", "volumes", "stacks", "proxy", "activity", "map"]);
+let liveTimer = null, liveRun = null, liveAt = 0, liveErr = "", pointerDown = 0;
+document.addEventListener("pointerdown", () => (pointerDown = Date.now()), true);
+for (const ev of ["pointerup", "pointercancel"]) document.addEventListener(ev, () => (pointerDown = 0), true);
+window.addEventListener("blur", () => (pointerDown = 0));
+function busy() {
+  if ($("[data-app]").hidden || document.hidden || Date.now() - pointerDown < 5000 || openMenu || document.querySelector("dialog[open]")) return true;
+  const a = document.activeElement;
+  if (a && view().contains(a) && (a.isContentEditable || /^(TEXTAREA|SELECT)$/.test(a.tagName) || (a.tagName === "INPUT" && !/^(checkbox|radio|button|submit|reset|range|color)$/.test(a.type)))) return true;
+  const sel = getSelection();
+  return !!(sel && !sel.isCollapsed && sel.toString().trim() && view().contains(sel.anchorNode));
+}
+function stopLive() { clearTimeout(liveTimer); liveTimer = null; PAGE.ctl.abort(); }
+// Re-read the current page's data and update it in place. fresh: the server waits for new data instead of its cache.
+async function refresh({ fresh = false, force = false } = {}) {
+  const pg = PAGE;
+  if (!AFTER_JOB.has(pg.key) || pg.ctl.signal.aborted) return false;
+  if (liveRun) { if (!fresh) return liveRun; await liveRun; if (PAGE !== pg) return false; }
+  if (!force && busy()) return false;
+  pg.soft = true; pg.fresh = fresh;
+  const t0 = performance.now();
+  liveShow(true);
+  const run1 = (async () => {
+    try { await ROUTES[pg.key](); if (PAGE === pg) { liveAt = Date.now(); liveErr = ""; } return true; }
+    catch (e) { if (PAGE === pg && e.name !== "AbortError" && e.message !== "login required") liveErr = e.message || "update failed"; return false; }
+    finally { pg.soft = pg.fresh = false; pg.took = performance.now() - t0; }
+  })();
+  liveRun = run1;
+  const ok = await run1;
+  if (liveRun === run1) liveRun = null;
+  liveShow();
+  return ok;
+}
+function liveSchedule(ms) { clearTimeout(liveTimer); liveTimer = ms ? setTimeout(liveTick, ms) : null; }
+async function liveTick() {
+  const pg = PAGE, base = LIVE[pg.key];
+  if (!base) return;
+  if (busy()) return liveSchedule(Math.min(base, 2000));       // try again soon, not on top of the user
+  const ok = await refresh();
+  if (PAGE !== pg) return;
+  // slow answers stretch the interval (up to a minute); failures double it
+  pg.delay = ok ? Math.min(60000, Math.max(base, (pg.took || 0) * 4)) : Math.min(60000, (pg.delay || base) * 2);
+  liveSchedule(pg.delay);
+}
+// After a command ends: one quiet, fresh refresh of the page on screen, once the user is not in the middle of something.
+function afterJob() {
+  const pg = PAGE;
+  if (!AFTER_JOB.has(pg.key)) return;
+  let tries = 0;
+  const go = () => {
+    if (PAGE !== pg) return;
+    if (busy() && tries++ < 60) return setTimeout(go, 1000);
+    if (tries <= 60) refresh({ fresh: true, force: true });
+  };
+  setTimeout(go, 400);
+}
+document.addEventListener("visibilitychange", () => {
+  const base = LIVE[PAGE.key];
+  if (!document.hidden && base && Date.now() - liveAt > base) liveSchedule(300);   // back on the tab: catch up at once
+});
+function ago(ms) { const s = Math.round(ms / 1000); return s < 5 ? "just now" : s < 90 ? `${s}s ago` : `${Math.round(s / 60)}m ago`; }
+function liveShow(spin = !!liveRun) {
+  const el = $("[data-live]");
+  if (!el) return;
+  const shown = AFTER_JOB.has(PAGE.key) && (liveAt || spin);
+  el.hidden = !shown;
+  if (!shown) return;
+  el.classList.toggle("is-busy", spin);
+  el.classList.toggle("is-err", !spin && !!liveErr);
+  const txt = spin ? "updating…" : liveErr ? `update failed · ${ago(Date.now() - liveAt)}` : `updated ${ago(Date.now() - liveAt)}`;
+  const t = $("[data-live-txt]", el);
+  if (t.textContent !== txt) t.textContent = txt;
+  el.title = liveErr ? liveErr : LIVE[PAGE.key] ? `Refreshes on its own every ${Math.round((PAGE.delay || LIVE[PAGE.key]) / 1000)} s` : "Refreshes after each command";
+}
+setInterval(() => { if (!document.hidden) liveShow(); }, 1000);
+
 window.addEventListener("hashchange", () => route());
-$("[data-refresh]").addEventListener("click", () => route());
-setInterval(() => { if (!document.hidden && ["", "#overview"].includes(location.hash) && !$("[data-confirm]").open) route(true); }, 15000);
+$("[data-refresh]").addEventListener("click", () => (AFTER_JOB.has(PAGE.key) ? refresh({ fresh: true, force: true }) : route()));
 boot();
