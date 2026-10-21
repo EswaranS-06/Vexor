@@ -214,23 +214,134 @@ async function vOverview() {
   bindRunButtons(view());
 }
 
+// Row menu: one floating menu for the whole page, anchored to the button that opened it.
+const MORE_ICON = '<svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/></svg>';
+let openMenu = null;
+function closeMenu(focusBack = true) {
+  if (!openMenu) return;
+  const { el, btn: b } = openMenu;
+  openMenu = null;
+  el.remove();
+  b.setAttribute("aria-expanded", "false");
+  if (focusBack) b.focus();
+  document.removeEventListener("pointerdown", onMenuOutside, true);
+  document.removeEventListener("keydown", onMenuKey, true);
+  window.removeEventListener("resize", onMenuAway);
+  window.removeEventListener("scroll", onMenuAway, true);
+}
+const onMenuOutside = (e) => { if (openMenu && !openMenu.el.contains(e.target) && !openMenu.btn.contains(e.target)) closeMenu(false); };
+const onMenuAway = (e) => {
+  if (!openMenu || (e && e.target instanceof Node && openMenu.el.contains(e.target))) return;
+  const r = openMenu.btn.getBoundingClientRect(), o = openMenu.rect;       // a scroll that did not move the button is noise
+  if (e?.type === "scroll" && Math.abs(r.top - o.top) < 2 && Math.abs(r.left - o.left) < 2) return;
+  closeMenu(false);
+};
+function onMenuKey(e) {
+  if (!openMenu) return;
+  const items = $$('[role="menuitem"]', openMenu.el), i = items.indexOf(document.activeElement);
+  const go = (n) => { e.preventDefault(); items[(n + items.length) % items.length].focus(); };
+  if (e.key === "Escape") { e.preventDefault(); closeMenu(); }
+  else if (e.key === "ArrowDown") go(i + 1);
+  else if (e.key === "ArrowUp") go(i < 0 ? items.length - 1 : i - 1);
+  else if (e.key === "Home") go(0);
+  else if (e.key === "End") go(items.length - 1);
+  else if (e.key === "Tab") closeMenu(false);
+}
+// items: [{label, onSelect}] or "-" for a divider
+function showMenu(trigger, items, label) {
+  closeMenu(false);
+  const el = document.createElement("div");
+  el.className = "menu";
+  el.setAttribute("role", "menu");
+  el.setAttribute("aria-label", label);
+  items.forEach((it) => {
+    if (it === "-") { const hr = document.createElement("hr"); hr.setAttribute("role", "separator"); el.appendChild(hr); return; }
+    const b = document.createElement("button");
+    b.type = "button"; b.setAttribute("role", "menuitem"); b.tabIndex = -1; b.textContent = it.label;
+    b.addEventListener("click", () => { closeMenu(false); it.onSelect(); });
+    el.appendChild(b);
+  });
+  el.style.visibility = "hidden";
+  document.body.appendChild(el);
+  const r = trigger.getBoundingClientRect(), w = el.offsetWidth, h = el.offsetHeight, vw = document.documentElement.clientWidth, vh = window.innerHeight, gap = 4, edge = 8;
+  const below = vh - r.bottom - edge, above = r.top - edge;
+  const up = below < h && above > below;                       // not enough room below: open upward
+  let top = up ? r.top - h - gap : r.bottom + gap;
+  top = Math.max(edge, Math.min(top, vh - h - edge));
+  el.style.top = `${top}px`;
+  el.style.left = `${Math.max(edge, Math.min(r.right - w, vw - w - edge))}px`;
+  el.style.maxHeight = `${vh - 2 * edge}px`;
+  el.style.overflowY = "auto";
+  el.style.visibility = "";
+  openMenu = { el, btn: trigger, rect: r };
+  trigger.setAttribute("aria-expanded", "true");
+  document.addEventListener("pointerdown", onMenuOutside, true);
+  document.addEventListener("keydown", onMenuKey, true);
+  window.addEventListener("resize", onMenuAway);
+  window.addEventListener("scroll", onMenuAway, true);
+  $('[role="menuitem"]', el).focus();
+}
+
+const SELECTED = new Set();   // container selection, keyed by service name; survives re-renders
 async function vContainers() {
   setTitle("Containers");
   loading("containers");
   const { data: cs } = await api("/api/containers");
+  const names = cs.map((c) => c.service);
+  [...SELECTED].forEach((n) => { if (!names.includes(n)) SELECTED.delete(n); });
   view().innerHTML = `
-    <div class="actions">${btn("Start all", ["start"])}${btn("Restart all", ["restart"])}${btn("Stop all", ["stop"], "btn--danger-ghost")}${btn("Errors (1h)", ["logs", "errors", "--since", "1h"])}</div>
+    <div class="actions actions--compact">${btn("Start all", ["start"])}${btn("Restart all", ["restart"])}${btn("Stop all", ["stop"], "btn--danger-ghost")}${btn("Errors (1h)", ["logs", "errors", "--since", "1h"])}</div>
     <div class="table-wrap"><table class="table">
-      <thead><tr><th>Service</th><th>State</th><th>Status</th><th>CPU</th><th>Memory</th><th>Ports</th><th>Image</th><th><span class="vh">Actions</span></th></tr></thead>
-      <tbody>${cs.map((c) => `<tr>
+      <thead><tr><th class="chk"><input type="checkbox" data-sel-all aria-label="Select all containers"></th><th>Service</th><th>State</th><th>Status</th><th>CPU</th><th>Memory</th><th>Ports</th><th>Image</th><th><span class="vh">Actions</span></th></tr></thead>
+      <tbody>${cs.map((c) => `<tr data-svc="${esc(c.service)}">
+        <td class="chk"><input type="checkbox" data-sel="${esc(c.service)}" aria-label="Select ${esc(c.service)}"></td>
         <td><b>${esc(c.service)}</b></td><td>${stateLine(c)}</td><td class="muted">${esc(c.status)}</td>
         <td class="num">${esc(c.cpu || "-")}</td><td class="num">${esc(c.mem || "-")}</td>
         <td class="mono">${esc([...new Set((c.ports || []).filter((p) => p.PublishedPort).map((p) => p.PublishedPort + (p.Protocol === "udp" ? "/udp" : "")))].join(" ") || "-")}</td>
         <td class="mono small">${esc(c.image)}</td>
-        <td class="row-actions">${btn("Logs", ["logs", c.service, "-n", "300"])}${btn("Follow", ["logs", c.service, "-f", "-n", "50"])}${c.state === "running" ? btn("Restart", ["restart", c.service]) + btn("Stop", ["stop", c.service]) : btn("Start", ["start", c.service], "btn--primary")}</td>
-      </tr>`).join("")}</tbody></table></div>
-    <p class="muted small">Managers are recreated on restart, so they load the current ossec.conf. Data stays in volumes.</p>`;
+        <td class="row-more"><button type="button" class="btn btn--ghost more" data-more="${esc(c.service)}" aria-haspopup="menu" aria-expanded="false" aria-label="Actions for ${esc(c.service)}">${MORE_ICON}</button></td>
+      </tr>`).join("") || '<tr><td colspan="9" class="muted">No containers yet.</td></tr>'}</tbody></table></div>
+    <div class="bulk" data-bulk role="region" aria-label="Bulk actions" hidden>
+      <b data-bulk-n></b>
+      <button type="button" class="btn btn--sm" data-bulk-act="start">Start</button>
+      <button type="button" class="btn btn--sm" data-bulk-act="stop">Stop</button>
+      <button type="button" class="btn btn--sm" data-bulk-act="restart">Restart</button>
+      <button type="button" class="btn btn--sm" data-bulk-act="logs">Logs</button>
+      <button type="button" class="btn btn--sm btn--ghost" data-bulk-act="clear">Clear</button>
+    </div>
+    <p class="muted small">Managers are recreated on restart, so they load the current ossec.conf. Data stays in volumes. Bulk actions run one vexor command for all selected services.</p>`;
   bindRunButtons(view());
+  const boxes = $$("[data-sel]", view()), all = $("[data-sel-all]", view()), bar = $("[data-bulk]", view());
+  const sync = () => {
+    const n = boxes.filter((b) => b.checked).length;
+    boxes.forEach((b) => b.closest("tr").classList.toggle("is-sel", b.checked));
+    all.checked = n > 0 && n === boxes.length;
+    all.indeterminate = n > 0 && n < boxes.length;
+    bar.hidden = n === 0;
+    $("[data-bulk-n]", bar).textContent = `${n} selected`;
+  };
+  boxes.forEach((b) => { b.checked = SELECTED.has(b.dataset.sel); b.addEventListener("change", () => { b.checked ? SELECTED.add(b.dataset.sel) : SELECTED.delete(b.dataset.sel); sync(); }); });
+  all.addEventListener("change", () => { boxes.forEach((b) => { b.checked = all.checked; all.checked ? SELECTED.add(b.dataset.sel) : SELECTED.delete(b.dataset.sel); }); sync(); });
+  $$("[data-bulk-act]", bar).forEach((b) => b.addEventListener("click", () => {
+    const sel = names.filter((n) => SELECTED.has(n)), k = b.dataset.bulkAct;
+    if (k === "clear") { SELECTED.clear(); boxes.forEach((x) => (x.checked = false)); sync(); return; }
+    if (!sel.length) return;
+    run(k === "logs" ? ["logs", "-n", "300", ...sel] : [k, ...sel]);   // start/stop/restart/logs accept several services
+  }));
+  $$("[data-more]", view()).forEach((b) => b.addEventListener("click", () => {
+    if (openMenu?.btn === b) return closeMenu();
+    const c = cs.find((x) => x.service === b.dataset.more);
+    showMenu(b, [
+      { label: "Logs (last 300)", onSelect: () => run(["logs", c.service, "-n", "300"]) },
+      { label: "Follow logs", onSelect: () => run(["logs", c.service, "-f", "-n", "50"]) },
+      "-",
+      { label: "Restart", onSelect: () => run(["restart", c.service]) },
+      c.state === "running" ? { label: "Stop", onSelect: () => run(["stop", c.service]) } : { label: "Start", onSelect: () => run(["start", c.service]) },
+      "-",
+      { label: "Show on map", onSelect: () => { location.hash = "#map"; } },
+    ], `Actions for ${c.service}`);
+  }));
+  sync();
 }
 
 async function vPorts() {
@@ -750,21 +861,36 @@ function themeNow() { try { return localStorage.getItem("vx-theme") || "auto"; }
 function setTheme(t) {
   if (t === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
   try { if (t === "auto") localStorage.removeItem("vx-theme"); else localStorage.setItem("vx-theme", t); } catch { /* storage blocked */ }
-  $("[data-theme-toggle]").textContent = `Theme: ${t}`;
+  $("[data-theme-label]").textContent = `Theme: ${t}`;
 }
 $("[data-theme-toggle]").addEventListener("click", () => setTheme(THEMES[(THEMES.indexOf(themeNow()) + 1) % THEMES.length]));
 setTheme(themeNow());
+
+// ---------------------------------------------------------------- sidebar (full / icons only)
+const sideEl = $(".app"), sideBtn = $("[data-side-toggle]");
+function setSide(collapsed, save = true) {
+  sideEl.classList.toggle("is-collapsed", collapsed);
+  sideBtn.setAttribute("aria-expanded", String(!collapsed));
+  sideBtn.title = collapsed ? "Expand sidebar" : "Collapse sidebar";
+  if (save) try { localStorage.setItem("vx-side", collapsed ? "1" : "0"); } catch { /* storage blocked */ }
+}
+sideBtn.addEventListener("click", () => setSide(!sideEl.classList.contains("is-collapsed")));
+let storedSide = false;
+try { storedSide = localStorage.getItem("vx-side") === "1"; } catch { /* storage blocked */ }
+setSide(storedSide, false);
 
 // ---------------------------------------------------------------- router
 const ROUTES = { overview: vOverview, map: vMap, containers: vContainers, ports: vPorts, volumes: vVolumes, stacks: vStacks, health: vHealth, logins: vLogins, settings: vSettings, terminal: vTerminal, activity: vActivity, reset: vReset };
 let routing = false, again = null;
 async function route(soft = false) {
+  closeMenu(false);
   if (routing) { again = again === false ? false : soft; return; }   // a page change while one loads runs after it
   if (!soft) view().onclick = null;
   const key = (location.hash || "#overview").slice(1);
   const fn = ROUTES[key] || vOverview;
   if (key !== "map") stopMap();
   $$("[data-nav] a").forEach((a) => a.setAttribute("aria-current", a.getAttribute("href") === "#" + key ? "page" : "false"));
+  if (matchMedia("(max-width: 760px)").matches) { const nav = $("[data-nav]"), cur = $("[data-nav] a[aria-current=page]"); if (cur) nav.scrollLeft = Math.max(0, cur.offsetLeft - 16); }   // top bar scrolls: keep the current page in view
   if (soft && ["settings", "terminal", "ports"].includes(key)) return;
   routing = true;
   try { await fn(); } catch (e) { if (e.message !== "login required") view().innerHTML = `<p class="err">${esc(e.message)}</p>`; }
