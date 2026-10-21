@@ -10,7 +10,7 @@
 # =============================================================================
 set -uo pipefail
 
-VEXOR_VERSION="2.0.0-alpha.1"
+VEXOR_VERSION="2.0.0"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 ROOT="$(dirname "$SELF")"
 ENV_FILE="$ROOT/.env"
