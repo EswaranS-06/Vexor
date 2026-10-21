@@ -1,0 +1,111 @@
+name: Integration
+
+# Brings up a real Vexor stack on the runner and drives it the way an operator would:
+# install -> doctor -> Suricata/Zeek/n8n end-to-end tests -> console API -> plan -> SOC=both -> backup with ES snapshot.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - "vexor"
+      - "docker-compose*.yml"
+      - "console/**"
+      - ".github/workflows/integration.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration
+  cancel-in-progress: true
+
+jobs:
+  stack:
+    name: Stack on one host
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      V: sudo ./vexor --no-color -y
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Make room for the images
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af >/dev/null
+          df -h / | tail -1; free -g | head -2
+
+      - name: Install (SOC=wazuh, single node)
+        run: |
+          $V install
+          $V status
+
+      - name: Doctor has no failures
+        run: |
+          set +e
+          $V doctor | tee doctor.txt
+          grep -qE ' 0 failed' doctor.txt || { echo "::error::doctor reported failures"; exit 1; }
+
+      - name: Suricata end to end (alert -> Wazuh rule 100721)
+        run: |
+          $V suricata enable
+          sleep 30
+          $V suricata test
+
+      - name: Zeek end to end
+        run: |
+          $V zeek enable
+          sleep 20
+          $V zeek test
+
+      - name: n8n end to end (connect, starter workflow, test alert)
+        run: |
+          $V n8n enable
+          $V n8n connect
+          $V n8n workflow
+          $V n8n test
+          $V n8n credentials > /dev/null
+
+      - name: Console answers and its API works
+        run: |
+          $V console | tee console.txt
+          grep -q "answers on" console.txt
+          PW=$(sudo grep -E '^CONSOLE_PASSWORD=' .env | tail -1 | cut -d= -f2 | awk '{print $1}')
+          curl -sk -c cj -X POST https://127.0.0.1:50443/api/login -H 'Content-Type: application/json' \
+               -d "{\"user\":\"admin\",\"password\":\"$PW\"}" | grep -q csrf
+          curl -sk -b cj https://127.0.0.1:50443/api/state | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["soc"]=="wazuh" and "wazuh.master" in d["services"], d'
+          curl -sk -b cj https://127.0.0.1:50443/api/logins | python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(r["id"]=="dashboard" for r in d) and all("password" not in r for r in d), d'
+          test "$(curl -sk -o /dev/null -w '%{http_code}' -b cj -X POST https://127.0.0.1:50443/api/run -H 'Content-Type: application/json' -d '{"args":["shell"]}')" = 403
+
+      - name: Plan shows a change without making it
+        run: |
+          before=$(sudo md5sum docker-compose.override.yml)
+          $V plan GRAFANA=true | tee plan.txt
+          grep -q "create: grafana" plan.txt
+          test "$before" = "$(sudo md5sum docker-compose.override.yml)"
+
+      - name: Logins are listed
+        run: $V login | grep -q "Wazuh dashboard"
+
+      - name: SOC=both and a backup with an Elasticsearch snapshot
+        run: |
+          $V soc both
+          $V elk
+          $V backup run | tee backup.txt
+          grep -q "Elasticsearch snapshot es-snap-" backup.txt
+
+      - name: Doctor after everything
+        run: |
+          set +e
+          $V doctor | tee doctor2.txt
+          grep -qE ' 0 failed' doctor2.txt || { echo "::error::doctor reported failures"; exit 1; }
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          sudo docker ps -a
+          sudo ./vexor --no-color logs errors --since 30m || true
+          sudo journalctl -u vexor-console --no-pager -n 50 || true
+          sudo ./vexor --no-color ai-context --print | tail -n 120 || true
