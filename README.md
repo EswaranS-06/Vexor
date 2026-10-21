@@ -192,9 +192,12 @@ Every call carries `X-Vexor-Token` (`N8N_HOOK_TOKEN`), so the workflow can rejec
 
 1. A webhook receives the alert.
 2. A code step checks the token and gives Wazuh, Suricata and Zeek events the same fields: `source`, `severity`, `level`, `title`, `where`, `alert`.
-3. A switch routes by severity to four placeholders: critical (12+), high (7–11), medium (4–6) and low.
+3. A switch routes by severity: critical (12+), high (7–11), medium (4–6) and low.
+4. **Chat** (`N8N_NOTIFY_URL`): critical and high alerts are posted to Slack, Teams, Discord or any JSON webhook.
+5. **AbuseIPDB** (`N8N_ABUSEIPDB_KEY`): public source IPs get a reputation score in the message.
+6. **Block with approval** (`N8N_AUTO_BLOCK=approve`): a critical alert with a public source IP posts an approve link; when it is opened within an hour, n8n runs `firewall-drop` on that agent through the Wazuh API.
 
-Replace the placeholders with your actions.
+Each step is skipped when its setting is empty. The credentials (Wazuh API, Elasticsearch, AbuseIPDB) are created inside n8n, so nothing secret is stored in the workflow.
 
 `vexor n8n credentials` creates least-privilege accounts for those actions:
 

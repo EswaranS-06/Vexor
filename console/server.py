@@ -34,7 +34,7 @@ SESSION_TTL = 8 * 3600
 MAX_JOBS = 60
 
 # ---------------------------------------------------------------- .env
-SECRET_RE = re.compile(r"(PASSWORD|SECRET|TOKEN|ENCRYPTION_KEY|APIKEY)$")
+SECRET_RE = re.compile(r"(PASSWORD|SECRET|TOKEN|_KEY|APIKEY)$")
 
 
 def read_env():

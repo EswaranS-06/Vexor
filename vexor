@@ -215,6 +215,9 @@ N8N_HOOK_TOKEN=
 WAZUH_N8N_USER=vexor-n8n
 SOC=wazuh                      # wazuh | elk | both  - switch with: vexor soc <value>
 LOGSTASH_BEATS_TLS=false       # true = TLS on the Beats input (vexor elk beats-config shows the sender settings)
+N8N_NOTIFY_URL=
+N8N_ABUSEIPDB_KEY=
+N8N_AUTO_BLOCK=off             # approve = critical alerts with a public source IP ask in chat, then firewall-drop on the agent
 ENROLL_PASSWORD_ON_INSTALL=yes # fresh installs turn on the agent enrollment password
 NOTIFY_ON=fail                 # health alerts off the host: fail | warn | off (vexor notify)
 NOTIFY_URL=
@@ -1152,6 +1155,8 @@ cmd_doctor() {
     cl="$(dc exec -T wazuh.master /var/ossec/bin/cluster_control -l 2>&1)"
     want=$(( $(active_workers) + 1 )); got="$(awk 'NR>1 && NF' <<<"$cl" | wc -l)"
     if [ "$got" -ge "$want" ]; then d_pass "manager cluster: $got/$want nodes connected$(is_single && echo ' (single: master only)')"
+    elif [ "$got" = 0 ] && [ "$(svc_uptime_s wazuh.master)" -lt 300 ]; then
+      d_warn "manager cluster not answering yet - the master started $(( $(svc_uptime_s wazuh.master) / 60 )) min ago and wazuh-clusterd comes up last" "wait a few minutes, then: vexor doctor"
     elif [ "$got" = 0 ]; then
       d_fail "manager cluster not answering (wazuh-clusterd down on the master?)" "vexor logs cluster master"
       d_fix "restart the master" && dc_restart wazuh.master
@@ -1415,7 +1420,7 @@ cmd_config() {
     show)
       local show=0; [ "${1:-}" = "--show-secrets" ] && show=1
       if [ "$show" = 1 ]; then cat "$ENV_FILE"
-      else sed -E 's/^([A-Z_]*(PASSWORD|ENCRYPTION_KEY)=)([^[:space:]#]+)/\1********/' "$ENV_FILE"; fi ;;
+      else sed -E 's/^([A-Z0-9_]*(PASSWORD|_KEY|TOKEN|SECRET)=)([^[:space:]#]+)/\1********/' "$ENV_FILE"; fi ;;
     get)  [ -n "${1:-}" ] || die "usage: vexor config get KEY"; env_get "$1" ;;
     set)
       local k="${1:-}" v="${2-}"
@@ -3410,7 +3415,7 @@ $( [ "$status" = FAIL ] && echo "AI report: $(ls -1t "$REPORT_DIR"/ai-context-*.
   return 0
 }
 mask_secrets() {
-  sed -E 's/^([A-Z_]*(PASSWORD|SECRET|TOKEN|APIKEY|ENCRYPTION_KEY)[A-Z_]*=)[^[:space:]#]+/\1***/;
+  sed -E 's/^([A-Z0-9_]*(PASSWORD|SECRET|TOKEN|APIKEY|_KEY)[A-Z_]*=)[^[:space:]#]+/\1***/;
           s/(password|hash|"key"|<key>|<api_key>)([":[:space:]=]*)[^<",[:space:]]+/\1\2***/Ig;
           s/ey[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_.-]+/***jwt***/g;
           s/webhook_[0-9a-fA-F-]{8,}/webhook_***/g'
@@ -3733,68 +3738,178 @@ n8n_doctor() {                 # alerts -> n8n path: config blocks, script per m
     *) d_fail "n8n not reachable from the stack ($(n8n_hook))" "vexor n8n status   (N8N enabled? URL right?)" ;;
   esac
 }
-n8n_workflow_json() {          # starter workflow: webhook -> check token + normalise (Wazuh/Suricata/Zeek) -> route by severity
-  python3 -I - "$(env_get N8N_HOOK_TOKEN)" "$(n8n_hook | sed -E 's#^.*/(webhook(-test)?/)##')" <<'PY'
+n8n_workflow_path() {          # the starter's webhook path: the connected path, unless it belongs to another workflow (a UUID)
+  local p; p="$(n8n_hook | sed -E 's#^.*/webhook(-test)?/##')"
+  [[ -z "$p" || "$p" =~ ^[0-9a-f]{8}-[0-9a-f]{4}- ]] && p="vexor-alerts"
+  echo "$p"
+}
+n8n_workflow_json() {          # "Vexor - SOC alerts": check token + normalise -> severity -> chat / enrichment / approved block
+  python3 -I - "$(env_get N8N_HOOK_TOKEN)" "$(n8n_workflow_path)" "$(env_get N8N_NOTIFY_URL)" \
+    "$( [ -n "$(env_get N8N_ABUSEIPDB_KEY)" ] && echo 1 || echo 0)" "$(env_def N8N_AUTO_BLOCK off)" "$(public_host)" <<'PY'
 import json, sys
-token, path = sys.argv[1], sys.argv[2] or "vexor-alerts"
-code = r"""// Vexor: accept only calls that carry the token, then give every source the same shape.
+token, path, notify, abuse, block, host = sys.argv[1:7]
+N, C = [], {}
+def node(name, typ, ver, x, y, params, **extra):
+    n = {"parameters": params, "id": f"6c1f2b1e-{len(N):04d}-4a10-9d70-7665786f72{len(N):02d}", "name": name, "type": typ,
+         "typeVersion": ver, "position": [x, y]}
+    n.update(extra); N.append(n); return name
+def link(a, b, out=0):
+    C.setdefault(a, {"main": []})
+    while len(C[a]["main"]) <= out:
+        C[a]["main"].append([])
+    C[a]["main"][out].append({"node": b, "type": "main", "index": 0})
+
+NORMALISE = r"""// Vexor: accept only calls that carry the token, then give every source the same shape.
 const TOKEN = '%s';
+const isPublic = (ip) => !!ip && /^\d+\.\d+\.\d+\.\d+$/.test(ip) && !/^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.)/.test(ip);
 const out = [];
 for (const item of $input.all()) {
   const h = item.json.headers || {};
-  if (h['x-vexor-token'] !== TOKEN) continue;             // not from Vexor: drop it
+  if (h['x-vexor-token'] !== TOKEN) continue;              // not from Vexor: drop it
   const a = item.json.body || {};
-  let source = 'other', level = 0, title = '', where = '';
-  if (a.rule) {                                          // Wazuh alert (also Suricata/Zeek seen by Wazuh)
-    source = 'wazuh'; level = Number(a.rule.level || 0); title = a.rule.description || '';
-    where = (a.agent || {}).name || '';
-  } else if (a.event_type === 'alert' && a.alert) {      // Suricata eve alert (SOC=elk, via Logstash)
+  let source = 'other', level = 0, title = '', where = '', srcip = '', agent_id = '';
+  if (a.rule) {                                           // Wazuh alert (also Suricata/Zeek seen by Wazuh, Vexor health)
+    source = (a.rule.groups || []).includes('health') ? 'vexor-health' : 'wazuh';
+    level = Number(a.rule.level || 0); title = a.rule.description || '';
+    where = (a.agent || {}).name || ''; agent_id = (a.agent || {}).id || '';
+    const d = a.data || {};
+    srcip = d.srcip || d.src_ip || (d['id.orig_h']) || '';
+  } else if (a.event_type === 'alert' && a.alert) {       // Suricata eve alert (SOC=elk, via Logstash)
     source = 'suricata'; level = ({1: 12, 2: 7, 3: 4})[a.alert.severity] || 3;
-    title = a.alert.signature || ''; where = `${a.src_ip}:${a.src_port} -> ${a.dest_ip}:${a.dest_port}`;
-  } else if (a.note) {                                   // Zeek notice (SOC=elk, via Logstash)
-    source = 'zeek'; level = 6; title = `${a.note}: ${a.msg || ''}`; where = a['id.orig_h'] || a.src || '';
+    title = a.alert.signature || ''; where = `${a.src_ip}:${a.src_port} -> ${a.dest_ip}:${a.dest_port}`; srcip = a.src_ip || '';
+  } else if (a.note) {                                    // Zeek notice (SOC=elk, via Logstash)
+    source = 'zeek'; level = 6; title = `${a.note}: ${a.msg || ''}`; where = a['id.orig_h'] || a.src || ''; srcip = a['id.orig_h'] || a.src || '';
   }
   const severity = level >= 12 ? 'critical' : level >= 7 ? 'high' : level >= 4 ? 'medium' : 'low';
-  out.push({ json: { source, severity, level, title, where,
-                     time: a.timestamp || a['@timestamp'] || new Date().toISOString(), alert: a } });
+  out.push({ json: { source, severity, level, title, where, srcip, srcip_public: isPublic(srcip), agent_id,
+                     rule_id: (a.rule || {}).id || '', time: a.timestamp || a['@timestamp'] || new Date().toISOString(), alert: a } });
 }
 return out;""" % token
-def rule(value):
+
+FORMAT = r"""// Build the chat message (Slack, Teams, Discord or plain JSON - picked from the URL).
+const URL_ = '%s';
+const kind = /hooks\.slack\.com/.test(URL_) ? 'slack' : /discord\.com\/api\/webhooks/.test(URL_) ? 'discord'
+           : /(webhook\.office\.com|logic\.azure\.com)/.test(URL_) ? 'teams' : 'json';
+return $input.all().map((it) => {
+  const j = it.json;
+  const rep = j.abuse && j.abuse.data ? ` · AbuseIPDB score ${j.abuse.data.abuseConfidenceScore}%% (${j.abuse.data.countryCode || '?'}, ${j.abuse.data.totalReports || 0} reports)` : '';
+  const icon = { critical: '🔴', high: '🟠', medium: '🟡', low: '⚪' }[j.severity] || '';
+  const text = `${icon} ${j.severity.toUpperCase()} (level ${j.level}) ${j.title}\n${j.source} · ${j.where || '-'}${j.srcip ? ' · src ' + j.srcip : ''}${rep}\n${j.time}`
+             + (j.approve_url ? `\nBlock ${j.srcip} on ${j.where}? Approve within 1 hour: ${j.approve_url}` : '');
+  const payload = kind === 'slack' ? { text } : kind === 'discord' ? { content: text.slice(0, 1900) }
+                : kind === 'teams' ? { text: text.replace(/\n/g, '<br>') } : { source: 'vexor', ...j, text };
+  return { json: { ...j, notify_url: URL_, payload } };
+});""" % notify.replace("'", "%27")
+
+y0 = 200
+node("Alerts from Vexor", "n8n-nodes-base.webhook", 2, 0, y0, {"httpMethod": "POST", "path": path, "responseMode": "onReceived", "options": {}},
+     webhookId="6c1f2b1e-0001-4a10-9d70-7665786f7299")
+node("Check token + normalise", "n8n-nodes-base.code", 2, 240, y0, {"jsCode": NORMALISE})
+link("Alerts from Vexor", "Check token + normalise")
+def rule(v):
     return {"conditions": {"options": {"caseSensitive": True, "leftValue": "", "typeValidation": "strict", "version": 2},
-                           "conditions": [{"id": value, "leftValue": "={{ $json.severity }}", "rightValue": value,
-                                           "operator": {"type": "string", "operation": "equals"}}],
-                           "combinator": "and"},
-            "renameOutput": True, "outputKey": value}
-sev = ["critical", "high", "medium", "low"]
-nodes = [
-    {"parameters": {"httpMethod": "POST", "path": path, "responseMode": "onReceived", "options": {}},
-     "id": "6c1f2b1e-0001-4a10-9d70-7665786f7201", "name": "Alerts from Vexor", "type": "n8n-nodes-base.webhook",
-     "typeVersion": 2, "position": [0, 200], "webhookId": "6c1f2b1e-0001-4a10-9d70-7665786f7299"},
-    {"parameters": {"jsCode": code}, "id": "6c1f2b1e-0002-4a10-9d70-7665786f7202", "name": "Check token + normalise",
-     "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [260, 200]},
-    {"parameters": {"rules": {"values": [rule(s) for s in sev]}, "options": {}},
-     "id": "6c1f2b1e-0003-4a10-9d70-7665786f7203", "name": "Route by severity", "type": "n8n-nodes-base.switch",
-     "typeVersion": 3.2, "position": [520, 200]},
-]
-for i, s in enumerate(sev):
-    nodes.append({"parameters": {}, "id": f"6c1f2b1e-001{i}-4a10-9d70-7665786f72{10 + i}",
-                  "name": f"{s.capitalize()} - add your actions", "type": "n8n-nodes-base.noOp",
-                  "typeVersion": 1, "position": [800, 20 + i * 130]})
-nodes.append({"parameters": {"content": "## Vexor SOC alerts\nWazuh posts alerts (level >= N8N_ALERT_LEVEL) here; with SOC=elk, Logstash posts Suricata alerts and Zeek notices.\n\nReplace the four *add your actions* nodes: Slack / e-mail / ticket, or call back into the stack with the credentials from `vexor n8n credentials` (Wazuh API: https://wazuh.master:55000, Elasticsearch: http://elasticsearch:9200).\n\nTest: `vexor n8n test`",
-                         "height": 300, "width": 420},
-              "id": "6c1f2b1e-0020-4a10-9d70-7665786f7220", "name": "About", "type": "n8n-nodes-base.stickyNote",
-              "typeVersion": 1, "position": [-40, -200]})
-conn = {"Alerts from Vexor": {"main": [[{"node": "Check token + normalise", "type": "main", "index": 0}]]},
-        "Check token + normalise": {"main": [[{"node": "Route by severity", "type": "main", "index": 0}]]},
-        "Route by severity": {"main": [[{"node": f"{s.capitalize()} - add your actions", "type": "main", "index": 0}] for s in sev]}}
-print(json.dumps([{"id": "vexorSocAlerts01", "name": "Vexor - SOC alerts", "nodes": nodes, "connections": conn,
+                           "conditions": [{"id": v, "leftValue": "={{ $json.severity }}", "rightValue": v, "operator": {"type": "string", "operation": "equals"}}],
+                           "combinator": "and"}, "renameOutput": True, "outputKey": v}
+SEV = ["critical", "high", "medium", "low"]
+node("Route by severity", "n8n-nodes-base.switch", 3.2, 480, y0, {"rules": {"values": [rule(v) for v in SEV]}, "options": {}})
+link("Check token + normalise", "Route by severity")
+
+tail = None  # last node of the critical/high chain before formatting
+if abuse == "1":
+    node("AbuseIPDB lookup", "n8n-nodes-base.httpRequest", 4.2, 740, 60,
+         {"url": "=https://api.abuseipdb.com/api/v2/check?ipAddress={{ $json.srcip }}&maxAgeInDays=90", "authentication": "genericCredentialType",
+          "genericAuthType": "httpHeaderAuth", "options": {}},
+         credentials={"httpHeaderAuth": {"id": "vexorAbuseIpdb01", "name": "Vexor - AbuseIPDB"}}, onError="continueRegularOutput")
+    node("Keep alert fields", "n8n-nodes-base.code", 2, 980, 60, {"mode": "runOnceForEachItem", "jsCode":
+         "// the lookup replaced the item: put the alert back and keep the AbuseIPDB answer next to it\n"
+         "return { json: { ...$('Route by severity').item.json, abuse: $json.data ? $json : null } };"})
+if notify:
+    node("Format message", "n8n-nodes-base.code", 2, 1220 if abuse == "1" else 740, 60, {"jsCode": FORMAT})
+    node("Send to chat", "n8n-nodes-base.httpRequest", 4.2, 1460 if abuse == "1" else 980, 60,
+         {"method": "POST", "url": "={{ $json.notify_url }}", "sendBody": True, "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($json.payload) }}", "options": {}}, onError="continueRegularOutput")
+    link("Format message", "Send to chat")
+    first = "AbuseIPDB lookup" if abuse == "1" else "Format message"
+    if abuse == "1":
+        link("AbuseIPDB lookup", "Keep alert fields"); link("Keep alert fields", "Format message")
+    link("Route by severity", first, 0); link("Route by severity", first, 1)
+for i, s in enumerate(SEV):
+    if notify and s in ("critical", "high"):
+        continue
+    node(f"{s.capitalize()} - add your actions", "n8n-nodes-base.noOp", 1, 740, 320 + i * 110, {})
+    link("Route by severity", f"{s.capitalize()} - add your actions", i)
+
+if block == "approve" and notify:
+    node("Needs approval?", "n8n-nodes-base.code", 2, 740, -160, {"jsCode":
+         "// block only public source IPs seen on a real agent (000 = the manager; allowed for vexor n8n test only)\n"
+         "return $input.all().filter((it) => it.json.srcip_public && it.json.agent_id && (it.json.agent_id !== '000' || it.json.rule_id === '100000'))"
+         ".map((it) => ({ json: { ...it.json, approve_url: $execution.resumeUrl + ($execution.resumeUrl.includes('?') ? '&' : '?') + 'decision=block' } }));"})
+    link("Route by severity", "Needs approval?", 0)
+    node("Ask in chat", "n8n-nodes-base.code", 2, 980, -160, {"jsCode": FORMAT})
+    node("Send approval request", "n8n-nodes-base.httpRequest", 4.2, 1220, -160,
+         {"method": "POST", "url": "={{ $json.notify_url }}", "sendBody": True, "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($json.payload) }}", "options": {}}, onError="continueRegularOutput")
+    node("Wait for approval", "n8n-nodes-base.wait", 1.1, 1460, -160,
+         {"resume": "webhook", "httpMethod": "GET", "limitWaitTime": True, "limitType": "afterTimeInterval", "resumeAmount": 1, "resumeUnit": "hours", "options": {}},
+         webhookId="6c1f2b1e-0002-4a10-9d70-7665786f7298")
+    node("Approved?", "n8n-nodes-base.code", 2, 1700, -160, {"jsCode":
+         "// continue only when the link was opened with decision=block (a timeout resumes without it)\n"
+         "const a = $('Needs approval?').first().json;\n"
+         "return $input.all().filter((it) => (it.json.query || {}).decision === 'block').map(() => ({ json: { srcip: a.srcip, agent_id: a.agent_id, title: a.title } }));"})
+    node("Wazuh API token", "n8n-nodes-base.httpRequest", 4.2, 1940, -160,
+         {"method": "POST", "url": "https://wazuh.master:55000/security/user/authenticate?raw=true", "authentication": "genericCredentialType",
+          "genericAuthType": "httpBasicAuth", "options": {"allowUnauthorizedCerts": True, "response": {"response": {"responseFormat": "text", "outputPropertyName": "token"}}}},
+         credentials={"httpBasicAuth": {"id": "vexorWazuhApi01", "name": "Vexor - Wazuh API"}})
+    node("Block source IP", "n8n-nodes-base.httpRequest", 4.2, 2180, -160,
+         {"method": "PUT", "url": "=https://wazuh.master:55000/active-response?agents_list={{ $('Approved?').first().json.agent_id }}",
+          "sendHeaders": True, "headerParameters": {"parameters": [{"name": "Authorization", "value": "=Bearer {{ $json.token }}"}]},
+          "sendBody": True, "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ command: '!firewall-drop', alert: { data: { srcip: $('Approved?').first().json.srcip } } }) }}",
+          "options": {"allowUnauthorizedCerts": True}})
+    for a, b in (("Needs approval?", "Ask in chat"), ("Ask in chat", "Send approval request"), ("Send approval request", "Wait for approval"),
+                 ("Wait for approval", "Approved?"), ("Approved?", "Wazuh API token"), ("Wazuh API token", "Block source IP")):
+        link(a, b)
+
+about = ("## Vexor SOC alerts\nGenerated by `vexor n8n workflow` from .env - edit freely, or change N8N_NOTIFY_URL, "
+         "N8N_ABUSEIPDB_KEY and N8N_AUTO_BLOCK and run it again (it replaces this workflow).\n\n"
+         f"- chat: {'on' if notify else 'off (N8N_NOTIFY_URL)'}\n- AbuseIPDB: {'on' if abuse == '1' else 'off (N8N_ABUSEIPDB_KEY)'}\n"
+         f"- block with approval: {'on' if block == 'approve' and notify else 'off (N8N_AUTO_BLOCK=approve, needs chat)'}\n\nTest: `vexor n8n test`")
+node("About", "n8n-nodes-base.stickyNote", 1, -40, -380, {"content": about, "height": 260, "width": 460})
+print(json.dumps([{"id": "vexorSocAlerts01", "name": "Vexor - SOC alerts", "nodes": N, "connections": C,
                    "settings": {"executionOrder": "v1"}, "active": False}], indent=1))
 PY
+}
+n8n_import_credentials() {     # create/refresh the n8n credentials the workflows use (encrypted by n8n on import)
+  is_running n8n || return 0
+  python3 -I - "$(env_def WAZUH_N8N_USER vexor-n8n)" "$(env_get WAZUH_N8N_PASSWORD)" "$(env_get ES_N8N_PASSWORD)" \
+    "$(env_get N8N_ABUSEIPDB_KEY)" "$(soc_wazuh && echo 1 || echo 0)" "$(soc_elk && echo 1 || echo 0)" > "$RUN_TMP/n8n-creds.json" <<'PY'
+import json, sys
+wu, wp, ep, abuse, wz, elk = sys.argv[1:7]
+c = []
+if wz == "1" and wp:
+    c.append({"id": "vexorWazuhApi01", "name": "Vexor - Wazuh API", "type": "httpBasicAuth", "data": {"user": wu, "password": wp}})
+if elk == "1" and ep and ep != "CHANGE_ME":
+    c.append({"id": "vexorElastic001", "name": "Vexor - Elasticsearch", "type": "httpBasicAuth", "data": {"user": "vexor_n8n", "password": ep}})
+if abuse:
+    c.append({"id": "vexorAbuseIpdb01", "name": "Vexor - AbuseIPDB", "type": "httpHeaderAuth", "data": {"name": "Key", "value": abuse}})
+print(json.dumps(c))
+PY
+  chmod 600 "$RUN_TMP/n8n-creds.json"
+  [ "$(cat "$RUN_TMP/n8n-creds.json")" = "[]" ] && return 0
+  dc cp "$RUN_TMP/n8n-creds.json" n8n:/tmp/vexor-creds.json >/dev/null 2>&1 || return 1
+  if dc exec -T n8n sh -c 'n8n import:credentials --input=/tmp/vexor-creds.json >/dev/null 2>&1; rc=$?; rm -f /tmp/vexor-creds.json; exit $rc'; then
+    ok "n8n credentials ready: $(python3 -I -c 'import json,sys; print(", ".join(c["name"] for c in json.load(open(sys.argv[1]))))' "$RUN_TMP/n8n-creds.json")"
+  else bad "could not import the n8n credentials"; return 1; fi
 }
 n8n_workflow_import() {
   tool_on n8n && is_running n8n || die "n8n is not running - vexor tools enable n8n"
   [ -n "$(env_get N8N_HOOK_TOKEN)" ] || gen_secret N8N_HOOK_TOKEN hex
+  if [ "$(env_def N8N_AUTO_BLOCK off)" = approve ] && [ -z "$(env_get WAZUH_N8N_PASSWORD)" ] && soc_wazuh; then
+    say "N8N_AUTO_BLOCK=approve needs the Wazuh API user - creating it"; n8n_credentials >/dev/null || warn "vexor n8n credentials failed"
+  fi
+  n8n_import_credentials || true
   mkdir -p "$TOOLS_DIR/n8n"; n8n_workflow_json > "$TOOLS_DIR/n8n/vexor-soc-alerts.workflow.json"
+  say "workflow: chat $( [ -n "$(env_get N8N_NOTIFY_URL)" ] && echo on || echo 'off (N8N_NOTIFY_URL)') · AbuseIPDB $( [ -n "$(env_get N8N_ABUSEIPDB_KEY)" ] && echo on || echo 'off (N8N_ABUSEIPDB_KEY)') · block with approval $( [ "$(env_def N8N_AUTO_BLOCK off)" = approve ] && [ -n "$(env_get N8N_NOTIFY_URL)" ] && echo on || echo 'off (N8N_AUTO_BLOCK=approve + chat)') · webhook path $(n8n_workflow_path)"
   dc cp "$TOOLS_DIR/n8n/vexor-soc-alerts.workflow.json" n8n:/tmp/vexor-soc-alerts.workflow.json >/dev/null 2>&1 || die "could not copy the workflow into n8n"
   dc exec -T n8n n8n import:workflow --input=/tmp/vexor-soc-alerts.workflow.json >"$RUN_TMP/n8n-import" 2>&1 \
     || { tail -n 5 "$RUN_TMP/n8n-import"; die "n8n import failed"; }
@@ -3802,7 +3917,7 @@ n8n_workflow_import() {
     || { tail -n 5 "$RUN_TMP/n8n-publish"; warn "imported, but publishing failed - open it in n8n and click Publish"; }
   dc restart n8n >/dev/null 2>&1        # a running n8n only picks up CLI changes after a restart
   local i; for i in $(seq 1 30); do [ "$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:$(tool_port n8n)/healthz")" = 200 ] && break; sleep 2; done
-  ok "workflow 'Vexor - SOC alerts' imported and published (webhook path: $(n8n_hook | sed -E 's#^.*/webhook/##'))"
+  ok "workflow 'Vexor - SOC alerts' imported and published (webhook path: $(n8n_workflow_path))"
   n8n_owner_set || warn "n8n has no owner account yet: open https://$(public_host):$(tool_port n8n) now - the first visitor becomes the owner"
   say "file: $TOOLS_DIR/n8n/vexor-soc-alerts.workflow.json  (re-import after editing it, or edit the workflow in n8n)"
 }
@@ -3845,7 +3960,8 @@ print(",".join(str(p["id"]) for p in d["data"]["affected_items"] if p["name"] in
     hdr "n8n credential: Elasticsearch (read vexor-*)"
     say "Elasticsearch node or HTTP Request: http://elasticsearch:9200   user vexor_n8n   password $(env_get ES_N8N_PASSWORD)"
   fi
-  hint "passwords are stored in .env (WAZUH_N8N_PASSWORD, ES_N8N_PASSWORD); re-running this rotates the Wazuh one"
+  n8n_import_credentials || true
+  hint "passwords are stored in .env (WAZUH_N8N_PASSWORD, ES_N8N_PASSWORD); in n8n they are the credentials 'Vexor - Wazuh API' / 'Vexor - Elasticsearch'"
 }
 n8n_status() {
   hdr "n8n (automation / SOAR)"
