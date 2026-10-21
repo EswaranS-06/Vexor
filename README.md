@@ -57,7 +57,7 @@ Around these, `vexor` handles certificates (local CA, your own, or Let's Encrypt
 | OS | Linux with systemd (tested on Ubuntu 24.04) |
 | Docker | Docker Engine 24 or later with the Compose v2 plugin |
 | RAM | `SOC=wazuh`: 8 GB (single) or 16 GB (multi). `SOC=both`: add about 4 GB. `SOC=elk`: about 6 GB. Each tool: 0.3–1 GB. |
-| Disk | 100 GB or more for the Docker data root |
+| Disk | 100 GB or more for the Docker data root. The Wazuh vulnerability feed alone needs about 13 GB per manager; `WAZUH_VULN_DETECTION=false` turns it off. `vexor install` and `vexor doctor` check every disk Docker uses (data root, volumes, image store, backups, the checkout), not only one. |
 | Packages | `python3`, `openssl`, `curl`, `ss`, `flock` (`apt install python3 openssl curl iproute2 util-linux`) |
 | Ports | Wazuh: 8080, 1514, 1515, 514/udp, 55000. ELK and tools: their 5XXXX ports from `.env`. |
 
@@ -311,6 +311,8 @@ Never put a comment on the same line as an **empty** value in `.env`: Docker Com
 | n8n workflows and credentials | `n8n-data` volume | kept; `vexor n8n backup` exports them |
 | Manager logs | `/var/ossec/logs` (volume) | `MANAGER_LOG_RETENTION_DAYS` |
 | Container logs | Docker `json-file` | `LOG_MAX_SIZE` × `LOG_MAX_FILE` |
+
+Disk space: `vexor disk` shows free space on every filesystem Docker uses (add `--json` for scripts). Volumes left behind by a layout change, such as worker or indexer data after `vexor node-type single`, are listed by `vexor volumes orphans` and removed by `vexor volumes prune` after you confirm. Volumes of switched-off tools are never counted as unused. After an upgrade, `vexor images prune` removes the old image versions of this stack; `vexor update apply` offers it at the end. Both only touch this Docker Compose project.
 
 `vexor backup` (daily with the daemon) saves an indexer snapshot, the master's state, the n8n, Grafana and Portainer volumes, and the configuration. Restore with `vexor backup restore-snapshot | restore-manager | restore-config`. Keep `.env`: it holds `N8N_ENCRYPTION_KEY`, without which n8n credentials cannot be decrypted. With `SOC=elk` or `both` the backup also takes an Elasticsearch snapshot of `vexor-*` and the Kibana saved objects (repository `backups/es-snapshots`); restore with `vexor backup restore-es <id>`.
 

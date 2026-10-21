@@ -48,6 +48,8 @@ It needs bash 4.4+, Docker Engine with Compose v2, `python3`, `openssl`, `curl`,
 
 ## Change management
 
+Disk settings: `DISK_WARN_PCT` (85) and `DISK_FAIL_PCT` (95) are the `doctor` limits for every disk Docker uses. `vexor install` warns below `DISK_WARN_FREE_GB` (15) and refuses below `DISK_MIN_FREE_GB` (5) free space on any of them; `vexor install --force` installs anyway. `WAZUH_VULN_DETECTION=false` switches the Wazuh vulnerability feed off in every manager (it needs about 13 GB per manager); `vexor config apply` recreates the managers. Data already downloaded stays until you remove the manager volumes.
+
 After editing `.env`: `vexor config validate`, then `vexor config apply`, then `vexor doctor`. Never use `down -v` or `reset` to apply settings, because they delete the data volumes.
 
 | You changed | Apply with | Downtime |
@@ -262,7 +264,9 @@ Wazuh password policy: 8–64 characters from letters, digits and `. * + ? -`, w
 | `backup restore-snapshot <id> [--indices P] [--rename]` / `restore-manager <stamp>` / `restore-config <file>` | Restore indices / agent keys, rules and groups / `.env` and `config/`. |
 | `n8n backup [dir]` | Workflows and credentials as JSON. |
 | `retention [show\|apply]` / `prune-logs` | Wazuh index retention / delete old manager logs. |
-| `volumes ls \| backup <vol\|all> [--stop] \| restore <vol> <file> \| rm <vol> \| prune` | Project volumes. |
+| `volumes ls \| orphans \| backup <vol\|all> [--stop] \| restore <vol> <file> \| rm <vol> \| prune [--yes]` | Project volumes. `orphans` lists volumes no service of the current layout uses (old worker or indexer data), with sizes. `prune` deletes them after you type DELETE; volumes still held by a container and the data of switched-off tools are skipped. `vexor plan` mentions them. |
+| `disk [--json]` | Size, used, free and percent of every filesystem Docker uses (Docker root, volumes, containerd image store, `BACKUP_DIR`, the checkout) with their roles, plus the size of Vexor's volumes and images. `--json` prints `{"filesystems":[{"mount","size","used","avail","pct","roles":[...]}]}` (bytes). |
+| `images prune [--yes]` | Remove old image versions of this stack (same repository, other tag) that no container uses. Offered at the end of `update apply`. |
 | `reset [containers\|data\|full\|purge]` | From removing containers up to a full wipe; backups are never deleted. |
 
 ## Health automation
@@ -304,7 +308,7 @@ Wazuh password policy: 8–64 characters from letters, digits and `. * + ? -`, w
 | Elasticsearch yellow, read-only, ILM or template missing | Replicas 0, clear the block, apply them |
 | Logstash writer or `kibana_system` login fails, data views missing | Re-create users and roles, reset the password, add the views |
 | A web tool not answering, Grafana user broken, Suricata with 0 signatures | Restart it, re-create the user, load the rules |
-| Docker disk above `DISK_WARN_PCT` | Prune old manager logs and dangling images |
+| Any disk Docker uses above `DISK_WARN_PCT` | Prune old manager logs and dangling images (`doctor` fails above `DISK_FAIL_PCT`) |
 
 Problems reported with a hint only include:
 
