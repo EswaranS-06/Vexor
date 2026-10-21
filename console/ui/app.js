@@ -186,13 +186,14 @@ async function vOverview() {
   view().innerHTML = `
     <section class="cards">
       <article class="card"><h2>Stack</h2><p class="big">SOC=${esc(s.soc)}</p><p class="muted">${esc(s.layout || "")}</p></article>
-      <article class="card ${missing.length ? "card--warn" : ""}"><h2>Containers</h2><p class="big">${running} / ${exp.length} running</p>
-        <p class="muted">${missing.length ? "not running: " + esc(missing.join(", ")) : "every enabled service is up"}</p></article>
+      <article class="card ${!missing.length ? "" : running === 0 && !s.stopped ? "card--bad" : "card--warn"}"><h2>Containers</h2><p class="big">${running} / ${exp.length} running</p>
+        <p class="muted">${!missing.length ? "every enabled service is up" : s.stopped ? "stopped with vexor stop - start it under Quick actions" : "not running: " + esc(missing.join(", "))}</p></article>
       <article class="card ${hl.fail > 0 ? "card--bad" : hl.warn > 0 ? "card--warn" : ""}"><h2>Last health check</h2>
         <p class="big">${hl.epoch ? `${hl.pass} passed · ${hl.warn} warn · ${hl.fail} failed` : "not run yet"}</p>
         <p class="muted">${hl.epoch ? new Date(hl.epoch * 1000).toLocaleString() : "the hourly timer runs it (vexor daemon install)"}</p></article>
       <article class="card ${level(worst?.pct ?? s.disk?.pct ?? 0) ? "card--" + level(worst?.pct ?? s.disk?.pct ?? 0) : ""}"><h2>Disk</h2><p class="big">${esc(worst?.pct ?? s.disk?.pct ?? "?")}% used</p><p class="muted">${esc(worst ? worst.mount + " (fullest)" : s.disk?.path || "")}</p></article>
     </section>
+    ${s.legacy_project ? `<section class="pending"><p><b>The Docker project is still named <code>${esc(s.project)}</code>.</b> Vexor 2 names it <code>vexor</code>. <code>vexor migrate</code> copies and checks every volume, then switches. The old volumes are kept; once the stack works, run <code>vexor migrate --yes</code> in the Terminal to remove them. Take a backup first.</p><div class="actions">${btn("Migrate to vexor", ["migrate"], "btn--danger-ghost")}</div></section>` : ""}
     ${pend.keys?.length ? `<section class="pending"><p><b>${pend.keys.length} .env change${pend.keys.length > 1 ? "s" : ""} not applied yet:</b> <code>${esc(pend.keys.join(" "))}</code></p><div class="actions">${btn("Show plan", ["plan"])}${btn("Apply", ["config", "apply"], "btn--primary")}</div></section>` : ""}
     <section class="block"><h2>Disk usage</h2>
       <div class="table-wrap"><table class="table">
@@ -206,7 +207,7 @@ async function vOverview() {
       <div class="links">${urls.map(([k, u]) => `<a class="linkcard" href="${esc(u)}" target="_blank" rel="noopener"><b>${esc(k)}</b><span>${esc(u)}</span></a>`).join("") || '<p class="muted">No web UIs enabled.</p>'}</div></section>
     ${(s.reminders || []).length ? `<section class="block"><h2>Reminders</h2><ul class="list">${s.reminders.map((r) => `<li><b>${esc(r.msg)}</b><code>${esc(r.cmd)}</code></li>`).join("")}</ul></section>` : ""}
     <section class="block"><h2>Quick actions</h2><div class="actions">
-      ${btn("Status", ["status"])}${btn("Doctor", ["doctor"])}${btn("Doctor --fix", ["doctor", "--fix"], "btn--primary")}${btn("Start stack", ["start"])}${btn("Backup now", ["backup", "run"])}${btn("AI report", ["ai-context", "--print"])}
+      ${btn("Status", ["status"])}${btn("Wait until ready", ["wait-ready", "--timeout", "600"])}${btn("Doctor", ["doctor"])}${btn("Doctor --fix", ["doctor", "--fix"], "btn--primary")}${btn("Start stack", ["start"])}${btn("Backup now", ["backup", "run"])}${btn("AI report", ["ai-context", "--print"])}
     </div></section>
     <section class="block"><h2>Services</h2><div class="svc-grid">${exp.map((x) => { const c = cs.find((y) => y.service === x); return `<a class="svc ${c?.state === "running" ? "" : "svc--down"}" href="#containers"><b>${esc(x)}</b>${c ? stateLine(c) : pill("missing", "bad")}</a>`; }).join("")}</div></section>`;
   $$("[data-w]").forEach((i) => (i.style.transform = `scaleX(${i.dataset.w})`));
@@ -304,14 +305,14 @@ async function vVolumes() {
   const max = Math.max(1, ...vs.map((v) => v.bytes || 0));
   view().innerHTML = `
     <p class="lede">${vs.length} volumes, ${fmt(total)} in total. Everything Vexor keeps lives here: alerts, agent keys, rules, workflows.</p>
-    <div class="actions">${btn("Backup all (live)", ["volumes", "backup", "all"])}${btn("Full backup (snapshot + state)", ["backup", "run"], "btn--primary")}${btn("List backups", ["backup", "list"])}${btn("Remove unused volumes", ["volumes", "prune"], "btn--danger-ghost")}<button class="btn btn--sm btn--ghost" type="button" data-vol-fresh>Recount sizes</button></div>
+    <div class="actions">${btn("Backup all (live)", ["volumes", "backup", "all"])}${btn("Full backup (snapshot + state)", ["backup", "run"], "btn--primary")}${btn("List backups", ["backup", "list"])}${btn("Show unused volumes", ["volumes", "orphans"])}${btn("Remove unused volumes", ["volumes", "prune"], "btn--danger-ghost")}<button class="btn btn--sm btn--ghost" type="button" data-vol-fresh>Recount sizes</button></div>
     <div class="table-wrap"><table class="table">
       <thead><tr><th>Volume</th><th>Size</th><th class="w-bar"><span class="vh">Share</span></th><th>Used by</th><th><span class="vh">Actions</span></th></tr></thead>
       <tbody>${vs.map((v) => `<tr>
         <td class="mono"><b>${esc(v.name)}</b></td><td class="num">${esc(fmt(v.bytes || 0))}</td>
         <td class="w-bar"><span class="bar"><i data-w="${(v.bytes || 0) / max}"></i></span></td>
         <td class="small">${v.users?.length ? esc(v.users.join(", ")) : pill("unused", "warn")}</td>
-        <td class="row-actions">${btn("Backup", ["volumes", "backup", v.short])}${v.users?.length ? "" : btn("Remove", ["volumes", "rm", v.short], "btn--danger-ghost")}</td></tr>`).join("")}</tbody></table></div>
+        <td class="row-actions">${btn("Backup", ["volumes", "backup", v.short])}${v.users?.length ? "" : btn("Remove", ["volumes", "rm", v.short], "btn--danger-ghost")}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">No volumes yet - they are created when the stack starts.</td></tr>'}</tbody></table></div>
     <p class="muted small">A live volume backup of a running indexer can be inconsistent; the full backup uses an indexer snapshot. Restores run from the terminal: <code>vexor volumes restore &lt;volume&gt; &lt;file&gt;</code>.</p>`;
   $$("[data-w]").forEach((i) => (i.style.transform = `scaleX(${i.dataset.w})`));
   bindRunButtons(view());
@@ -357,7 +358,7 @@ async function vStacks() {
     </article>`).join("")}</div>
     <section class="block"><h2>Certificates, backups, automation</h2><div class="actions">
       ${btn("Certificate status", ["cert", "status"])}${btn("Create local-CA cert", ["cert", "create"])}${btn("Renew", ["cert", "renew"])}
-      ${btn("Retention", ["retention", "show"])}${btn("Apply retention", ["retention", "apply"])}${btn("Daemon status", ["daemon", "status"])}${btn("Install daemon", ["daemon", "install"])}${btn("Update check", ["update", "check"])}
+      ${btn("Retention", ["retention", "status"])}${btn("Apply retention", ["retention", "apply"])}${btn("Daemon status", ["daemon", "status"])}${btn("Install daemon", ["daemon", "install"])}${btn("Update check", ["update", "check"])}
     </div></section>`;
   bindRunButtons(view());
 }
@@ -423,7 +424,7 @@ async function vReset() {
   $$("[data-reset]").forEach((b) => b.addEventListener("click", () => { const r = RESETS[+b.dataset.reset]; run(r.args, { text: r.what }); }));
 }
 
-const SUGGEST = ["status", "doctor", "doctor --fix", "wazuh alerts -n 20", "agents list", "elk", "elk indices", "n8n", "n8n test", "suricata", "suricata alerts --since 1h", "suricata test", "zeek", "zeek top hosts", "tools", "soc", "volumes ls", "backup list", "cert status", "logs errors --since 1h", "logs nginx -n 100", "retention show", "update check", "version", "reminders"];
+const SUGGEST = ["status", "doctor", "doctor --fix", "wazuh alerts -n 20", "agents list", "elk", "elk indices", "n8n", "n8n test", "suricata", "suricata alerts --since 1h", "suricata test", "zeek", "zeek top hosts", "tools", "soc", "volumes ls", "backup list", "cert status", "logs errors --since 1h", "logs nginx -n 100", "retention status", "disk", "volumes orphans", "wait-ready", "update check", "version", "reminders"];
 async function vTerminal() {
   setTitle("Terminal");
   view().innerHTML = `

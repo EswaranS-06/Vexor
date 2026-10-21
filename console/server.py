@@ -86,12 +86,13 @@ CATALOG = {
     "maintenance": "change", "watchdog": "change", "support-bundle": "change", "ai-context": "read",
     "indexer": "read", "api": "read", "passwd": "danger", "reset": "danger", "console": "change", "plan": "read",
     "notify": "change", "login": "change", "disk": "read", "uninstall": "danger", "images": "danger",
+    "wait-ready": "read", "wait": "read", "migrate": "danger",
 }
 READ_SUBS = {
     "tools": {"status", "ls", ""}, "soc": {"status", ""}, "elk": {"status", "indices", "search", "explain", ""},
     "n8n": {"status", ""}, "suricata": {"status", "alerts", ""}, "zeek": {"status", "show", "notices", "top", ""},
     "agents": {"list", "summary", "outdated", "enroll-cmd", ""}, "cert": {"status", ""}, "backup": {"list", "ls"},
-    "retention": {"show", "status", ""}, "volumes": {"ls", "list", ""}, "reminders": {"list", ""}, "config": {"show", "get", "validate"},
+    "retention": {"show", "status", ""}, "volumes": {"ls", "list", "orphans", ""}, "reminders": {"list", ""}, "config": {"show", "get", "validate"},
     "daemon": {"status", "logs", ""}, "console": {"status", "url", ""}, "update": {"check", ""},
     "indexers": {"status", ""}, "node-type": {"status", ""}, "notify": {"status", ""},
 }
@@ -486,6 +487,7 @@ def audit(user, msg):
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "VexorConsole"
     sys_version = ""
+    timeout = 60   # per connection: a client that stalls (also during the TLS handshake) frees its thread
 
     def log_message(self, fmt, *a):  # quiet access log; the audit log records actions
         pass
@@ -823,6 +825,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             audit(f"({ip})", "login failed")
             time.sleep(1)
             return self.send_json({"error": "wrong user or password"}, 401)
+        for tok in [t for t, v in SESSIONS.items() if v["exp"] < now]:
+            SESSIONS.pop(tok, None)      # forget expired sessions
+        for k in [k for k, v in FAILS.items() if not v]:
+            FAILS.pop(k, None)
         token = secrets.token_hex(32)
         SESSIONS[token] = {"user": user, "csrf": secrets.token_hex(16), "exp": now + SESSION_TTL, "ip": ip}
         audit(user, f"login from {ip}")
@@ -850,7 +856,8 @@ def main():
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(str(cert), str(key))
     httpd = Server((bind, port), Handler)
-    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    # handshake in the request thread, not in accept(): one client that connects and sends nothing must not block the console
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
     print(f"vexor console on https://{bind}:{port}  (cert {cert})", flush=True)
     httpd.serve_forever()
 
