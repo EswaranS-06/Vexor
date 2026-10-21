@@ -100,6 +100,7 @@ Available when `SOC` is `elk` or `both`.
 | `elk indices` | `vexor-*` indices with health, document count and size. |
 | `elk search [query] [-n N] [--index P]` | Lucene search, newest first, with a short summary of each hit. Example: `vexor elk search 'alert.signature_id:2100498' --index 'vexor-suricata-*'`. |
 | `elk data-views` / `elk retention` | Re-create the Kibana data views / re-apply ILM retention (`ELK_RETENTION_DAYS`) and the index template. |
+| `elk beats-ca` | The CA that Beats senders trust when `LOGSTASH_BEATS_TLS=true`. |
 | `elk beats-config` | `filebeat.yml` snippet for machines that ship logs to Logstash (`LOGSTASH_BEATS_PORT`). |
 | `elk es <METHOD> <path> [json]` | Raw Elasticsearch API as `elastic`, e.g. `vexor elk es GET /_cat/health?v`. |
 | `elk explain` / `elk reset-password` | Shard allocation explanation / a new `elastic` password, stored in `.env`. |

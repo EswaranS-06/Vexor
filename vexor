@@ -214,6 +214,8 @@ N8N_ALERT_GROUPS=
 N8N_HOOK_TOKEN=
 WAZUH_N8N_USER=vexor-n8n
 SOC=wazuh                      # wazuh | elk | both  - switch with: vexor soc <value>
+LOGSTASH_BEATS_TLS=false       # true = TLS on the Beats input (vexor elk beats-config shows the sender settings)
+ENROLL_PASSWORD_ON_INSTALL=yes # fresh installs turn on the agent enrollment password
 NOTIFY_ON=fail                 # health alerts off the host: fail | warn | off (vexor notify)
 NOTIFY_URL=
 NOTIFY_REPEAT_HOURS=6          # re-send a problem that persists
@@ -746,10 +748,14 @@ cmd_install() {
   if [ -z "$(env_get PROXY_CERT)" ]; then cert_issue_local || warn "falling back to the built-in self-signed cert"
   else ok "using $(env_get PROXY_CERT) ($(cert_mode))"; fi
   hdr "9/9 Starting the stack"
+  local fresh=0; docker volume inspect "$(project)_master-wazuh-etc" >/dev/null 2>&1 || fresh=1
   local bdir; bdir="$(backup_dir)"
   mkdir -p "$bdir/snapshots" "$bdir/config"; chown 1000:1000 "$bdir/snapshots"
   rm -f "$STATE_DIR/stopped"
   apply_all
+  if [ "$fresh" = 1 ] && soc_wazuh && [ -z "$(env_get AGENT_ENROLL_PASSWORD)" ] && [ "$(env_def ENROLL_PASSWORD_ON_INSTALL yes)" = yes ]; then
+    agents_password on && say "agents need this password to enroll; vexor agents enroll-cmd includes it"
+  fi
   cmd_info
   say ""
   say "Next: ${C_BD}vexor doctor${C_0}   |   ${C_BD}vexor daemon install${C_0} (watchdog, backups, maintenance)"
@@ -2988,6 +2994,7 @@ services:
     volumes:
       - ./config/elk/logstash/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
       - ./config/elk/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./config/elk/logstash/certs:/usr/share/logstash/certs:ro
       - elk-logstash-data:/usr/share/logstash/data
       - master-wazuh-logs:/wazuh-logs/master:ro
       - worker-wazuh-logs:/wazuh-logs/worker:ro
@@ -3003,6 +3010,37 @@ EOF
   cmp -s "$tmp" "$ELK_COMPOSE" || cp "$tmp" "$ELK_COMPOSE"
   rm -f "$tmp"
 }
+# ============================================================== Logstash Beats input over TLS
+# LOGSTASH_BEATS_TLS=true: the Beats input on LOGSTASH_BEATS_PORT only accepts TLS. Server certificate signed by the
+# stack's internal root CA (config/wazuh_indexer_ssl_certs/root-ca.pem); senders trust that CA (vexor elk beats-ca).
+LS_CERT_DIR="$ROOT/config/elk/logstash/certs"
+logstash_tls_on() { [[ "$(env_def LOGSTASH_BEATS_TLS false)" =~ ^(true|yes|on|1)$ ]]; }
+logstash_sans() {
+  local s="DNS:logstash,DNS:localhost,IP:127.0.0.1" h ip; h="$(public_host)"
+  if [[ "$h" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then s+=",IP:$h"; else s+=",DNS:$h"; fi
+  for ip in $(host_ips); do [[ ",$s," == *",IP:$ip,"* ]] || s+=",IP:$ip"; done
+  echo "$s"
+}
+logstash_certs() {             # issue/renew the Beats server certificate (only when TLS is on)
+  mkdir -p "$LS_CERT_DIR"
+  logstash_tls_on || return 0
+  local d="$LS_CERT_DIR" ca="$INT_CERT_DIR/root-ca.pem" cakey="$INT_CERT_DIR/root-ca.key" sans
+  [ -f "$ca" ] && [ -f "$cakey" ] || { warn "internal CA missing - Beats TLS needs: vexor install"; return 1; }
+  sans="$(logstash_sans)"
+  if [ -s "$d/logstash.crt" ] && [ -s "$d/logstash.key" ] && [ "$(cat "$d/sans" 2>/dev/null)" = "$sans" ] \
+     && [ "$(cert_days_left "$d/logstash.crt")" -gt 30 ] && cmp -s "$ca" "$d/ca.crt"; then
+    return 0
+  fi
+  openssl req -new -newkey rsa:2048 -nodes -keyout "$RUN_TMP/ls.key" -subj "/CN=logstash/O=Vexor" -out "$RUN_TMP/ls.csr" 2>/dev/null \
+    && printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature,keyEncipherment\n' "$sans" > "$RUN_TMP/ls.ext" \
+    && openssl x509 -req -in "$RUN_TMP/ls.csr" -CA "$ca" -CAkey "$cakey" -CAcreateserial -CAserial "$RUN_TMP/ls.srl" \
+         -days 825 -sha256 -extfile "$RUN_TMP/ls.ext" -out "$d/logstash.crt" 2>/dev/null \
+    && openssl pkcs8 -topk8 -nocrypt -in "$RUN_TMP/ls.key" -out "$d/logstash.key" \
+    || { bad "could not issue the Logstash Beats certificate"; return 1; }
+  cp "$ca" "$d/ca.crt"; echo "$sans" > "$d/sans"
+  chmod 644 "$d/logstash.crt" "$d/ca.crt"; chmod 600 "$d/logstash.key"
+  ok "Logstash Beats certificate issued for ${sans//,/ }"
+}
 write_logstash_config() {      # pipeline follows SOC + sensors; Logstash reloads it by itself
   mkdir -p "$ELK_DIR/logstash/pipeline" "$TOOLS_DATA"
   cat > "$ELK_DIR/logstash/logstash.yml.tmp" <<'EOF'
@@ -3016,12 +3054,14 @@ EOF
   tool_on suricata && su=1
   tool_on zeek && ze=1
   local nf=0; [ "$(soc)" = elk ] && [ -n "$(n8n_hook)" ] && nf=1
-  python3 -I - "$ELK_DIR/logstash/pipeline/vexor.conf.tmp" "$wz" "$su" "$ze" "$(env_def ZEEK_WAZUH_LOGS notice,weird,dns,http,ssl,ssh)" "$nf" "$(n8n_level)" <<'PY'
+  python3 -I - "$ELK_DIR/logstash/pipeline/vexor.conf.tmp" "$wz" "$su" "$ze" "$(env_def ZEEK_WAZUH_LOGS notice,weird,dns,http,ssl,ssh)" "$nf" "$(n8n_level)" "$(logstash_tls_on && echo 1 || echo 0)" <<'PY'
 import sys
 out, wz, su, ze, zl = sys.argv[1], sys.argv[2] == "1", sys.argv[3] == "1", sys.argv[4] == "1", sys.argv[5]
-n8n, lvl = sys.argv[6] == "1", int(sys.argv[7])
+n8n, lvl, tls = sys.argv[6] == "1", int(sys.argv[7]), sys.argv[8] == "1"
 zfiles = ", ".join(f'"/vexor-sensors/zeek/logs/{n.strip()}.log"' for n in zl.split(",") if n.strip())
-i = ["input {", '  beats { port => 5044 tags => ["beats"] }']
+beats_tls = (' ssl_enabled => true ssl_certificate => "/usr/share/logstash/certs/logstash.crt"'
+             ' ssl_key => "/usr/share/logstash/certs/logstash.key" ssl_client_authentication => "none"') if tls else ""
+i = ["input {", '  beats { port => 5044 tags => ["beats"]' + beats_tls + ' }']
 if wz:
     i.append('  file { path => "/wazuh-logs/*/alerts/alerts.json" codec => "json" mode => "tail" start_position => "end"'
              ' sincedb_path => "/usr/share/logstash/data/sincedb-wazuh" tags => ["wazuh"] }')
@@ -3076,6 +3116,7 @@ elk_prepare() {                # before `docker compose up`
   local p; for p in KIBANA_PORT LOGSTASH_BEATS_PORT ES_PORT; do
     [[ "$(env_def "$p" x)" =~ ^5[0-9]{4}$ ]] || die "$p=$(env_get "$p") - ELK ports must be in 50000-59999"
   done
+  logstash_certs || warn "Beats input stays without TLS until the certificate can be issued"
   write_logstash_config
 }
 elk_post() {                   # after `docker compose up`: users, roles, retention, data views
@@ -3185,6 +3226,14 @@ print("none" if p is None else "%s in / %s out" % (p["events"]["in"], p["events"
     [ "$(soc)" = both ] && ! dc exec -T logstash test -r /wazuh-logs/master/alerts/alerts.json 2>/dev/null \
       && d_warn "Logstash cannot read the master's alerts.json" "vexor logs logstash"
   fi
+  if logstash_tls_on; then
+    local ld; ld="$(cert_days_left "$LS_CERT_DIR/logstash.crt" 2>/dev/null)"
+    if [ -n "$ld" ] && [ "$ld" -gt 30 ]; then d_pass "Beats input uses TLS (certificate valid $ld days)"
+    else d_warn "Beats TLS certificate missing or expiring (${ld:-none})" "vexor doctor --fix"
+         d_fix "re-issue the Logstash certificate" && { logstash_certs && write_logstash_config; }; fi
+  else
+    d_warn "the Beats input on port $(env_def LOGSTASH_BEATS_PORT 55044) accepts plain TCP" "LOGSTASH_BEATS_TLS=true, vexor config apply, then: vexor elk beats-config"
+  fi
   return 0
 }
 pull_missing_images() {        # predictable issue: registry TLS/network hiccups - retry each missing image
@@ -3256,11 +3305,12 @@ cmd_elk() {
     data-views) soc_elk || die "ELK is off"; elk_data_views ;;
     retention) soc_elk || die "ELK is off"; elk_retention_apply ;;
     beats-config|filebeat) soc_elk || die "ELK is off"; elk_beats_config ;;
+    beats-ca) logstash_tls_on || die "LOGSTASH_BEATS_TLS is off"; cat "$LS_CERT_DIR/ca.crt" 2>/dev/null || die "no certificate yet - vexor config apply" ;;
     es) shift; soc_elk || die "ELK is off"; local m="${1:?usage: vexor elk es <METHOD> <path> [json]}" pth="${2:?path}"; shift 2
         if [ $# -gt 0 ]; then es_curl "$m" "$pth" -d "$1"; else es_curl "$m" "$pth"; fi; echo ;;
     logs) shift; cmd_logs "${@:-elasticsearch}" ;;
     *) die "usage: vexor elk [status] | indices | search [query] [-n N] [--index P] | data-views | retention
-                | beats-config | es <METHOD> <path> [json] | explain | reset-password | logs [svc]" ;;
+                | beats-config | beats-ca | es <METHOD> <path> [json] | explain | reset-password | logs [svc]" ;;
   esac
 }
 
@@ -4179,13 +4229,24 @@ for h in reversed(hits):
 }
 elk_beats_config() {
   hdr "Ship logs from another machine into ELK (Filebeat / Elastic Agent -> Logstash)"
-  cat <<EOF
+  if logstash_tls_on; then
+    cat <<EOF
+  # filebeat.yml on the sending machine (copy the CA first: vexor elk beats-ca > /etc/filebeat/vexor-ca.crt)
+  output.logstash:
+    hosts: ["$(public_host):$(env_def LOGSTASH_BEATS_PORT 55044)"]
+    ssl.enabled: true
+    ssl.certificate_authorities: ["/etc/filebeat/vexor-ca.crt"]
+  # events land in vexor-beats-* (Kibana data view "Vexor - Beats / Elastic Agent")
+EOF
+  else
+    cat <<EOF
   # filebeat.yml on the sending machine
   output.logstash:
     hosts: ["$(public_host):$(env_def LOGSTASH_BEATS_PORT 55044)"]
   # events land in vexor-beats-* (Kibana data view "Vexor - Beats / Elastic Agent")
 EOF
-  hint "the Beats input has no TLS: use it on a trusted network, or put a VPN/firewall rule in front"
+    hint "the Beats input has no TLS: set LOGSTASH_BEATS_TLS=true, vexor config apply, then update the senders"
+  fi
 }
 cmd_cluster() {
   is_running wazuh.master || die "wazuh.master is not running"
@@ -4778,7 +4839,7 @@ _vexor() {
       zeek)    words="status enable disable show notices top test logs hosts ports dns conn dns http ssl ssh notice weird -n" ;;
       tools)   words="status apply enable disable update-rules n8n grafana portainer suricata zeek" ;;
       soc)     words="status wazuh elk both" ;;
-      elk)     words="status indices search data-views retention beats-config es explain reset-password logs -n --index" ;;
+      elk)     words="status indices search data-views retention beats-config beats-ca es explain reset-password logs -n --index" ;;
       indexers) words="status 1 3 abort cleanup --dry-run --no-backup" ;;
       node-type) words="status single multi --dry-run --no-backup --indexers" ;;
       reminders) words="list done" ;;
@@ -5178,7 +5239,7 @@ ${C_BD}ELK${C_0} (SOC=elk|both)
   elk [status]                   Elasticsearch health, Kibana, events in the last hour
   elk indices | search [query] [-n N] [--index P]   vexor-* indices | Lucene search, newest first
   elk data-views | retention     re-create Kibana data views | re-apply ILM retention (ELK_RETENTION_DAYS)
-  elk beats-config               filebeat.yml snippet to ship logs from other machines
+  elk beats-config | beats-ca    filebeat.yml for other machines | the CA they trust (LOGSTASH_BEATS_TLS=true)
   elk es <METHOD> <path> [json]  raw Elasticsearch API      e.g. vexor elk es GET /_cat/health?v
   elk explain | reset-password   shard allocation explain | new "elastic" password (+ .env)
 

@@ -369,7 +369,8 @@ vexor ai-context --print  # one report to paste into any AI assistant (secrets m
   - `vexor-n8n`: agent actions and active response.
   - `vexor_n8n`: read `vexor-*`.
 - Alerts sent to n8n carry a secret token (`N8N_HOOK_TOKEN`); the starter workflow drops calls without it.
-- Agent enrollment is open by default. Protect it with `vexor agents password on`.
+- Fresh installs require a password for agent enrollment (`ENROLL_PASSWORD_ON_INSTALL=yes`); `vexor agents enroll-cmd` includes it. On older installs turn it on with `vexor agents password on`.
+- The Logstash Beats input uses TLS with a certificate from the internal CA (`LOGSTASH_BEATS_TLS=true` on new installs; existing installs keep plain TCP until you switch, and doctor warns). Senders get their settings from `vexor elk beats-config` and the CA from `vexor elk beats-ca`.
 - Firewall:
   - Allow 1514 and 1515/tcp, and 514/udp, from endpoints.
   - Allow 8080 and the tool ports from administrators.
@@ -424,7 +425,6 @@ Created at run time and ignored by git: `.env`, `.state/`, `backups/`, `reports/
 - Up to three workers are predefined.
 - Wazuh 5.x uses a different deployment layout and is not covered by `vexor update apply`.
 - Elasticsearch runs as a single node and is not yet in `vexor backup`.
-- The Logstash Beats input has no TLS; use it on a trusted network.
 
 ## License
 
