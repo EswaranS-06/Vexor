@@ -77,6 +77,10 @@ vexor console password        # login for the web console
 vexor login                   # url, user and password of every login Vexor manages
 ```
 
+If `install` finds an earlier setup (`.env`, certificates, state or volumes), it asks whether to reuse it (the default) or start clean. `sudo ./vexor install --fresh` starts clean without asking: it deletes the old containers, volumes and generated files, and keeps backups.
+
+To remove Vexor, run `sudo ./vexor uninstall`. It shows what it will remove and asks first. It removes only this project's containers, network, volumes, generated files and systemd units. `--keep-data` keeps the volumes and files, and `--images` also removes the images.
+
 Open the Wazuh dashboard at `https://<host>:8080` and log in as `admin`. The first start takes 1–2 minutes. Everything below can also be done from the **Vexor Console** at `https://<host>:50443`.
 
 Add the rest of the SOC:

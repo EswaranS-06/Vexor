@@ -28,6 +28,8 @@ sudo ./vexor daemon install   # /usr/local/bin/vexor, completion, boot service, 
 
 It needs bash 4.4+, Docker Engine with Compose v2, `python3`, `openssl`, `curl`, `ss`, `flock`, and systemd for the daemon.
 
+When `install` finds an earlier setup, it asks whether to reuse it or start clean. `install --fresh` starts clean without asking. `sudo vexor uninstall` removes everything Vexor added (see [Data](#data)).
+
 ---
 
 ## Conventions
@@ -181,7 +183,7 @@ The web UI (`CONSOLE=true`, `https://PUBLIC_HOST:CONSOLE_PORT`). The README list
 
 | Command | Description |
 |---|---|
-| `install` | First-time setup, safe to re-run. It checks prerequisites and sets `vm.max_map_count`, then creates `.env` and detects `PUBLIC_HOST`. It generates the passwords and the cluster key, removes the OpenSearch demo users, and creates the internal certificates and a local-CA dashboard certificate. Finally it starts the selected stack and waits until it is ready. |
+| `install [--fresh]` | First-time setup, safe to re-run. If it finds an earlier `.env`, certificates, state or volumes, it asks whether to reuse them (default) or start clean; without a terminal it reuses them. `--fresh` starts clean: it deletes the project's containers, volumes and generated files (backups are kept), because the old indexer volumes keep the old password hashes. It checks prerequisites and sets `vm.max_map_count`, then creates `.env` and detects `PUBLIC_HOST`. It generates the passwords and the cluster key, removes the OpenSearch demo users, and creates the internal certificates and a local-CA dashboard certificate. Finally it starts the selected stack and waits until it is ready. |
 | `info [--show-secrets]` | URLs and logins (Wazuh dashboard, Kibana, tools), agent and API ports, certificate mode. |
 | `config show [--show-secrets]` / `get KEY` / `set KEY VALUE` | View or set values; keys with their own command are redirected to it. |
 | `plan [KEY=VALUE ..] [--json]` | What an apply would change, without changing anything: settings since the last apply (or the ones given), containers recreated, created and removed (a compose dry-run against temp-rendered files), nginx changes, and the downtime each means. |
@@ -264,6 +266,7 @@ Wazuh password policy: 8–64 characters from letters, digits and `. * + ? -`, w
 | `retention [show\|apply]` / `prune-logs` | Wazuh index retention / delete old manager logs. |
 | `volumes ls \| backup <vol\|all> [--stop] \| restore <vol> <file> \| rm <vol> \| prune` | Project volumes. |
 | `reset [containers\|data\|full\|purge]` | From removing containers up to a full wipe; backups are never deleted. |
+| `uninstall [--keep-data] [--images] [--yes]` | Remove Vexor: systemd units, PATH link, the containers, network and volumes of the compose project (and its `-certs` helper), and the generated files in the checkout (`.env`, `.state`, certificates, `backups/` inside the checkout, `reports/`, `tools-data/` and the like). It shows a plan and asks first. Git-tracked files and other projects are never touched. `--keep-data` keeps the volumes and files. `--images` also removes the stack's images unless another container uses them. Running it again prints "already clean". |
 
 ## Health automation
 
