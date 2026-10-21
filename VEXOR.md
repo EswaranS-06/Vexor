@@ -37,7 +37,7 @@ When `install` finds an earlier setup, it asks whether to reuse it or start clea
 | Topic | Behaviour |
 |---|---|
 | **Root** | Every command except `help`, `version` and `completion` needs root; a non-root user is re-run through `sudo`. |
-| **Global options** | `-y` / `--yes` answers every prompt. `-q` / `--quiet` prints less. `--no-color` gives plain output for scripts and logs. |
+| **Global options** | `-y` / `--yes` answers every prompt. `-q` / `--quiet` prints less. `--no-color` gives plain output for scripts and logs. `--verbose` (or `VEXOR_VERBOSE=1`) streams the full docker output instead of the one-line progress view. |
 | **Service names** | Full names (`wazuh.master`) or aliases: `master`, `worker`, `worker2`, `worker3`, `indexer1`–`indexer3`, `dashboard`, `nginx`, and the groups `managers` and `indexers`. ELK and tool services use their own names (`kibana`, `logstash`, `n8n`, `suricata` …). |
 | **Confirmation** | Risky actions ask `[y/N]`; destructive ones make you type `DELETE`, `RESTORE` or `REGEN`. `--yes` skips both. |
 | **Locking** | Commands that change something take `/run/lock/vexor.lock`. Interactive commands wait up to 3 minutes for a running watchdog or health check. |

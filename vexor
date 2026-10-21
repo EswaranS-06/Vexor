@@ -95,6 +95,112 @@ confirm_word() {               # confirm_word WORD "warning text"
 }
 mask() { local v="$1"; [ ${#v} -le 4 ] && { echo "****"; return; }; echo "${v:0:2}$(printf '%*s' $(( ${#v} - 2 )) '' | tr ' ' '*')"; }
 
+# ============================================================== progress helpers (run_step, live spinner, image pulls)
+# run_step "<label>" <cmd...>   runs the command with its output captured in $STATE_DIR/logs/<label>.log.
+#   on a terminal: one live line  "⠋ label (12s) · latest output line", then "✔ label (12s)" / "✘ label (12s)"
+#   in CI / pipes / TERM=dumb / --no-color: no animation - the label once, then ✔/✘ with the time
+#   on failure: the last lines of the log + its path; returns the command's exit code
+#   VEXOR_VERBOSE=1 or --verbose: the command's full output streams as before
+VERBOSE="${VEXOR_VERBOSE:-0}"
+SPIN_PID=""
+SPIN_CURSOR=0
+SPIN_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+step_live() {                  # true when animations may be drawn (colour terminal, not CI, not dumb)
+  [ -n "$C_0" ] && [ -t 1 ] && [ "$QUIET" != 1 ] && [ "$VERBOSE" != 1 ] \
+    && [ -z "${CI:-}" ] && [ "${TERM:-dumb}" != dumb ]
+}
+step_cols() {
+  local c="${COLUMNS:-}"
+  [[ "$c" =~ ^[0-9]+$ ]] || c="$(tput cols 2>/dev/null)"
+  { [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 20 ]; } || c=80
+  echo "$c"
+}
+cursor_hide() { tput civis 2>/dev/null || printf '\e[?25l'; SPIN_CURSOR=1; }
+cursor_show() { [ "$SPIN_CURSOR" = 1 ] || return 0; tput cnorm 2>/dev/null; printf '\e[?25h'; SPIN_CURSOR=0; }
+spin_line() {                  # spin_line <frame-index> <text>: redraw the live line in place, cut to the terminal width
+  local cols txt="$2"; cols="$(step_cols)"
+  txt="${txt:0:$((cols - 5))}"
+  printf '\r  %s%s%s %s\e[K' "$C_B" "${SPIN_FRAMES[$(( $1 % 10 ))]}" "$C_0" "$txt"
+}
+spin_clear() { printf '\r\e[K'; }
+spin_stop() {                  # kill the spinner, wipe its line, show the cursor (also called from the EXIT trap)
+  if [ -n "$SPIN_PID" ]; then
+    kill "$SPIN_PID" 2>/dev/null; wait "$SPIN_PID" 2>/dev/null; SPIN_PID=""
+    spin_clear
+  fi
+  cursor_show
+}
+step_last_line() {             # newest non-empty line of a log; \r progress redraws and ANSI codes are dropped
+  local esc=$'\e'
+  tail -c 4096 "$1" 2>/dev/null | tr '\r' '\n' | sed -E "s/${esc}\[[0-9;?]*[A-Za-z]//g" \
+    | tr -cd '\11\12\40-\176' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$' | tail -n 1
+}
+step_spin() {                  # background subshell: step_spin <label> <log> <start-SECONDS> <parent-pid>
+  local label="$1" log="$2" start="$3" par="$4" i=0 detail=""
+  trap 'exit 0' TERM
+  trap 'spin_clear; cursor_show' EXIT
+  SPIN_CURSOR=1
+  while kill -0 "$par" 2>/dev/null; do     # ends by itself when vexor dies without cleaning up
+    [ $((i % 5)) = 0 ] && detail="$(step_last_line "$log")"
+    spin_line "$i" "$label ($(fmt_dur $(( SECONDS - start ))))${detail:+ · $detail}"
+    i=$((i + 1)); sleep 0.1 2>/dev/null || sleep 1
+  done
+}
+run_step() {
+  local label="$1" slug log t0 rc=0 el mode=plain; shift
+  step_live && mode=live
+  [ "$VERBOSE" = 1 ] && mode=verbose
+  slug="$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '-' | sed -E 's/-+/-/g; s/^-//; s/-$//' | cut -c1-48)"
+  log="$STATE_DIR/logs/${slug:-step}.log"
+  mkdir -p "$STATE_DIR/logs" 2>/dev/null || log="${RUN_TMP:-/tmp}/${slug:-step}.log"
+  : > "$log" 2>/dev/null || log=/dev/null
+  t0=$SECONDS
+  case "$mode" in
+    verbose) say "$label ..."; "$@" </dev/null; rc=$? ;;
+    plain)   say "$label ..."; "$@" >"$log" 2>&1 </dev/null; rc=$? ;;
+    live)
+      cursor_hide
+      step_spin "$label" "$log" "$t0" "$BASHPID" & SPIN_PID=$!
+      "$@" >"$log" 2>&1 </dev/null; rc=$?
+      spin_stop ;;
+  esac
+  el="$(fmt_dur $(( SECONDS - t0 )))"
+  if [ "$rc" = 0 ]; then ok "$label ($el)"
+  else
+    bad "$label ($el, exit $rc)"
+    if [ "$mode" != verbose ] && [ -s "$log" ]; then
+      printf '      %s--- last lines of the output ---%s\n' "$C_D" "$C_0"
+      tail -n 25 "$log" | tr -d '\r' | sed 's/^/      /'
+      hint "full log: $log"
+    fi
+  fi
+  return "$rc"
+}
+pull_image_list() {            # pull_image_list <image..>: pulls the ones missing locally (all with PULL_ALL=1), 4 tries each
+  local img todo=() n
+  for img in "$@"; do
+    if [ "${PULL_ALL:-0}" = 1 ] || ! docker image inspect "$img" >/dev/null 2>&1; then todo+=("$img"); fi
+  done
+  n=${#todo[@]}; [ "$n" -gt 0 ] || return 0
+  run_step "pulling $n image$([ "$n" = 1 ] || echo s)" pull_images_loop "$n" "${todo[@]}"
+}
+pull_images_loop() {           # pull_images_loop <total> <image..>: progress goes to stdout (live line / log)
+  local n="$1" img i=0 t fail=0 err; shift
+  err="$(mktemp)"
+  for img in "$@"; do
+    i=$((i + 1))
+    for t in 1 2 3 4; do
+      echo "pulling $i/$n images - $img"
+      docker pull -q "$img" >/dev/null 2>"$err" && break
+      cat "$err"
+      [ "$t" = 4 ] && { echo "could not pull $img (network/registry) - retry later: vexor start"; fail=1; break; }
+      echo "pull of $img failed - retry $t/3 in $((t * 10))s"; sleep $((t * 10))
+    done
+  done
+  rm -f "$err"
+  return "$fail"
+}
+
 # ============================================================== .env helpers
 env_get() {
   [ -f "$ENV_FILE" ] || return 0
@@ -731,23 +837,36 @@ d_starting() {                 # doctor: a warning (not a failure) for a service
   svc_starting "$1" || return 1
   d_warn "$1 still starting ($(svc_not_ready "$1"))" "give it a few minutes (up to $((WAIT_READY_TIMEOUT / 60)) min after a start), then: vexor wait-ready $1"
 }
-wait_ready_run() {             # wait_ready_run <timeout-s> <json 0|1> <svc..>  -> 0 all ready, 1 otherwise (lists what is not ready)
-  local t="$1" js="$2" start="$SECONDS" lastp=-999 now why svc s rows="" nfail=0 printed
+wait_spin() {                  # wait_spin <seconds> <start> <svc..>: animated sleep, one line naming what is still pending
+  local secs="$1" start="$2" end i=0 svc txt=""; shift 2
+  for svc in "$@"; do txt+="${txt:+, }$svc${WAIT_WHY[$svc]:+ (${WAIT_WHY[$svc]})}"; done
+  [ "$SPIN_CURSOR" = 1 ] || cursor_hide
+  end=$(( SECONDS + secs ))
+  while [ "$SECONDS" -lt "$end" ]; do
+    spin_line "$i" "waiting $(fmt_dur $(( SECONDS - start ))) · $txt"
+    i=$((i + 1)); sleep 0.1 2>/dev/null || sleep 1
+  done
+}
+wait_ready_run() {           # wait_ready_run <timeout-s> <json 0|1> <svc..>  -> 0 all ready, 1 otherwise (lists what is not ready)
+  local t="$1" js="$2" start="$SECONDS" lastp=-999 now why svc s rows="" nfail=0 printed live=0
   shift 2
   local pending=("$@") still
+  [ "$js" = 1 ] || ! step_live || live=1      # tty: one live spinner line instead of "waiting:" lines
   while [ ${#pending[@]} -gt 0 ]; do
     now=$(( SECONDS - start )); still=(); printed=0
     for svc in "${pending[@]}"; do
       why="$(svc_not_ready "$svc")"
       if [ -z "$why" ]; then
+        [ "$live" = 1 ] && spin_clear
         [ "$js" = 1 ] || ok "ready: $svc $(fmt_dur "$now")"
         rows+="$svc|1|$now|"$'\n'
       elif [ "${why:0:1}" = '!' ]; then
+        [ "$live" = 1 ] && spin_clear
         [ "$js" = 1 ] || bad "$svc: ${why:1}"
         rows+="$svc|0|$now|${why:1}"$'\n'; nfail=$((nfail + 1))
       else
         still+=("$svc"); WAIT_WHY["$svc"]="$why"
-        if [ "$js" != 1 ] && [ $((now - lastp)) -ge "$WAIT_PRINT" ]; then say "waiting: $svc ($why) $(fmt_dur "$now")"; printed=1; fi
+        if [ "$js" != 1 ] && [ "$live" = 0 ] && [ $((now - lastp)) -ge "$WAIT_PRINT" ]; then say "waiting: $svc ($why) $(fmt_dur "$now")"; printed=1; fi
       fi
     done
     [ "$printed" = 1 ] && lastp=$now
@@ -755,8 +874,9 @@ wait_ready_run() {             # wait_ready_run <timeout-s> <json 0|1> <svc..>  
     [ ${#pending[@]} -gt 0 ] || break
     [ $(( SECONDS - start )) -ge "$t" ] && break
     now=$(( t - (SECONDS - start) )); [ "$now" -gt "$WAIT_POLL" ] && now="$WAIT_POLL"
-    sleep "$now"
+    if [ "$live" = 1 ]; then wait_spin "$now" "$start" "${pending[@]}"; else sleep "$now"; fi
   done
+  [ "$live" = 1 ] && spin_stop
   for svc in "${pending[@]}"; do rows+="$svc|0|$t|${WAIT_WHY[$svc]:-not ready}"$'\n'; done
   if [ "$js" = 1 ]; then
     python3 -I -c '
@@ -844,10 +964,12 @@ gen_internal_certs() {
   local mm; mm="$(cur_version | cut -d. -f1,2)"
   sed -i -E "s/(CERT_TOOL_VERSION=)[0-9.]+/\1$mm/" "$CERTGEN_FILE"
   mkdir -p "$INT_CERT_DIR"
-  (cd "$ROOT" && docker compose -p "$(project)-certs" -f "$CERTGEN_FILE" run --rm generator) || return 1
+  pull_image_list $(cd "$ROOT" && docker compose -f "$CERTGEN_FILE" config --images 2>/dev/null | sort -u)
+  run_step "Generating the internal TLS certificates" certgen_run || return 1
   (cd "$ROOT" && docker compose -p "$(project)-certs" -f "$CERTGEN_FILE" down) >/dev/null 2>&1
   [ -f "$INT_CERT_DIR/root-ca.pem" ]
 }
+certgen_run() { (cd "$ROOT" && docker compose -p "$(project)-certs" -f "$CERTGEN_FILE" run -T --rm generator); }
 cmd_install() {
   local fresh_req=0 a
   for a in "$@"; do
@@ -885,6 +1007,7 @@ cmd_install() {
   remove_demo_users
   if [ ! -f "$STATE_DIR/passwords-applied" ]; then
     local h1 h2
+    is_running wazuh1.indexer || pull_image_list "wazuh/wazuh-indexer:$(cur_version)"   # hash_pw runs it once
     h1="$(hash_pw "$(env_get INDEXER_PASSWORD)")"; h2="$(hash_pw "$(env_get DASHBOARD_PASSWORD)")"
     [ -n "$h1" ] && [ -n "$h2" ] || die "Could not generate password hashes (is the wazuh-indexer image reachable?)"
     set_user_hash admin "$h1" && set_user_hash kibanaserver "$h2" || die "Could not update internal_users.yml"
@@ -895,7 +1018,7 @@ cmd_install() {
   fi
   hdr "7/9 Internal TLS certificates"
   if [ -f "$INT_CERT_DIR/root-ca.pem" ]; then ok "present"
-  else gen_internal_certs || die "Certificate generation failed"; ok "generated"; fi
+  else gen_internal_certs || die "Certificate generation failed"; ok "root CA + node certificates are in config/wazuh_indexer_ssl_certs"; fi
   hdr "8/9 Dashboard certificate (port $(env_def PROXY_PORT 8080))"
   if [ -z "$(env_get PROXY_CERT)" ]; then cert_issue_local || warn "falling back to the built-in self-signed cert"
   else ok "using $(env_get PROXY_CERT) ($(cert_mode))"; fi
@@ -945,7 +1068,7 @@ cmd_start() {
   render_nginx; render_override
   rm -f "$STATE_DIR/stopped"
   if [ $# -gt 0 ]; then
-    dc up -d $(resolve_many "$@") || return 1
+    run_step "Starting $(resolve_many "$@" | tr '\n' ' ')" dc up -d $(resolve_many "$@") || return 1
     wait_ready_run "$WAIT_READY_TIMEOUT" 0 $(resolve_many "$@") || warn "not ready yet - vexor wait-ready   |   vexor doctor"
     return 0
   fi
@@ -1831,7 +1954,7 @@ cmd_cert() {
       dc_all stop
       mv "$INT_CERT_DIR" "$bk" && ok "old certificates moved to $bk"
       gen_internal_certs || { bad "generation failed - restoring old certificates"; rm -rf "$INT_CERT_DIR"; mv "$bk" "$INT_CERT_DIR"; dc up -d; exit 1; }
-      dc up -d --force-recreate && wait_indexer 300 && wait_dashboard 240 ;;
+      run_step "Recreating all containers with the new certificates" dc up -d --force-recreate && wait_indexer 300 && wait_dashboard 240 ;;
     *) die "usage: vexor cert status|create|export-ca|serve-ca|import|letsencrypt|renew|use-default|internal-regen" ;;
   esac
 }
@@ -2442,16 +2565,16 @@ nt_apply_layout() {            # nt_apply_layout <single|multi>: managers, nginx
     nginx_reload >/dev/null 2>&1 || true
     prune_disabled_containers
     say "recreating the master + dashboard (drops any old direct ports), nginx keeps $(env_def AGENT_PORT 1514) and $(env_def PROXY_PORT 8080)"
-    dc up -d --no-deps --force-recreate wazuh.master wazuh.dashboard >/dev/null 2>&1 \
+    run_step "Recreating the master and dashboard" dc up -d --no-deps --force-recreate wazuh.master wazuh.dashboard \
       || die "master/dashboard did not start - see: vexor logs master dashboard ; re-run: vexor node-type single"
-    dc up -d >/dev/null 2>&1 || die "nginx did not start - see: vexor logs nginx ; re-run: vexor node-type single"
+    run_step "Starting the remaining containers" dc up -d || die "nginx did not start - see: vexor logs nginx ; re-run: vexor node-type single"
     nginx_reload >/dev/null 2>&1 || true
   else
     say "starting the workers (they resync agent keys, rules and groups from the master)"
-    dc up -d --no-deps --force-recreate wazuh.master wazuh.dashboard >/dev/null 2>&1 \
+    run_step "Recreating the master and dashboard" dc up -d --no-deps --force-recreate wazuh.master wazuh.dashboard \
       || die "master/dashboard did not start - see: vexor logs master dashboard ; re-run: vexor node-type multi"
     prune_disabled_containers
-    dc up -d >/dev/null 2>&1 || die "workers/nginx did not start - see: vexor logs nginx worker ; re-run: vexor node-type multi"
+    run_step "Starting the remaining containers" dc up -d || die "workers/nginx did not start - see: vexor logs nginx worker ; re-run: vexor node-type multi"
     render_nginx                    # only now that the workers exist (nginx resolves upstreams on reload)
     nginx_reload >/dev/null 2>&1 || dc up -d --no-deps --force-recreate nginx >/dev/null 2>&1
   fi
@@ -3486,16 +3609,7 @@ print("none" if p is None else "%s in / %s out" % (p["events"]["in"], p["events"
   return 0
 }
 pull_missing_images() {        # predictable issue: registry TLS/network hiccups - retry each missing image
-  local img t fail=0
-  for img in $(dc config --images 2>/dev/null | sort -u); do
-    docker image inspect "$img" >/dev/null 2>&1 && continue
-    for t in 1 2 3 4; do
-      docker pull -q "$img" >/dev/null 2>&1 && { say "pulled $img"; break; }
-      [ "$t" = 4 ] && { bad "could not pull $img (network/registry) - retry later: vexor start"; fail=1; break; }
-      say "pull of $img failed - retry $t/3 in $((t * 10))s"; sleep $((t * 10))
-    done
-  done
-  return "$fail"
+  pull_image_list $(dc config --images 2>/dev/null | sort -u)
 }
 cmd_soc() {
   local target="${1:-status}"; shift || true
@@ -3523,7 +3637,7 @@ apply_all() {                  # the one reconcile path: render everything, pull
   tools_prepare; elk_prepare
   pull_missing_images || warn "some images are missing - their services will not start"
   prune_disabled_containers
-  dc up -d || die "docker compose up failed - see the error above, then: vexor doctor"
+  run_step "Starting the containers" dc up -d || die "docker compose up failed - see the output above, then: vexor doctor"
   soc_wazuh && wait_indexer 300 && post_start      # users/roles below need a running indexer
   tools_post
   elk_post
@@ -5563,11 +5677,11 @@ cmd_update() {
       confirm "Roll back $(cur_version) -> $prev?" || die "Aborted"
       take_lock
       env_set WAZUH_VERSION "$prev"; rm -f "$STATE_DIR/previous_version"
-      dc_all down && dc up -d && wait_indexer 300 && wait_dashboard 240 ;;
+      run_step "Stopping the stack" dc_all down && run_step "Starting on $prev" dc up -d && wait_indexer 300 && wait_dashboard 240 ;;
     images|pull)
       take_lock
       hdr "Re-pulling images for $(cur_version) + $(env_def NGINX_IMAGE nginx:stable)"
-      dc pull && dc up -d && ok "containers recreated only where the image changed"
+      PULL_ALL=1 pull_image_list $(dc config --images 2>/dev/null | sort -u) && run_step "Recreating containers where the image changed" dc up -d
       docker image prune -f >/dev/null
       images_prune_offer ;;
     *) die "usage: vexor update [check] | apply [VERSION|latest] [--no-backup] [--force] | rollback | images" ;;
@@ -5597,10 +5711,9 @@ update_apply() {
   confirm "Continue? The stack is down for a few minutes" || die "Aborted"
   take_lock
   hdr "Pulling images (before any downtime)"
-  local img; for img in wazuh-manager wazuh-indexer wazuh-dashboard; do
-    docker pull -q "wazuh/$img:$target" || die "image wazuh/$img:$target not available"
-  done
-  docker pull -q "$(env_def NGINX_IMAGE nginx:stable)" >/dev/null || warn "nginx image pull failed (keeping current)"
+  PULL_ALL=1 pull_image_list wazuh/wazuh-manager:$target wazuh/wazuh-indexer:$target wazuh/wazuh-dashboard:$target \
+    || die "images wazuh/*:$target not available - see the output above"
+  PULL_ALL=1 pull_image_list "$(env_def NGINX_IMAGE nginx:stable)" || warn "nginx image pull failed (keeping current)"
   if [ "$nobackup" = 0 ]; then
     if [ "$(ix_code)" = 200 ]; then backup_run || { confirm "Backup failed. Continue anyway?" || die "Aborted"; }
     else confirm "Indexer unreachable - continue WITHOUT a backup?" || die "Aborted"; fi
@@ -5609,7 +5722,7 @@ update_apply() {
   env_set WAZUH_VERSION "$target"
   sed -i -E "s/(CERT_TOOL_VERSION=)[0-9.]+/\1$(cut -d. -f1,2 <<<"$target")/" "$CERTGEN_FILE"
   hdr "Restarting on $target"
-  dc_all down && render_nginx && dc up -d || die "start failed - roll back with: vexor update rollback"
+  run_step "Stopping the stack" dc_all down && render_nginx && run_step "Starting on $target" dc up -d || die "start failed - roll back with: vexor update rollback"
   if wait_stack; then
     post_start
     ok "Upgraded to $target"
@@ -6656,7 +6769,7 @@ ${C_BD}Automation${C_0}
   maintenance                    prune logs + retention + certificate renewal + image cleanup
   completion [install]           bash completion
 
-Options: -y/--yes (no prompts)  -q/--quiet  --no-color
+Options: -y/--yes (no prompts)  -q/--quiet  --no-color  --verbose (stream the full docker output; same as VEXOR_VERBOSE=1)
 Service names: master worker worker2 worker3 indexer1 indexer2 indexer3 dashboard nginx | managers | indexers
                (node type single: master indexer1 dashboard)
 EOF
@@ -6670,7 +6783,8 @@ main() {
         -y|--yes)   ASSUME_YES=1; continue ;;
         -q|--quiet) QUIET=1; continue ;;
         --no-color) USE_COLOR=0; continue ;;
-        -h|--help)  [ -z "$cmd" ] && { cmd=help; continue; } ;;
+        --verbose)  VERBOSE=1; continue ;;
+        -h|--help) [ -z "$cmd" ] && { cmd=help; continue; } ;;
       esac
     fi
     [ -z "$cmd" ] && { cmd="$a"; continue; }
@@ -6687,7 +6801,7 @@ main() {
         exec sudo -E "$SELF" "$@"
       fi ;;
   esac
-  RUN_TMP="$(mktemp -d /tmp/vexor.XXXXXX)"; trap 'rm -rf "$RUN_TMP"' EXIT
+  RUN_TMP="$(mktemp -d /tmp/vexor.XXXXXX)"; trap 'spin_stop; rm -rf "$RUN_TMP"' EXIT
   if [ -f "$ENV_FILE" ] && [ "$(id -u)" -eq 0 ] && [[ "$cmd" != help && "$cmd" != completion ]]; then
     project_resolve; ensure_env_defaults >/dev/null; env_drop_legacy >/dev/null; migrate_layout
     case "$cmd" in   # action history (feeds ai-context); read-only commands are not logged
