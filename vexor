@@ -6284,13 +6284,14 @@ cmd_plan() {
   ) >/dev/null 2>&1
   cf="docker-compose.yml:docker-compose.tools.yml:docker-compose.elk.yml:$d/override.yml"
   (cd "$ROOT" && COMPOSE_FILE="$cf" COMPOSE_PROFILES="$(grep -E '^COMPOSE_PROFILES=' "$d/.env" | tail -1 | cut -d= -f2-)" \
-     docker compose --env-file "$d/.env" --dry-run up -d 2>&1) > "$d/dry"
+     docker compose --env-file "$d/.env" --dry-run up -d --pull never 2>&1) > "$d/dry"   # never: a dry run would still pull missing images
   running_services > "$d/running" 2>/dev/null
+  dc_all ps -a --services > "$d/existing" 2>/dev/null
   diff -u "$NGINX_CONF" "$d/nginx.conf" > "$d/nginx.diff" 2>/dev/null
   volume_orphans 2>/dev/null | cut -f1,2 > "$d/orphans"
-  python3 -I - "$base" "$d/.env" "$d/dry" "$d/enabled" "$d/running" "$d/nginx.diff" "$json" "$(project)" "$( [ -f "$STATE_DIR/env.applied" ] && echo 1 || echo 0)" "$d/orphans" <<'PY'
+  python3 -I - "$base" "$d/.env" "$d/dry" "$d/enabled" "$d/running" "$d/nginx.diff" "$json" "$(project)" "$( [ -f "$STATE_DIR/env.applied" ] && echo 1 || echo 0)" "$d/orphans" "$d/existing" <<'PY'
 import json, re, sys
-base, new, dry, enabled, running, ndiff, as_json, proj, have_base, orphans = sys.argv[1:11]
+base, new, dry, enabled, running, ndiff, as_json, proj, have_base, orphans, existing = sys.argv[1:12]
 def env(p):
     out = {}
     for line in open(p, errors="replace"):
@@ -6320,8 +6321,9 @@ for line in open(dry, errors="replace"):
     name = re.sub(r"^[0-9a-f]{12}_", "", m.group(1))
     svc = re.sub(rf"^{re.escape(proj)}-(.*)-\d+$", r"\1", name)
     (recreate if m.group(2) == "Recreate" else create).append(svc)
-recreate, create = sorted(set(recreate)), sorted(set(create) - set(recreate))
 en = set(open(enabled).read().split())
+create += [x for x in en if x not in set(open(existing).read().split())]   # enabled, no container yet
+recreate, create = sorted(set(recreate)), sorted(set(create) - set(recreate))
 remove = sorted(s for s in open(running).read().split() if s not in en)
 nginx_lines = [l for l in open(ndiff, errors="replace") if l[:1] in "+-" and not l.startswith(("+++", "---"))]
 DOWN = {
