@@ -49,9 +49,9 @@ services:
     logging: *default-logging
     ulimits: *manager-ulimits
     ports:
-      - "${ENROLL_PORT:-1515}:1515"
-      - "${SYSLOG_PORT:-514}:514/udp"
-      - "${API_PORT:-55000}:55000"
+      - "${BIND_IP:-0.0.0.0}:${ENROLL_PORT:-1515}:1515"
+      - "${BIND_IP:-0.0.0.0}:${SYSLOG_PORT:-514}:514/udp"
+      - "${BIND_IP:-0.0.0.0}:${API_PORT:-55000}:55000"
     environment:
       INDEXER_URL: '"https://wazuh1.indexer:9200","https://wazuh2.indexer:9200","https://wazuh3.indexer:9200"'
       INDEXER_USERNAME: ${INDEXER_USERNAME:-admin}

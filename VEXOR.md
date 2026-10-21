@@ -43,6 +43,7 @@ It needs bash 4.4+, Docker Engine with Compose v2, `python3`, `openssl`, `curl`,
 | **History** | Every changing command is logged to `.state/history.log`, secrets masked. |
 | **Self-migration** | On every run `vexor` upgrades what older versions wrote: new `.env` keys, compose layout, the old `wazuhctl` names and units, and the Shuffle settings (replaced by n8n in 1.2.0). |
 | **Settings** | Read from `.env`. A key defined twice resolves to its last definition, as in Docker Compose. |
+| **Addresses** | An empty `PUBLIC_HOST` is detected each time `vexor` runs and never saved, so a moved machine needs no edit; `doctor` warns when the certificates no longer cover the current address. Published ports listen on `BIND_IP` (default `0.0.0.0`). |
 
 ---
 
@@ -60,6 +61,7 @@ After editing `.env`: `vexor config validate`, then `vexor config apply`, then `
 | Passwords | `vexor passwd …`, `vexor elk reset-password` | dependent containers |
 | `WAZUH_VERSION` | `vexor update apply <version>` | a few minutes |
 | `PUBLIC_HOST`, certificate names | `vexor cert create` | nginx (seconds) |
+| `BIND_IP` (address the published ports listen on) | `vexor config apply` | containers with published ports |
 | Timer times | `vexor daemon install` | none |
 | `config/wazuh_cluster/*.conf` | edit every manager file → `vexor restart managers` | managers are **recreated** |
 | `config/nginx/nginx.conf.tpl` | `vexor config apply` | none (reload) |
@@ -181,7 +183,7 @@ The web UI (`CONSOLE=true`, `https://PUBLIC_HOST:CONSOLE_PORT`). The README list
 
 | Command | Description |
 |---|---|
-| `install` | First-time setup, safe to re-run. It checks prerequisites and sets `vm.max_map_count`, then creates `.env` and detects `PUBLIC_HOST`. It generates the passwords and the cluster key, removes the OpenSearch demo users, and creates the internal certificates and a local-CA dashboard certificate. Finally it starts the selected stack and waits until it is ready. |
+| `install` | First-time setup, safe to re-run. It checks prerequisites and sets `vm.max_map_count`, then creates `.env` and shows the detected `PUBLIC_HOST`. It generates the passwords and the cluster key, removes the OpenSearch demo users, and creates the internal certificates and a local-CA dashboard certificate. Finally it starts the selected stack and waits until it is ready. |
 | `info [--show-secrets]` | URLs and logins (Wazuh dashboard, Kibana, tools), agent and API ports, certificate mode. |
 | `config show [--show-secrets]` / `get KEY` / `set KEY VALUE` | View or set values; keys with their own command are redirected to it. |
 | `plan [KEY=VALUE ..] [--json]` | What an apply would change, without changing anything: settings since the last apply (or the ones given), containers recreated, created and removed (a compose dry-run against temp-rendered files), nginx changes, and the downtime each means. |

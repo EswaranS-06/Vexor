@@ -98,6 +98,8 @@ vexor agents enroll-cmd windows --name pc-01     # also: linux, rpm, macos
 vexor cert create && vexor cert export-ca        # local CA certificate + how to trust it
 ```
 
+`PUBLIC_HOST` is empty by default: Vexor detects the machine's address each time it runs, so the same checkout keeps working after a move or a new DHCP address. Set it in `.env` only when clients use a DNS name or a NAT address. Nothing in the checkout is tied to one machine or path.
+
 ---
 
 ## Choosing what runs
@@ -291,6 +293,7 @@ vexor config validate && vexor config apply && vexor doctor
 | Any password | `vexor passwd admin\|kibanaserver\|api`, `vexor elk reset-password`; editing `.env` alone breaks logins |
 | `WAZUH_VERSION` | `vexor update apply <version>` |
 | `PUBLIC_HOST`, certificate names | `vexor cert create` |
+| `BIND_IP` | `vexor config apply` |
 | `BACKUP_TIME`, `MAINT_TIME`, `HEALTH_INTERVAL` | `vexor daemon install` |
 | `config/wazuh_cluster/*.conf` | Edit **every** manager file, then `vexor restart managers` |
 | `config/nginx/nginx.conf.tpl` | `vexor config apply` (`nginx.conf` is generated) |
@@ -357,6 +360,7 @@ vexor ai-context --print  # one report to paste into any AI assistant (secrets m
 |---|---|
 | Agent stays *never connected* | Normal for about a minute. Otherwise 1514/tcp is not reachable from the endpoint. |
 | Browser warns about the certificate | `vexor cert create`, then trust the CA (`vexor cert export-ca`) |
+| The machine got a new IP or moved | Nothing to edit while `PUBLIC_HOST` is empty. `vexor doctor` says when the certificate no longer covers the address: `vexor cert create`. |
 | n8n shows no executions | `vexor n8n`: is the webhook registered and is the level threshold right? Then `vexor n8n test`. |
 | Suricata has no alerts | `vexor suricata test`; is `SNIFF_INTERFACE` the interface the traffic uses? |
 | Kibana returns 502 | Still starting (2–3 min on the first run) |
@@ -376,6 +380,7 @@ vexor ai-context --print  # one report to paste into any AI assistant (secrets m
 - Alerts sent to n8n carry a secret token (`N8N_HOOK_TOKEN`); the starter workflow drops calls without it.
 - Fresh installs require a password for agent enrollment (`ENROLL_PASSWORD_ON_INSTALL=yes`); `vexor agents enroll-cmd` includes it. On older installs turn it on with `vexor agents password on`.
 - The Logstash Beats input uses TLS with a certificate from the internal CA (`LOGSTASH_BEATS_TLS=true` on new installs; existing installs keep plain TCP until you switch, and doctor warns). Senders get their settings from `vexor elk beats-config` and the CA from `vexor elk beats-ca`.
+- Published ports listen on `BIND_IP` (default `0.0.0.0`, all interfaces). Set it to one address of the machine to publish only there. The console follows it unless `CONSOLE_BIND` is set.
 - Firewall:
   - Allow 1514 and 1515/tcp, and 514/udp, from endpoints.
   - Allow 8080 and the tool ports from administrators.
