@@ -264,6 +264,7 @@ Wazuh password policy: 8–64 characters from letters, digits and `. * + ? -`, w
 | `retention [show\|apply]` / `prune-logs` | Wazuh index retention / delete old manager logs. |
 | `volumes ls \| backup <vol\|all> [--stop] \| restore <vol> <file> \| rm <vol> \| prune` | Project volumes. |
 | `reset [containers\|data\|full\|purge]` | From removing containers up to a full wipe; backups are never deleted. |
+| `migrate [--yes]` | Rename the Docker project `wazuh` (installs before 2.0) to `vexor`: copies and verifies every volume, removes the old containers and network, starts the stack. The old volumes are removed only after you confirm. Also removes unused old Shuffle Wazuh app images. |
 
 ## Health automation
 

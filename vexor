@@ -248,7 +248,7 @@ EOF
 # ============================================================== docker helpers
 dc()      { (cd "$ROOT" && docker compose "$@"); }
 dc_all()  { (cd "$ROOT" && COMPOSE_PROFILES=wazuh,elk,multi,w2,w3,ix3,n8n,grafana,portainer,suricata,zeek docker compose "$@"); }    # every service of both node types
-project() { env_def COMPOSE_PROJECT_NAME wazuh; }
+project() { env_def COMPOSE_PROJECT_NAME vexor; }   # .env always has it (project_resolve); "wazuh" before vexor 2.0
 dc_restart() {                 # restart services; MANAGERS ARE RECREATED instead:
   # the wazuh-manager image copies the mounted ossec.conf (/wazuh-config-mount) only when a container
   # is created - on a plain `docker restart` its init script exits early and keeps the old config.
@@ -715,6 +715,7 @@ cmd_install() {
   if [ ! -f "$ENV_FILE" ]; then
     [ -f "$ROOT/.env.example" ] || die ".env and .env.example not found in $ROOT"
     cp "$ROOT/.env.example" "$ENV_FILE"; chmod 600 "$ENV_FILE"; ok "created .env from .env.example (edit it any time: vexor config edit)"
+    project_install_env
   fi
   hdr "1/9 Prerequisites";        check_prereqs
   hdr "2/9 Kernel (vm.max_map_count for the indexers)"; ensure_sysctl
@@ -856,6 +857,7 @@ PY
 cmd_status() {
   docker_ok || die "Docker daemon is not running"
   printf '%sVexor  |  SOC=%s  |  project %s%s%s\n\n' "$C_BD" "$(soc)" "$(project)" "$(soc_wazuh && echo "  |  Wazuh $(cur_version), $(layout_desc)")" "$C_0"
+  project_is_legacy && { hint "the Docker project is still named '$(project)' - rename it with: vexor migrate"; echo; }
   container_rows > "$RUN_TMP/rows"
   python3 -I - "$RUN_TMP/rows" "$(enabled_services | tr '\n' ' ')" "${C_G:+1}" <<'PY'
 import datetime, sys
@@ -1000,6 +1002,10 @@ cmd_doctor() {
     d_fix "comment out earlier duplicate keys in .env" && env_dedupe
   else d_pass ".env has no duplicate keys"; fi
   local cerr; if cerr="$(dc config -q 2>&1)"; then d_pass "docker-compose.yml + .env valid"; else d_fail "compose config invalid: $cerr"; fi
+  if project_is_legacy; then d_warn "Docker project is still named '$(project)' (before vexor 2.0)" "vexor migrate   (renames it to $(project_target); data is copied and verified)"
+  elif migrate_leftovers | has .; then d_warn "old volumes of project '$(cat "$MIGRATED_FROM_FILE")' are left from vexor migrate" "check the stack, then: vexor migrate --yes"
+  else d_pass "Docker project '$(project)'"; fi
+  shuffle_images | has . && d_warn "old Shuffle Wazuh app images on disk: $(shuffle_images | tr '\n' ' ')" "vexor migrate removes the unused ones"
   local f missing=()
   for f in root-ca.pem root-ca-manager.pem admin.pem admin-key.pem wazuh.dashboard.pem wazuh.master.pem wazuh.worker.pem \
            wazuh2.worker.pem wazuh3.worker.pem wazuh1.indexer.pem wazuh2.indexer.pem wazuh3.indexer.pem; do
@@ -4987,13 +4993,14 @@ _vexor() {
   local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}" words
   local svcs="master worker worker2 worker3 indexer1 indexer2 indexer3 dashboard nginx managers indexers"
   if [ "$COMP_CWORD" -eq 1 ]; then
-    words="install info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console plan notify login tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
+    words="install migrate info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console plan notify login tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
   else
     case "$cmd" in
       start|stop|restart|shell|exec) words="$svcs" ;;
       logs)    words="$svcs ossec api cluster alerts archives errors size -f -n --since" ;;
       config)  words="show get set edit validate plan apply --show-secrets" ;;
       plan)    words="--json" ;;
+      migrate) words="--yes" ;;
       notify)  words="status test send fail warn ok info" ;;
       login)   words="dashboard indexer api enroll kibana elasticsearch logstash grafana portainer n8n console wazuh elk --json" ;;
       update)  words="check apply rollback images latest --no-backup --force" ;;
@@ -5032,6 +5039,185 @@ EOF
 cmd_completion() {
   if [ "${1:-}" = install ]; then completion_script > /etc/bash_completion.d/vexor && ok "installed - open a new shell"
   else completion_script; fi
+}
+
+# ============================================================== project name: wazuh -> vexor (vexor migrate)
+# Docker Compose reads COMPOSE_PROJECT_NAME from .env; project() is the only place vexor takes it from.
+# Before 2.0 the project was named "wazuh" (containers wazuh-n8n-1, volumes wazuh_n8n-data, network
+# wazuh_default). Such installs keep that name until `vexor migrate` copies their volumes to vexor_*.
+LEGACY_PROJECT="wazuh"
+MIGRATE_MARK=".vexor-migrate-partial"          # inside a target volume while its copy is not verified
+MIGRATED_FROM_FILE="$ROOT/.state/migrated-from"
+project_target() { echo "${VEXOR_MIGRATE_TO:-vexor}"; }      # VEXOR_MIGRATE_TO: for tests
+project_volumes_of() { docker volume ls -q --filter "label=com.docker.compose.project=$1" 2>/dev/null | sort; }
+compose_volume_keys() {        # top-level volume names of the compose files
+  local f; for f in "$ROOT/docker-compose.yml" "$TOOLS_COMPOSE" "$ELK_COMPOSE"; do
+    [ -f "$f" ] && awk '/^volumes:/ {v=1; next} /^[^ #]/ {v=0} v && /^  [A-Za-z0-9_.-]+:/ {sub(":.*", "", $1); print $1}' "$f"
+  done | sort -u
+}
+legacy_project_detect() {      # true when a "wazuh" project of THIS checkout exists (containers or volumes)
+  local p="${1:-$LEGACY_PROJECT}" ids wd mine=0 other=0 k
+  ids="$(docker ps -aq --filter "label=com.docker.compose.project=$p" 2>/dev/null)"
+  if [ -n "$ids" ]; then
+    while read -r wd; do
+      if [ "$(readlink -f "$wd" 2>/dev/null || echo "$wd")" = "$ROOT" ]; then mine=1; else other=1; fi
+    done < <(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' $ids 2>/dev/null)
+  fi
+  [ "$mine" = 1 ] && return 0
+  [ "$other" = 1 ] && return 1             # that project belongs to another checkout
+  for k in $(compose_volume_keys); do      # containers removed (down), data kept
+    [ "$(docker volume inspect -f '{{index .Labels "com.docker.compose.project"}}' "${p}_$k" 2>/dev/null)" = "$p" ] && return 0
+  done
+  return 1
+}
+project_resolve() {            # .env without COMPOSE_PROJECT_NAME: keep "wazuh" for an old stack, else vexor
+  [ -f "$ENV_FILE" ] && ! env_has COMPOSE_PROJECT_NAME || return 0
+  docker_ok || return 0                    # decided once docker answers (compose cannot run before that anyway)
+  if legacy_project_detect; then
+    env_set COMPOSE_PROJECT_NAME "$LEGACY_PROJECT"
+    warn "existing Docker project '$LEGACY_PROJECT' kept in .env - rename it with: vexor migrate"
+  else env_set COMPOSE_PROJECT_NAME "$(project_target)"; fi
+}
+project_install_env() {        # cmd_install: a new .env from .env.example says vexor; keep an old stack's name
+  docker_ok && legacy_project_detect || return 0
+  env_set COMPOSE_PROJECT_NAME "$LEGACY_PROJECT"; say "existing Docker project '$LEGACY_PROJECT' found and kept (rename it with: vexor migrate)"
+}
+project_is_legacy() { [ "$(project)" = "$LEGACY_PROJECT" ] && [ "$(project_target)" != "$LEGACY_PROJECT" ]; }
+migrate_leftovers() {          # old volumes still there after a migrate
+  local from; from="$(cat "$MIGRATED_FROM_FILE" 2>/dev/null)"
+  [ -n "$from" ] && [ "$from" != "$(project)" ] || return 0
+  project_volumes_of "$from"
+}
+mig_vol_key() { docker volume inspect -f '{{index .Labels "com.docker.compose.volume"}}' "$1" 2>/dev/null; }
+mig_vol_sig() {                # md5 of a listing of every entry (path type size mode owner; no dir sizes) + entry count
+  docker run --rm -v "$1:/v:ro" "$ALPINE_IMAGE" sh -c \
+    "cd /v && { find . ! -type d ! -path './$MIGRATE_MARK' -exec stat -c '%n|%F|%s|%a|%u|%g' {} +; find . -type d -exec stat -c '%n|%F|%a|%u|%g' {} +; } | sort | md5sum && find . ! -path './$MIGRATE_MARK' | wc -l" \
+    2>/dev/null | tr -s ' \n' ' '
+}
+mig_vol_kb() { docker run --rm -v "$1:/v:ro" "$ALPINE_IMAGE" du -sk /v 2>/dev/null | awk '{print $1}'; }
+mig_vol_free_kb() { docker run --rm -v "$1:/v:ro" "$ALPINE_IMAGE" df -Pk /v 2>/dev/null | awk 'NR==2 {print $4}'; }
+mig_vol_state() {              # mig_vol_state <volume>: none | empty | partial | data
+  docker volume inspect "$1" >/dev/null 2>&1 || { echo none; return; }
+  docker run --rm -v "$1:/v:ro" "$ALPINE_IMAGE" sh -c \
+    "if [ -e '/v/$MIGRATE_MARK' ]; then echo partial; elif [ -z \"\$(ls -A /v)\" ]; then echo empty; else echo data; fi" 2>/dev/null || echo none
+}
+mig_vol_verified() { local a b; a="$(mig_vol_sig "$1")"; b="$(mig_vol_sig "$2")"; [ -n "$a" ] && [ "$a" = "$b" ]; }
+mig_target() { echo "$3${1#"$2"}"; }   # mig_target <volume> <from> <to>: wazuh_n8n-data -> vexor_n8n-data
+migrate_copy_volume() {        # migrate_copy_volume <from-volume> <to-volume> <to-project>
+  local src="$1" dst="$2" to="$3" key ver
+  key="$(mig_vol_key "$src")"; ver="$(docker volume inspect -f '{{index .Labels "com.docker.compose.version"}}' "$src" 2>/dev/null)"
+  case "$(mig_vol_state "$dst")" in
+    data)    if mig_vol_verified "$src" "$dst"; then ok "$dst already copied"; return 0; fi
+             bad "$dst exists with other data - not overwritten (remove it yourself if it is not needed)"; return 1 ;;
+    none)    docker volume create --label "com.docker.compose.project=$to" --label "com.docker.compose.volume=$key" \
+               ${ver:+--label "com.docker.compose.version=$ver"} "$dst" >/dev/null || { bad "could not create $dst"; return 1; } ;;
+    partial) say "$dst: an earlier copy did not finish - copying again" ;;
+  esac
+  docker run --rm -v "$src:/from:ro" -v "$dst:/to" "$ALPINE_IMAGE" sh -c \
+    "touch '/to/$MIGRATE_MARK' && find /to -mindepth 1 -maxdepth 1 ! -name '$MIGRATE_MARK' -exec rm -rf {} + && cp -a /from/. /to/" \
+    || { bad "copy $src -> $dst failed"; return 1; }
+  mig_vol_verified "$src" "$dst" || { bad "$dst differs from $src after the copy"; return 1; }
+  docker run --rm -v "$src:/from:ro" -v "$dst:/to" "$ALPINE_IMAGE" sh -c "rm -f '/to/$MIGRATE_MARK' && touch -r /from /to" || return 1
+  ok "$src -> $dst ($(mig_vol_kb "$dst") KB, verified)"
+}
+migrate_copy_volumes() {       # migrate_copy_volumes <from> <to>: every volume of project <from>; 2 = not enough disk
+  local from="$1" to="$2" v c need=0 kb free n=0 vols
+  vols="$(project_volumes_of "$from")"
+  [ -n "$vols" ] || { ok "project $from has no volumes"; return 0; }
+  for v in $vols; do
+    for c in $(vol_users "$v"); do
+      [ "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$c" 2>/dev/null)" = "$from" ] \
+        || { bad "$v is used by container $c, which is not part of project $from"; return 1; }
+    done
+    [ "$(mig_vol_state "$(mig_target "$v" "$from" "$to")")" = data ] && continue
+    kb="$(mig_vol_kb "$v")"; need=$(( need + ${kb:-0} ))
+  done
+  free="$(mig_vol_free_kb "$(head -1 <<<"$vols")")"
+  if [ $(( need + need / 10 + 262144 )) -gt "${free:-0}" ]; then
+    bad "not enough free disk for the copy: need $(( need / 1024 )) MB + 10% + 256 MB, free $(( ${free:-0} / 1024 )) MB"
+    hint "free space (see: vexor volumes ls), then run vexor migrate again"
+    return 2
+  fi
+  say "copying $(( need / 1024 )) MB ($(( ${free:-0} / 1024 )) MB free)"
+  for v in $vols; do
+    migrate_copy_volume "$v" "$(mig_target "$v" "$from" "$to")" "$to" || return 1; n=$((n + 1))
+  done
+  ok "$n volume(s) copied to project $to"
+}
+migrate_remove_old() {         # migrate_remove_old <from> <to>: old volumes with a verified copy, after asking
+  local from="$1" to="$2" v t rm=() keep=()
+  for v in $(project_volumes_of "$from"); do
+    t="$(mig_target "$v" "$from" "$to")"
+    if [ -z "$(vol_users "$v")" ] && [[ "$(mig_vol_state "$t")" =~ ^(data|empty)$ ]] && mig_vol_verified "$v" "$t"; then rm+=("$v")
+    else keep+=("$v"); fi
+  done
+  [ ${#keep[@]} -gt 0 ] && warn "kept ${#keep[@]} old volume(s) that are in use or differ from their copy: ${keep[*]}"
+  if [ ${#rm[@]} -eq 0 ]; then [ ${#keep[@]} -eq 0 ] && rm -f "$MIGRATED_FROM_FILE"; return 0; fi
+  say "${#rm[@]} old volume(s) of project $from match their copy in project $to"
+  if [ "$ASSUME_YES" = 1 ] || { [ -t 0 ] && confirm "Remove the old '$from' volumes now (keep them if you want to check the stack first)?"; }; then
+    docker volume rm "${rm[@]}" >/dev/null && ok "removed ${#rm[@]} old volume(s)"
+    [ ${#keep[@]} -eq 0 ] && rm -f "$MIGRATED_FROM_FILE"
+  else
+    say "old volumes kept - remove them later with: vexor migrate --yes"
+  fi
+  return 0
+}
+shuffle_images() {             # images of the old Shuffle Wazuh app (Shuffle was replaced by n8n in 1.2.0)
+  docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+    | grep -iE '^((registry\.hub\.docker\.com|docker\.io)/)?frikky/shuffle:.*wazuh' || true
+}
+migrate_shuffle_images() {
+  local i id rm=()
+  for i in $(shuffle_images); do
+    id="$(docker image inspect -f '{{.Id}}' "$i" 2>/dev/null)" || continue
+    if docker ps -aq --filter "ancestor=$id" | has .; then say "kept $i (used by a container)"; else rm+=("$i"); fi
+  done
+  [ ${#rm[@]} -gt 0 ] || { ok "no unused Shuffle Wazuh app images"; return 0; }
+  say "old Shuffle Wazuh app image(s), unused since n8n replaced Shuffle:"; printf '    %s\n' "${rm[@]}"
+  if [ "$ASSUME_YES" = 1 ] || { [ -t 0 ] && confirm "Remove them?"; }; then
+    docker rmi "${rm[@]}" >/dev/null && ok "removed ${#rm[@]} Shuffle image(s)"
+  else say "kept - remove them later with: vexor migrate --yes"; fi
+}
+cmd_migrate() {
+  case "${1:-}" in ""|--yes|-y) ;; *) die "usage: vexor migrate [--yes]" ;; esac
+  [ -f "$ENV_FILE" ] || die ".env not found - nothing to migrate (new installs use project $(project_target))"
+  docker_ok || die "Docker daemon is not running"
+  local from to was=0 rc
+  from="$(project)"; to="$(project_target)"
+  hdr "Docker project name"
+  if [ "$from" = "$to" ]; then
+    ok "project is already '$to'"
+    if migrate_leftovers | has .; then take_lock; migrate_remove_old "$(cat "$MIGRATED_FROM_FILE")" "$to"; fi
+  else
+    say "Renames project '$from' to '$to': stops the stack, copies every ${from}_* volume to ${to}_*,"
+    say "removes the old containers and network, then starts the stack as '$to'."
+    say "The old volumes stay until their copies are verified and you confirm."
+    confirm "Migrate now?" || die "Aborted"
+    take_lock
+    running_services | has . && was=1
+    if [ "$was" = 1 ]; then
+      hdr "Stopping the stack"; mkdir -p "$STATE_DIR"; touch "$STATE_DIR/stopped"
+      dc_all stop >/dev/null 2>&1; ok "stopped"
+    fi
+    hdr "Copying volumes"
+    migrate_copy_volumes "$from" "$to"; rc=$?
+    if [ "$rc" != 0 ]; then
+      if [ "$was" = 1 ]; then rm -f "$STATE_DIR/stopped"; dc_all start >/dev/null 2>&1 && say "stack started again as '$from'"; fi
+      die "migration stopped - the project is still '$from', its volumes are untouched"
+    fi
+    hdr "Switching to '$to'"
+    dc_all down --remove-orphans >/dev/null 2>&1 && ok "old containers and network of '$from' removed (volumes kept)"
+    env_set COMPOSE_PROJECT_NAME "$to"; mkdir -p "$STATE_DIR"; echo "$from" > "$MIGRATED_FROM_FILE"
+    ok "COMPOSE_PROJECT_NAME=$to in .env"
+    if [ "$was" = 1 ]; then
+      hdr "Starting the stack as '$to'"; rm -f "$STATE_DIR/stopped"
+      QUIET=1 cmd_start || warn "start reported a problem - see: vexor doctor"
+    else say "the stack was not running - start it with: vexor start"; fi
+    hdr "Old volumes"
+    migrate_remove_old "$from" "$to"
+  fi
+  hdr "Old Shuffle images"
+  migrate_shuffle_images
 }
 
 # ============================================================== notifications: health results off the host
@@ -5596,6 +5782,8 @@ ${C_BD}Data${C_0}
   prune-logs                     delete rotated manager logs older than MANAGER_LOG_RETENTION_DAYS
   volumes ls | backup <vol|all> [--stop] [--out DIR] | restore <vol> <file> | rm <vol> | prune
   reset [containers|data|full|purge]          interactive menu without a level
+  migrate [--yes]                rename the Docker project "wazuh" (before 2.0) to "vexor": copies the volumes,
+                                 verifies them, restarts; also removes unused old Shuffle Wazuh app images
 
 ${C_BD}Automation${C_0}
   daemon install|uninstall|status|logs        PATH link, completion, boot service, login message, timers:
@@ -5637,7 +5825,7 @@ main() {
   esac
   RUN_TMP="$(mktemp -d /tmp/vexor.XXXXXX)"; trap 'rm -rf "$RUN_TMP"' EXIT
   if [ -f "$ENV_FILE" ] && [ "$(id -u)" -eq 0 ] && [[ "$cmd" != help && "$cmd" != completion ]]; then
-    ensure_env_defaults >/dev/null; env_drop_legacy >/dev/null; migrate_layout
+    project_resolve; ensure_env_defaults >/dev/null; env_drop_legacy >/dev/null; migrate_layout
     case "$cmd" in   # action history (feeds ai-context); read-only commands are not logged
       help|version|--version|-v|completion|status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check|wazuh|suricata|zeek|json|plan|login|logins|creds) ;;
       doctor|troubleshoot|check) [ "${args[0]:-}" = --fix ] && echo "$(ts) doctor --fix" >> "$HISTORY_FILE" ;;
@@ -5695,6 +5883,7 @@ main() {
     prune-logs)            take_lock; prune_logs ;;
     volumes|volume|vol)    cmd_volumes "${args[@]}" ;;
     reset)                 cmd_reset "${args[@]}" ;;
+    migrate)               cmd_migrate "${args[@]}" ;;
     daemon|service)        cmd_daemon "${args[@]}" ;;
     watchdog)              cmd_watchdog ;;
     maintenance|maint)     cmd_maintenance ;;
