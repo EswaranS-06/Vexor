@@ -8,7 +8,6 @@ on:
     paths:
       - "docs/**"
       - "VEXOR.md"
-      - "ROADMAP.md"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -32,13 +31,13 @@ jobs:
 
       - name: Check the pages
         run: |
-          for f in docs/index.html docs/guide.html docs/roadmap.html; do
+          for f in docs/index.html docs/guide.html; do
             test -s "$f" && grep -q "<title>" "$f"
             python3 -c "import html.parser,sys; html.parser.HTMLParser().feed(open(sys.argv[1]).read())" "$f"
           done
 
-      - name: Publish VEXOR.md and ROADMAP.md with the site (the pages read them)
-        run: cp VEXOR.md ROADMAP.md docs/
+      - name: Publish VEXOR.md with the site (the home page reads it)
+        run: cp VEXOR.md docs/
 
       - uses: actions/configure-pages@v5
 

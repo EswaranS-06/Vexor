@@ -1,5 +1,5 @@
 /* Hallmark · genre: modern-minimal · macrostructure: Docs home (sticky TOC + sectioned body) · theme: Cobalt (shared system)
- * page: guide + roadmap · enrichment: Tier A interactive visuals per section · shares tokens.css + site.css with the home page
+ * page: guide · enrichment: Tier A interactive visuals per section · shares tokens.css + site.css with the home page
  */
 
 
@@ -257,14 +257,8 @@
 
 /* 13 limits */
 .limits { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-3); }
-.limits li { display: grid; grid-template-columns: minmax(0, 1fr) 3rem minmax(0, 17rem); gap: var(--space-3); align-items: center; }
+.limits li { padding: var(--space-3) var(--space-4); border: var(--rule-w) solid var(--color-rule); border-left: 3px solid var(--color-warn); border-radius: var(--radius-md); background: var(--color-paper); }
 .lim-now { font-size: var(--text-sm); color: var(--color-ink-2); }
-.lim-arrow { height: 2px; background: var(--color-accent); position: relative; }
-.lim-arrow::after { content: ""; position: absolute; right: 0; top: -4px; border-left: 7px solid var(--color-accent); border-top: 5px solid transparent; border-bottom: 5px solid transparent; }
-.lim-v2 { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); text-decoration: none; border: var(--rule-w) solid var(--color-rule-2); border-radius: var(--radius-md); padding: 0.55rem 0.7rem; font-size: var(--text-sm); color: var(--color-ink); transition: border-color var(--dur-micro) var(--ease-out); }
-.lim-v2:hover { border-color: var(--color-accent); }
-.phase { font: 500 10px/1 var(--font-mono); letter-spacing: var(--tracking-label); text-transform: uppercase; padding: 0.3rem 0.4rem; border-radius: var(--radius-sm); white-space: nowrap; border: var(--rule-w) solid currentColor; }
-.phase--alpha { color: var(--color-accent-2); } .phase--beta { color: var(--color-warn); } .phase--20 { color: var(--color-ok); } .phase--2x { color: var(--color-neutral); }
 
 /* ---------- responsive ---------- */
 @media (max-width: 1080px) {
@@ -284,9 +278,6 @@
   .ret-row { grid-template-columns: minmax(0, 1fr) minmax(0, 6rem); }
   .ret-bar { grid-column: 1 / -1; grid-row: 2; }
   .tree__info { border-left: 0; padding-left: 0; border-top: var(--rule-w) solid var(--color-rule); padding-top: var(--space-4); }
-  .limits li { grid-template-columns: minmax(0, 1fr); }
-  .lim-arrow { width: 2px; height: 1.2rem; justify-self: start; margin-left: var(--space-4); }
-  .lim-arrow::after { right: -4px; top: auto; bottom: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 7px solid var(--color-accent); border-bottom: 0; }
   .calc, .flows, .changer, .retention, .day, .ctabs__pane, .tree { padding: var(--space-4); }
   .chg-steps li { grid-template-columns: 1.25rem minmax(0, 1fr); }
   .chg-steps .copy-mini { grid-column: 2; justify-self: start; }

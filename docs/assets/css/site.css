@@ -97,7 +97,6 @@ kbd {
   .nav__links { display: flex; gap: var(--space-4); margin-right: auto; }
   .nav__links a:not([data-page]) { display: none; }
 }
-@media (max-width: 520px) { .nav__links a[data-page="roadmap.html"] { display: none; } }
 @media (max-width: 380px) { .nav__links { display: none; } }
 
 /* ---------- buttons ---------- */

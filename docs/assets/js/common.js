@@ -58,7 +58,6 @@ export function reveal(selector) {
 const SITE = [
   { kind: "page", main: "Home", sub: "Hero, simulator, releases, commands", run: () => location.assign("./") },
   { kind: "page", main: "Guide", sub: "How Vexor works, with visuals", run: () => location.assign("guide.html") },
-  { kind: "page", main: "Roadmap: V2", sub: "What comes after v1.2", run: () => location.assign("roadmap.html") },
   { kind: "page", main: "Simulator", sub: "Pick a stack and watch it run", run: () => location.assign("./#simulator") },
   { kind: "page", main: "Every command", sub: "The full reference", run: () => location.assign("./#commands") },
 ];
@@ -77,7 +76,7 @@ function render() {
     <li role="option" id="pal-${i}" aria-selected="${i === sel}" data-i="${i}">
       <span class="p-kind">${esc(it.kind)}</span>
       <span class="p-main">${esc(it.main)}<span class="p-sub">${esc(it.sub.slice(0, 140))}</span></span>
-    </li>`).join("") : `<li aria-disabled="true"><span class="p-kind">none</span><span class="p-main">No match<span class="p-sub">Try: n8n, test, backup, roadmap</span></span></li>`;
+    </li>`).join("") : `<li aria-disabled="true"><span class="p-kind">none</span><span class="p-main">No match<span class="p-sub">Try: n8n, test, backup, guide</span></span></li>`;
   pal.input.setAttribute("aria-activedescendant", shown.length ? `pal-${sel}` : "");
   pal.list.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: "nearest" });
 }

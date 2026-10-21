@@ -113,16 +113,16 @@ const TREE = [
   { p: "docs/", d: "This site: plain HTML, CSS and JavaScript modules, published by the Pages workflow." },
   { p: ".github/workflows/", d: "`ci.yml` (checks on every push) and `pages.yml` (publishes docs/)." },
   { p: ".gitleaks.toml", d: "Secret-scan settings used by CI." },
-  { p: "README.md · VEXOR.md · ROADMAP.md", d: "Overview, command reference, and the V2 plan. This site reads VEXOR.md and ROADMAP.md live." },
+  { p: "README.md · VEXOR.md · LICENSE", d: "Overview, command reference and license. The home page reads VEXOR.md live for its command list." },
   { p: "created at run time", d: "Ignored by git: `.env`, `.state/`, `backups/`, `reports/`, `tools-data/`, certificates, `config/tools/`, `config/elk/`, `docker-compose.override.yml`, `nginx.conf`.", ghost: true },
 ];
 
 const LIMITS = [
-  ["Everything runs on one host; the clusters protect against a failed container, not a failed host.", "Multi-host stacks", "2.0"],
-  ["Elasticsearch runs as one node and is not in vexor backup.", "Elasticsearch in backups", "beta"],
-  ["The Logstash Beats input has no TLS.", "Encrypted Beats input", "alpha"],
-  ["Wazuh 5.x is not covered by vexor update apply.", "Wazuh 5.x module", "2.0"],
-  ["Adding a stack means editing one 4,900-line script in several places.", "Stack modules", "alpha"],
+  "Everything runs on one host; the clusters protect against a failed container, not a failed host.",
+  "Up to three workers are predefined.",
+  "Wazuh 5.x uses a different deployment layout and is not covered by vexor update apply.",
+  "Elasticsearch runs as one node and is not yet in vexor backup.",
+  "The Logstash Beats input has no TLS; use it on a trusted network.",
 ];
 
 // ---------------------------------------------------------------- 1 explorer + 6 tabs
@@ -398,9 +398,7 @@ function initTree() {
 }
 
 function initLimits() {
-  $("[data-limits]").innerHTML = LIMITS.map(([lim, fix, phase]) => `
-    <li><span class="lim-now">${esc(lim)}</span><span class="lim-arrow" aria-hidden="true"></span>
-      <a class="lim-v2" href="roadmap.html"><b>${esc(fix)}</b><span class="phase phase--${esc(phase.replace(".", ""))}">${esc(phase)}</span></a></li>`).join("");
+  $("[data-limits]").innerHTML = LIMITS.map((l) => `<li><span class="lim-now">${esc(l)}</span></li>`).join("");
 }
 
 // ---------------------------------------------------------------- table of contents

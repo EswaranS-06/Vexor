@@ -10,10 +10,10 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="assets/css/tokens.css?v=1.2.1">
-  <link rel="stylesheet" href="assets/css/site.css?v=1.2.3">
-  <link rel="stylesheet" href="assets/css/guide.css?v=1.2.3">
-  <script type="module" src="assets/js/guide.js?v=1.2.1"></script>
+  <link rel="stylesheet" href="assets/css/tokens.css?v=1.2.4">
+  <link rel="stylesheet" href="assets/css/site.css?v=1.2.4">
+  <link rel="stylesheet" href="assets/css/guide.css?v=1.2.4">
+  <script type="module" src="assets/js/guide.js?v=1.2.4"></script>
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
@@ -28,7 +28,6 @@
         <a href="./#simulator">Simulator</a>
         <a href="./#commands">Commands</a>
         <a href="guide.html" data-page="guide.html">Guide</a>
-        <a href="roadmap.html" data-page="roadmap.html">Roadmap</a>
         <a href="https://github.com/EswaranS-06/Vexor">GitHub</a>
       </nav>
       <div class="nav__right">
@@ -57,7 +56,7 @@
         <li><a href="#security">Security</a></li>
         <li><a href="#cicd">CI/CD</a></li>
         <li><a href="#repo">Repository layout</a></li>
-        <li><a href="#limits">Limits and V2</a></li>
+        <li><a href="#limits">Limits</a></li>
       </ol>
       <div class="toc__progress" aria-hidden="true"><span data-toc-progress></span></div>
     </aside>
@@ -196,7 +195,7 @@ vexor cert create &amp;&amp; vexor cert export-ca</code></pre></div></li>
           <ul class="checks">
             <li>Wazuh indexer snapshot</li><li>Master state: agent keys, rules, groups, API users</li>
             <li>n8n, Grafana and Portainer volumes</li><li><code>.env</code>, <code>config/</code> and certificates</li>
-            <li class="is-no">Elasticsearch data: not yet (<code>vexor volumes backup elk-es-data --stop</code>; planned for V2)</li>
+            <li class="is-no">Elasticsearch data: not yet (<code>vexor volumes backup elk-es-data --stop</code>)</li>
           </ul>
           <p class="aside-note">Keep <code>.env</code>: it holds <code>N8N_ENCRYPTION_KEY</code>, without which n8n credentials cannot be decrypted.</p>
         </div>
@@ -266,15 +265,14 @@ vexor cert create &amp;&amp; vexor cert export-ca</code></pre></div></li>
 
       <!-- 13 -->
       <section id="limits" class="g-sec" aria-labelledby="lim-t">
-        <h2 id="lim-t">Limits, and what V2 does about them</h2>
+        <h2 id="lim-t">Limits</h2>
         <ul class="limits" data-limits></ul>
-        <p><a class="link-arrow" href="roadmap.html">Read the V2 roadmap</a></p>
       </section>
     </main>
   </div>
 
   <footer class="foot">
-    <p><span class="wordmark wordmark--sm">vexor</span> · <a href="./">Home</a> · <a href="roadmap.html">V2 roadmap</a> · MIT · <a href="https://github.com/EswaranS-06/Vexor">github.com/EswaranS-06/Vexor</a></p>
+    <p><span class="wordmark wordmark--sm">vexor</span> · <a href="./">Home</a> · MIT · <a href="https://github.com/EswaranS-06/Vexor">github.com/EswaranS-06/Vexor</a></p>
   </footer>
 
   <div class="palette" data-palette hidden>
