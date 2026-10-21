@@ -105,6 +105,8 @@ function openJob(job, onEnd) {
   out.hidden = false;
   document.body.classList.add("has-out");
   $("[data-out-cmd]").textContent = job.cmd;
+  $("[data-out-cmd]").title = job.cmd;
+  $("[data-out-cmd]").classList.remove("is-full");
   $("[data-out-st]").textContent = "running";
   $("[data-out-st]").className = "out__st is-run";
   $("[data-out-body]").replaceChildren();
@@ -122,6 +124,28 @@ function openJob(job, onEnd) {
   });
   es.onerror = () => { $("[data-out-st]").textContent = "disconnected"; es.close(); };
 }
+// copy to the clipboard (falls back to a hidden textarea where the Clipboard API is blocked)
+async function copyText(text, btn) {
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; } catch {
+    const t = document.createElement("textarea"); t.value = text; t.setAttribute("readonly", ""); t.style.position = "fixed"; t.style.opacity = "0";
+    document.body.appendChild(t); t.select(); try { ok = document.execCommand("copy"); } catch { ok = false; } t.remove();
+  }
+  toast(ok ? "Copied." : "Copy is blocked here - select the text instead.", ok ? "" : "bad");
+  if (ok && btn) { btn.classList.add("is-copied"); setTimeout(() => btn.classList.remove("is-copied"), 1200); }
+}
+// long command: shortened with a fade; hovering (or focusing) it for 3 s shows it in full; a tap toggles
+{
+  const cmd = $("[data-out-cmd]"); let t = null;
+  const full = (on) => { clearTimeout(t); cmd.classList.toggle("is-full", on); };
+  cmd.addEventListener("mouseenter", () => { clearTimeout(t); t = setTimeout(() => full(true), 3000); });
+  cmd.addEventListener("mouseleave", () => full(false));
+  cmd.addEventListener("focus", () => { clearTimeout(t); t = setTimeout(() => full(true), 3000); });
+  cmd.addEventListener("blur", () => full(false));
+  cmd.addEventListener("click", () => full(!cmd.classList.contains("is-full")));
+}
+$("[data-copy-cmd]").addEventListener("click", (e) => copyText($("[data-out-cmd]").textContent, e.currentTarget));
+$("[data-copy-out]").addEventListener("click", (e) => copyText($("[data-out-body]").textContent.replace(/\n$/, ""), e.currentTarget));
 $("[data-out-close]").addEventListener("click", () => { es?.close(); $("[data-out]").hidden = true; document.body.classList.remove("has-out"); });
 $("[data-out-stop]").addEventListener("click", () => currentJob && api(`/api/jobs/${currentJob.id}/stop`, { body: {} }));
 
@@ -540,13 +564,13 @@ async function vTerminal() {
   setTitle("Terminal");
   view().innerHTML = `
     <p class="lede">Type any vexor command. Reading runs at once; changes ask first; commands that delete or switch layouts ask you to type their name. Interactive ones (shell, exec, logtest, config edit) stay in SSH.</p>
-    <form class="term" data-term><span class="term__p">vexor</span><input class="in in--term" name="cmd" list="vx-suggest" placeholder="suricata alerts --since 1h" autocomplete="off" spellcheck="false" autofocus><button class="btn btn--primary btn--sm">Run</button></form>
+    <form class="term" data-term><span class="term__p">vexor</span><input class="in in--term" name="cmd" list="vx-suggest" placeholder="suricata alerts --since 1h" autocomplete="off" spellcheck="false" autofocus><button type="button" class="btn btn--ghost btn--sm btn--icon" data-term-copy aria-label="Copy command" title="Copy command"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg></button><button class="btn btn--primary btn--sm">Run</button></form>
     <datalist id="vx-suggest">${SUGGEST.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>
     <div class="chips">${SUGGEST.slice(0, 14).map((s) => `<button type="button" class="chip" data-fill="${esc(s)}">${esc(s)}</button>`).join("")}</div>
     <h2 class="sub">History</h2><ol class="hist" data-hist></ol>`;
   const f = $("[data-term]"), inp = $("[name=cmd]", f);
   const hist = JSON.parse(sessionStorage.getItem("vx-hist") || "[]");
-  const drawHist = () => ($("[data-hist]").innerHTML = hist.slice(0, 20).map((h) => `<li><button type="button" class="link-btn mono" data-fill="${esc(h)}">vexor ${esc(h)}</button></li>`).join("") || '<li class="muted">Nothing yet.</li>');
+  const drawHist = () => ($("[data-hist]").innerHTML = hist.slice(0, 20).map((h) => `<li><button type="button" class="link-btn mono" data-fill="${esc(h)}" title="vexor ${esc(h)}">vexor ${esc(h)}</button><button type="button" class="btn btn--ghost btn--xs btn--icon" data-copy-hist="${esc(h)}" aria-label="Copy command" title="Copy command"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg></button></li>`).join("") || '<li class="muted">Nothing yet.</li>');
   drawHist();
   f.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -555,7 +579,11 @@ async function vTerminal() {
     const ok = await run(c);
     if (ok) { hist.unshift(c); try { sessionStorage.setItem("vx-hist", JSON.stringify([...new Set(hist)].slice(0, 30))); } catch { /* private mode */ } drawHist(); inp.select(); }
   });
-  view().onclick = (e) => { const b = e.target.closest("[data-fill]"); if (b) { inp.value = b.dataset.fill; inp.focus(); } };
+  view().onclick = (e) => {
+    const c = e.target.closest("[data-copy-hist]"); if (c) return copyText("vexor " + c.dataset.copyHist, c);
+    const b = e.target.closest("[data-fill]"); if (b) { inp.value = b.dataset.fill; inp.focus(); }
+  };
+  $("[data-term-copy]").addEventListener("click", (e) => { const v = inp.value.trim().replace(/^vexor\s+/, ""); if (v) copyText("vexor " + v, e.currentTarget); else toast("Type a command first.", "bad"); });
 }
 
 async function vActivity() {

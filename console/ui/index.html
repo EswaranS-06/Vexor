@@ -84,12 +84,16 @@
 
     <aside class="out" data-out aria-label="Command output" hidden>
       <header class="out__head">
-        <code class="out__cmd" data-out-cmd></code>
+        <code class="out__cmd" data-out-cmd tabindex="0"></code>
+        <button class="btn btn--ghost btn--xs btn--icon" type="button" data-copy-cmd aria-label="Copy command" title="Copy command"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg></button>
         <span class="out__st" data-out-st></span>
         <button class="btn btn--ghost btn--xs" type="button" data-out-stop>Stop</button>
         <button class="btn btn--ghost btn--xs" type="button" data-out-close aria-label="Close output">Close</button>
       </header>
-      <pre class="out__body" data-out-body></pre>
+      <div class="out__wrap">
+        <div class="out__tools"><button class="btn btn--ghost btn--xs out__copy" type="button" data-copy-out aria-label="Copy output" title="Copy output"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg><span>Copy output</span></button></div>
+        <pre class="out__body" data-out-body></pre>
+      </div>
     </aside>
   </div>
 

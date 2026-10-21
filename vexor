@@ -2346,9 +2346,20 @@ proxy_issue_local() {          # proxy_issue_local <host>: certificate from the 
   rm -f "$RUN_TMP/route.pem" "$RUN_TMP/route-key.pem"
   ok "certificate for $h from the local CA ($(env_def CERT_DAYS 397) days)"
 }
+le_public_name() {             # false for names Let's Encrypt can never validate (private / reserved suffixes, single labels)
+  local h="${1,,}"
+  [[ "$h" == *.* ]] || return 1
+  case ".${h##*.}" in
+    .lab|.local|.lan|.internal|.home|.corp|.test|.localhost|.invalid|.example|.intranet|.private|.localdomain|.home.arpa|.arpa) return 1 ;;
+  esac
+  [[ "$h" == *.home.arpa ]] && return 1
+  return 0
+}
 proxy_issue_le() {             # proxy_issue_le <host> [force]: Let's Encrypt via http-01 on ROUTES_HTTP_PORT (nginx answers it)
   local h="$1" force="${2:-0}" img="${LE_IMAGE:-certbot/certbot:latest}" reg=(--register-unsafely-without-email) extra=(--keep-until-expiring)
   is_ipv4 "$h" && { bad "Let's Encrypt does not issue certificates for IP addresses here - use --tls local"; return 1; }
+  le_public_name "$h" || { bad "Let's Encrypt cannot issue for $h (.${h##*.} is not a public domain) - use --tls local"; return 1; }
+  getent hosts "$h" >/dev/null 2>&1 || warn "$h does not resolve from this server - Let's Encrypt will not find it either (add an A record first)"
   is_running nginx || { bad "nginx must run to answer the Let's Encrypt challenge (vexor start)"; return 1; }
   host_published nginx 80 || { bad "nginx does not publish ROUTES_HTTP_PORT yet"; return 1; }
   [ "$(routes_http_port)" = 80 ] || warn "Let's Encrypt connects to port 80 - forward public port 80 to ROUTES_HTTP_PORT=$(routes_http_port)"
@@ -2356,6 +2367,7 @@ proxy_issue_le() {             # proxy_issue_le <host> [force]: Let's Encrypt vi
   [ "$force" = 1 ] && extra=(--force-renewal)
   mkdir -p "$ACME_DIR" "$LE_DIR"; chmod 755 "$ACME_DIR"
   say "$h must resolve to this server and port 80 must be reachable from the internet."
+  pull_image_list "$img" || { bad "could not download $img"; return 1; }   # so a failure shows certbot's own error, not pull progress
   run_step "Let's Encrypt certificate for $h (http-01)" docker run --rm -v "$LE_DIR:/etc/letsencrypt" -v "$ACME_DIR:/var/www/acme" "$img" \
     certonly --webroot -w /var/www/acme --non-interactive --agree-tos "${reg[@]}" --cert-name "$h" -d "$h" "${extra[@]}" \
     || { hint "check: DNS A record of $h -> this server, port 80 forwarded, vexor proxy show $h"; return 1; }
@@ -2476,6 +2488,7 @@ proxy_add_edit() {             # proxy_add_edit add|edit <host> [target] [opts]
   proxy_parse_opts "$@"
   proxy_check_target "$P_TARGET"
   [ "$P_TLS" = letsencrypt ] && is_ipv4 "$h" && die "Let's Encrypt needs a domain name - use --tls local for an IP address"
+  [ "$P_TLS" = letsencrypt ] && ! le_public_name "$h" && die "Let's Encrypt only issues certificates for public internet domains; '$h' ends in .${h##*.}, a private name it cannot reach - use --tls local (and install the CA certificate once on your devices), or a domain you own"
   if [ "$P_TLS" != off ] && is_ipv4 "$h"; then
     local other; other="$(routes_py tsv | awk -F'\t' -v h="$h" '$1 != h && $1 ~ /^[0-9.]+$/ && $3 != "off" {print $1; exit}')"
     [ -z "$other" ] || die "only one IP-address route can use TLS (clients send no name for an IP, so nginx cannot tell them apart; $other has it) - use a DNS name"
