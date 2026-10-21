@@ -40,6 +40,7 @@ jobs:
       - name: Install (SOC=wazuh, single node)
         run: |
           $V install
+          $V wait-ready --timeout 900
           $V status
 
       - name: Doctor has no failures
@@ -51,18 +52,19 @@ jobs:
       - name: Suricata end to end (alert -> Wazuh rule 100721)
         run: |
           $V suricata enable
-          sleep 30
+          $V wait-ready --timeout 300 suricata
           $V suricata test
 
       - name: Zeek end to end
         run: |
           $V zeek enable
-          sleep 20
+          $V wait-ready --timeout 300 zeek
           $V zeek test
 
       - name: n8n end to end (connect, starter workflow, test alert)
         run: |
           $V n8n enable
+          $V wait-ready --timeout 300 n8n
           $V n8n connect
           $V n8n workflow
           $V n8n test
@@ -92,6 +94,7 @@ jobs:
       - name: SOC=both and a backup with an Elasticsearch snapshot
         run: |
           $V soc both
+          $V wait-ready --timeout 900
           $V elk
           $V backup run | tee backup.txt
           grep -q "Elasticsearch snapshot es-snap-" backup.txt
