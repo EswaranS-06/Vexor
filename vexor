@@ -303,7 +303,7 @@ running_services() { dc_all ps --status running --services 2>/dev/null; }
 is_running() { running_services | has -x "$1"; }
 docker_ok() { docker info >/dev/null 2>&1; }
 svc_uptime_s() {               # seconds since the service container started (0 if not running)
-  local id st; id="$(dc_all ps -q "$1" 2>/dev/null | head -1)"; [ -n "$id" ] || { echo 0; return; }
+  local id st; id="$(svc_cid "$1")"; [ -n "$id" ] || { echo 0; return; }
   st="$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null)"
   echo $(( $(date +%s) - $(date -d "$st" +%s 2>/dev/null || date +%s) ))
 }
@@ -649,23 +649,141 @@ nginx_reload() {
 }
 
 # ============================================================== waits
-wait_indexer() {
-  local t="${1:-240}" i=0
-  say "Waiting for the indexer cluster (up to ${t}s)..."
-  while [ "$i" -lt "$t" ]; do
-    [ "$(ix_code)" = 200 ] && { ok "Indexer is up"; return 0; }
-    sleep 5; i=$((i + 5))
+# One readiness rule for install / start / restart / upgrade / doctor / CI: `vexor wait-ready`.
+# A service is ready when its container runs, its Docker healthcheck (if any) is healthy,
+# and the service-specific probe in svc_not_ready answers.
+WAIT_READY_TIMEOUT=900         # seconds: default for wait-ready, and how long after a start doctor says "still starting"
+WAIT_POLL=5                    # seconds between probe rounds
+WAIT_PRINT=15                  # seconds between "waiting:" progress lines
+declare -A WAIT_WHY=()
+svc_cid() { docker ps -aq --filter "label=com.docker.compose.project=$(project)" --filter "label=com.docker.compose.service=$1" 2>/dev/null | head -1; }
+fmt_dur() { local s="$1"; if [ "$s" -ge 60 ]; then echo "$((s / 60))m$(printf '%02d' $((s % 60)))s"; else echo "${s}s"; fi; }
+svc_not_ready() {              # svc_not_ready <svc>: why it is not ready (prints nothing when ready); a leading ! = will not fix itself
+  local svc="$1" cid st hl c want got
+  cid="$(svc_cid "$svc")"
+  [ -n "$cid" ] || { echo "not running (no container)"; return 0; }
+  st="$(docker inspect -f '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cid" 2>/dev/null)"
+  hl="${st#*|}"; st="${st%%|*}"
+  [ "$st" = running ] || { echo "not running (${st:-unknown})"; return 0; }
+  case "$hl" in ""|healthy) ;; *) echo "healthcheck $hl"; return 0 ;; esac
+  case "$svc" in
+    wazuh1.indexer)
+      c="$(ix_code)"
+      case "$c" in 200) ;; 401) echo "!indexer rejects INDEXER_PASSWORD (HTTP 401)" ;; *) echo "indexer API HTTP ${c:-000}" ;; esac ;;
+    wazuh.master)
+      if ! dc exec -T wazuh.master /var/ossec/bin/cluster_control -l >/dev/null 2>&1; then echo "cluster (wazuh-clusterd) not answering"
+      elif ! api_login; then echo "Wazuh API login not answering"; fi ;;
+    wazuh.worker|wazuh2.worker|wazuh3.worker)
+      if ! daemon_list "$svc" | has '^wazuh-clusterd is running'; then echo "wazuh-clusterd not running"
+      else
+        want=$(( $(active_workers) + 1 ))
+        got="$(dc exec -T wazuh.master /var/ossec/bin/cluster_control -l 2>/dev/null | awk 'NR>1 && NF' | wc -l)"
+        [ "${got:-0}" -ge "$want" ] || echo "master lists ${got:-0}/$want cluster nodes"
+      fi ;;
+    wazuh.dashboard)
+      c="$(proxy_code)"; [[ "$c" =~ ^(200|302)$ ]] || echo "dashboard via nginx HTTP ${c:-000}" ;;
+    elasticsearch)
+      c="$(es_code /_cluster/health)"
+      case "$c" in 200) ;; 401) echo "!Elasticsearch rejects ELASTIC_PASSWORD (HTTP 401)" ;; *) echo "Elasticsearch API HTTP ${c:-000}" ;; esac ;;
+    kibana)
+      c="$(kibana_code)"; [ "$c" = 200 ] || echo "Kibana HTTP ${c:-000}" ;;
+    logstash)
+      c="$(dc exec -T logstash curl -s -o /dev/null -w '%{http_code}' localhost:9600 2>/dev/null)"
+      [ "$c" = 200 ] || echo "Logstash API HTTP ${c:-000}" ;;
+    n8n)
+      c="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://127.0.0.1:$(tool_port n8n)/healthz" 2>/dev/null)"
+      [ "$c" = 200 ] || echo "n8n /healthz HTTP ${c:-000}" ;;
+    grafana)
+      c="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://127.0.0.1:$(tool_port grafana)/api/health" 2>/dev/null)"
+      [ "$c" = 200 ] || echo "Grafana /api/health HTTP ${c:-000}" ;;
+    portainer)
+      c="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://127.0.0.1:$(tool_port portainer)/" 2>/dev/null)"
+      [[ "$c" =~ ^(200|30[0-9]|401)$ ]] || echo "Portainer HTTP ${c:-000}" ;;
+  esac
+  return 0
+}
+svc_starting() {               # true while <svc> runs, is not ready yet and was started less than WAIT_READY_TIMEOUT s ago
+  local cid why; cid="$(svc_cid "$1")"; [ -n "$cid" ] || return 1
+  [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" = true ] || return 1
+  [ "$(svc_uptime_s "$1")" -lt "$WAIT_READY_TIMEOUT" ] || return 1
+  why="$(svc_not_ready "$1")"; [ -n "$why" ] && [ "${why:0:1}" != '!' ]
+}
+d_starting() {                 # doctor: a warning (not a failure) for a service that is still coming up; true when it warned
+  svc_starting "$1" || return 1
+  d_warn "$1 still starting ($(svc_not_ready "$1"))" "give it a few minutes (up to $((WAIT_READY_TIMEOUT / 60)) min after a start), then: vexor wait-ready $1"
+}
+wait_ready_run() {             # wait_ready_run <timeout-s> <json 0|1> <svc..>  -> 0 all ready, 1 otherwise (lists what is not ready)
+  local t="$1" js="$2" start="$SECONDS" lastp=-999 now why svc s rows="" nfail=0 printed
+  shift 2
+  local pending=("$@") still
+  while [ ${#pending[@]} -gt 0 ]; do
+    now=$(( SECONDS - start )); still=(); printed=0
+    for svc in "${pending[@]}"; do
+      why="$(svc_not_ready "$svc")"
+      if [ -z "$why" ]; then
+        [ "$js" = 1 ] || ok "ready: $svc $(fmt_dur "$now")"
+        rows+="$svc|1|$now|"$'\n'
+      elif [ "${why:0:1}" = '!' ]; then
+        [ "$js" = 1 ] || bad "$svc: ${why:1}"
+        rows+="$svc|0|$now|${why:1}"$'\n'; nfail=$((nfail + 1))
+      else
+        still+=("$svc"); WAIT_WHY["$svc"]="$why"
+        if [ "$js" != 1 ] && [ $((now - lastp)) -ge "$WAIT_PRINT" ]; then say "waiting: $svc ($why) $(fmt_dur "$now")"; printed=1; fi
+      fi
+    done
+    [ "$printed" = 1 ] && lastp=$now
+    pending=("${still[@]}")
+    [ ${#pending[@]} -gt 0 ] || break
+    [ $(( SECONDS - start )) -ge "$t" ] && break
+    now=$(( t - (SECONDS - start) )); [ "$now" -gt "$WAIT_POLL" ] && now="$WAIT_POLL"
+    sleep "$now"
   done
-  warn "Indexer not ready after ${t}s - check: vexor logs indexer1"; return 1
+  for svc in "${pending[@]}"; do rows+="$svc|0|$t|${WAIT_WHY[$svc]:-not ready}"$'\n'; done
+  if [ "$js" = 1 ]; then
+    python3 -I -c '
+import json, sys
+rows = [l.split("|", 3) for l in sys.stdin.read().splitlines() if l]
+svcs = [{"name": r[0], "ready": r[1] == "1", "seconds": int(r[2]), "reason": r[3]} for r in rows]
+print(json.dumps({"ready": all(s["ready"] for s in svcs), "timeout": int(sys.argv[1]), "services": svcs}, indent=2))' "$t" <<<"$rows"
+  elif [ ${#pending[@]} -gt 0 ] || [ "$nfail" -gt 0 ]; then
+    bad "not ready after $(fmt_dur $(( SECONDS - start ))):"
+    while IFS='|' read -r svc s _ why; do if [ -n "$svc" ] && [ "$s" = 0 ]; then printf '      - %s: %s\n' "$svc" "$why"; fi; done <<<"$rows"
+  fi
+  [ ${#pending[@]} -eq 0 ] && [ "$nfail" -eq 0 ]
+}
+wait_stack() {                 # everything the current settings enable (install, start, restart, upgrade)
+  local t="${1:-$WAIT_READY_TIMEOUT}" s; s=($(enabled_services))
+  [ ${#s[@]} -gt 0 ] || return 0
+  say "Waiting until the stack is ready (up to $(fmt_dur "$t"))..."
+  wait_ready_run "$t" 0 "${s[@]}"
+}
+cmd_wait_ready() {
+  local t="$WAIT_READY_TIMEOUT" js=0 a svcs=() known s
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout|-t) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "usage: vexor wait-ready [--timeout SECONDS] [--json] [service..]"; t="$2"; shift ;;
+      --timeout=*) t="${1#*=}"; [[ "$t" =~ ^[0-9]+$ ]] || die "--timeout takes seconds" ;;
+      --json) js=1 ;;
+      -*) die "unknown option $1 - usage: vexor wait-ready [--timeout SECONDS] [--json] [service..]" ;;
+      *) for a in $(resolve_many "$1"); do svcs+=("$a"); done ;;
+    esac
+    shift
+  done
+  docker_ok || die "Docker daemon is not running"
+  known=" wazuh.master wazuh.worker wazuh2.worker wazuh3.worker ${INDEXERS[*]} wazuh.dashboard nginx ${ELK_SERVICES[*]} ${TOOLS[*]} "
+  for s in "${svcs[@]}"; do [[ "$known" == *" $s "* ]] || die "unknown service '$s' (try: master worker indexer dashboard nginx elasticsearch kibana logstash n8n grafana portainer suricata zeek)"; done
+  [ ${#svcs[@]} -gt 0 ] || svcs=($(enabled_services))
+  [ ${#svcs[@]} -gt 0 ] || die "no services are enabled"
+  [ "$js" = 1 ] || say "Waiting for: ${svcs[*]} (up to $(fmt_dur "$t"))"
+  wait_ready_run "$t" "$js" "${svcs[@]}"
+}
+wait_indexer() {
+  local t="${1:-240}"
+  wait_ready_run "$t" 0 wazuh1.indexer || { warn "Indexer not ready after ${t}s - check: vexor logs indexer1"; return 1; }
 }
 wait_dashboard() {
-  local t="${1:-180}" i=0 c
-  say "Waiting for the dashboard (up to ${t}s)..."
-  while [ "$i" -lt "$t" ]; do
-    c="$(proxy_code)"; [[ "$c" =~ ^(200|302)$ ]] && { ok "Dashboard answers on port $(env_def PROXY_PORT 8080) (through nginx)"; return 0; }
-    sleep 5; i=$((i + 5))
-  done
-  warn "Dashboard not answering yet (HTTP $c) - check: vexor logs dashboard"; return 1
+  local t="${1:-180}"
+  wait_ready_run "$t" 0 wazuh.dashboard || { warn "Dashboard not answering after ${t}s - check: vexor logs dashboard"; return 1; }
 }
 post_start() {                 # idempotent indexer-side setup
   [ "$(ix_code)" = 200 ] || return 0
@@ -756,6 +874,7 @@ cmd_install() {
   mkdir -p "$bdir/snapshots" "$bdir/config"; chown 1000:1000 "$bdir/snapshots"
   rm -f "$STATE_DIR/stopped"
   apply_all
+  wait_stack || warn "some services are not ready yet - vexor wait-ready   |   vexor doctor"
   if [ "$fresh" = 1 ] && soc_wazuh && [ -z "$(env_get AGENT_ENROLL_PASSWORD)" ] && [ "$(env_def ENROLL_PASSWORD_ON_INSTALL yes)" = yes ]; then
     agents_password on && say "agents need this password to enroll; vexor agents enroll-cmd includes it"
   fi
@@ -793,8 +912,13 @@ cmd_start() {
   if [ $# -eq 0 ] && soc_wazuh && maybe_switch_node_type; then rm -f "$STATE_DIR/stopped"; [ "$QUIET" = 1 ] || cmd_status; return; fi
   render_nginx; render_override
   rm -f "$STATE_DIR/stopped"
-  if [ $# -gt 0 ]; then dc up -d $(resolve_many "$@"); return; fi
+  if [ $# -gt 0 ]; then
+    dc up -d $(resolve_many "$@") || return 1
+    wait_ready_run "$WAIT_READY_TIMEOUT" 0 $(resolve_many "$@") || warn "not ready yet - vexor wait-ready   |   vexor doctor"
+    return 0
+  fi
   apply_all
+  wait_stack || warn "some services are not ready yet - vexor wait-ready   |   vexor doctor"
   [ "$QUIET" = 1 ] || cmd_status
 }
 cmd_stop() {
@@ -810,9 +934,13 @@ cmd_stop() {
 }
 cmd_restart() {
   take_lock; preflight
-  if [ $# -gt 0 ]; then dc_restart $(resolve_many "$@"); return; fi
+  if [ $# -gt 0 ]; then
+    dc_restart $(resolve_many "$@") || return 1
+    wait_ready_run "$WAIT_READY_TIMEOUT" 0 $(resolve_many "$@") || warn "not ready yet - vexor wait-ready   |   vexor doctor"
+    return 0
+  fi
   maybe_switch_node_type && return 0
-  render_nginx; render_override; dc_restart && wait_indexer 300 && wait_dashboard 240
+  render_nginx; render_override; dc_restart && wait_stack
 }
 cmd_down() {
   take_lock
@@ -1100,8 +1228,10 @@ cmd_doctor() {
   case "$code" in
     200) d_pass "indexer API reachable, admin login OK" ;;
     401) d_fail "indexer rejects INDEXER_PASSWORD from .env (HTTP 401)" "vexor passwd admin  (sets the same value in .env and the indexer)" ;;
-    503) d_fail "indexer security not initialised / cluster forming (HTTP 503)" "wait 1-2 min after start; else: vexor logs indexer1" ;;
-    *)   d_fail "indexer unreachable (HTTP ${code:-000})" "vexor logs indexer1" ;;
+    *)   if ! d_starting wazuh1.indexer; then
+           if [ "$code" = 503 ]; then d_fail "indexer security not initialised / cluster forming (HTTP 503)" "vexor logs indexer1"
+           else d_fail "indexer unreachable (HTTP ${code:-000})" "vexor logs indexer1"; fi
+         fi ;;
   esac
   if [ "$code" = 200 ]; then
     local open_demo; open_demo="$(demo_logins_open | tr '\n' ' ')"
@@ -1155,8 +1285,8 @@ cmd_doctor() {
     cl="$(dc exec -T wazuh.master /var/ossec/bin/cluster_control -l 2>&1)"
     want=$(( $(active_workers) + 1 )); got="$(awk 'NR>1 && NF' <<<"$cl" | wc -l)"
     if [ "$got" -ge "$want" ]; then d_pass "manager cluster: $got/$want nodes connected$(is_single && echo ' (single: master only)')"
-    elif [ "$got" = 0 ] && [ "$(svc_uptime_s wazuh.master)" -lt 300 ]; then
-      d_warn "manager cluster not answering yet - the master started $(( $(svc_uptime_s wazuh.master) / 60 )) min ago and wazuh-clusterd comes up last" "wait a few minutes, then: vexor doctor"
+    elif [ "$got" = 0 ] && d_starting wazuh.master; then :     # wazuh-clusterd comes up last
+    elif [ "$got" != 0 ] && [ "$(active_workers)" -gt 0 ] && d_starting "$(enabled_managers | tail -1)"; then :
     elif [ "$got" = 0 ]; then
       d_fail "manager cluster not answering (wazuh-clusterd down on the master?)" "vexor logs cluster master"
       d_fix "restart the master" && dc_restart wazuh.master
@@ -1211,8 +1341,10 @@ cmd_doctor() {
     local hc s; hc="$(proxy_code)"
     case "$hc" in
       200|302) d_pass "https://127.0.0.1:$port -> dashboard (HTTP $hc)" ;;
-      502|504) d_fail "nginx up, dashboard not answering (HTTP $hc)" "vexor logs dashboard"
-               [ "$(svc_uptime_s wazuh.dashboard)" -ge 300 ] && d_fix "restart the dashboard" && dc_restart wazuh.dashboard >/dev/null ;;
+      502|503|504) if ! d_starting wazuh.dashboard; then
+               d_fail "nginx up, dashboard not answering (HTTP $hc)" "vexor logs dashboard"
+               [ "$(svc_uptime_s wazuh.dashboard)" -ge 300 ] && d_fix "restart the dashboard" && dc_restart wazuh.dashboard >/dev/null
+             fi ;;
       *)       d_fail "dashboard via nginx: HTTP ${hc:-000}" "vexor logs nginx dashboard" ;;
     esac
     s="$(proxy_code http)"
@@ -1243,8 +1375,10 @@ cmd_doctor() {
       tc="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://127.0.0.1:$(tool_port "$tl")/" 2>/dev/null)"
       case "$tc" in
         200|301|302|303|307|308|401) d_pass "$tl https://$(public_host):$(tool_port "$tl") (HTTP $tc)" ;;
-        502|503|504) d_fail "$tl: nginx answers, $tl does not (HTTP $tc)" "vexor logs $tl   (first start can take 1-2 min)"
-                     [ "$(svc_uptime_s "$tl")" -ge 180 ] && d_fix "restart $tl" && dc restart "$tl" >/dev/null 2>&1 ;;
+        502|503|504) if ! d_starting "$tl"; then
+                       d_fail "$tl: nginx answers, $tl does not (HTTP $tc)" "vexor logs $tl"
+                       [ "$(svc_uptime_s "$tl")" -ge 180 ] && d_fix "restart $tl" && dc restart "$tl" >/dev/null 2>&1
+                     fi ;;
         *) d_fail "$tl: nothing answers on port $(tool_port "$tl") (HTTP ${tc:-000})" "vexor doctor --fix   (renders nginx + publishes the port)"
            d_fix "render nginx + recreate it with the tool ports" && { render_override; render_nginx; dc up -d --no-deps --force-recreate nginx >/dev/null 2>&1; } ;;
       esac
@@ -1751,7 +1885,7 @@ cmd_passwd() {
       env_set API_PASSWORD "$pw"; set_api_pw_yml "$pw"
       say "Recreating master + dashboard (the master applies the API password on start)..."
       dc up -d --force-recreate wazuh.master wazuh.dashboard >/dev/null 2>&1
-      local i; for i in $(seq 1 36); do API_TOKEN=""; api_login && break; sleep 5; done
+      API_TOKEN=""; wait_ready_run 180 0 wazuh.master >/dev/null 2>&1
       if api_login; then ok "Wazuh API accepts the new password"; else warn "API login still failing - vexor logs master"; fi ;;
   esac
   [ "$gen" = 1 ] && say "New password: $pw   (stored in .env)"
@@ -2271,11 +2405,8 @@ node_type_verify() {
   wait_indexer 300 || warn "indexer not ready yet - vexor doctor"
   wait_dashboard 300 || true
   want=$(( $(active_workers) + 1 ))
-  for i in $(seq 1 24); do
-    got="$(dc exec -T wazuh.master /var/ossec/bin/cluster_control -l 2>/dev/null | awk 'NR>1 && NF' | wc -l)"
-    [ "${got:-0}" -ge "$want" ] && break
-    sleep 5
-  done
+  wait_ready_run 120 0 $(enabled_managers) >/dev/null 2>&1
+  got="$(dc exec -T wazuh.master /var/ossec/bin/cluster_control -l 2>/dev/null | awk 'NR>1 && NF' | wc -l)"
   if [ "${got:-0}" -ge "$want" ]; then ok "manager cluster: $got/$want node(s)"
   else warn "manager cluster: ${got:-0}/$want node(s) - workers may still be syncing (vexor cluster)"; fi
   tcp_open 127.0.0.1 "$(env_def AGENT_PORT 1514)"  && ok "agent port $(env_def AGENT_PORT 1514)/tcp open"  || bad "agent port $(env_def AGENT_PORT 1514) closed - vexor doctor --fix"
@@ -3130,7 +3261,7 @@ elk_prepare() {                # before `docker compose up`
 elk_post() {                   # after `docker compose up`: users, roles, retention, data views
   soc_elk || return 0
   local i c=""
-  for i in $(seq 1 60); do c="$(es_code /_cluster/health)"; [ "$c" = 200 ] && break; [ "$c" = 401 ] && break; sleep 5; done
+  wait_ready_run 300 0 elasticsearch >/dev/null 2>&1; c="$(es_code /_cluster/health)"
   if [ "$c" = 401 ]; then
     bad "Elasticsearch rejects ELASTIC_PASSWORD (it is set only on the FIRST start of the data volume)"
     hint "put the old value back in .env, or reset it: vexor elk reset-password"; return 1
@@ -3143,7 +3274,7 @@ elk_post() {                   # after `docker compose up`: users, roles, retent
   es_curl PUT /_security/user/vexor_logstash -d "{\"password\":\"$(env_get LOGSTASH_ES_PASSWORD)\",\"roles\":[\"vexor_logstash\"],\"full_name\":\"Vexor Logstash writer\"}" \
     | has '"created"' && ok "Elasticsearch user vexor_logstash (write vexor-* only)" || warn "could not create the vexor_logstash user"
   elk_retention_apply
-  for i in $(seq 1 60); do c="$(kibana_code)"; [ "$c" = 200 ] && break; sleep 5; done
+  wait_ready_run 300 0 kibana >/dev/null 2>&1; c="$(kibana_code)"
   if [ "$c" = 200 ]; then elk_data_views; else warn "Kibana not ready yet (HTTP ${c:-000}) - first start takes 2-3 min; vexor doctor --fix adds the data views"; fi
   return 0
 }
@@ -3191,8 +3322,10 @@ elk_doctor() {                 # ELK checks + predictable repairs
   case "$c" in
     200) d_pass "Elasticsearch reachable, elastic login OK" ;;
     401) d_fail "Elasticsearch rejects ELASTIC_PASSWORD (only applied on the first start of the data volume)" "restore the old value in .env, or: vexor elk reset-password" ;;
-    000|"") d_fail "Elasticsearch not answering on 127.0.0.1:$(es_port)" "vexor logs elasticsearch   (first start ~1 min; 'max virtual memory areas' = vm.max_map_count, 'OutOfMemoryError' = lower ELK_HEAP)"
-            [ "$(svc_uptime_s elasticsearch)" -ge 240 ] && d_fix "restart elasticsearch" && dc restart elasticsearch >/dev/null 2>&1 ;;
+    000|"") if ! d_starting elasticsearch; then
+              d_fail "Elasticsearch not answering on 127.0.0.1:$(es_port)" "vexor logs elasticsearch   ('max virtual memory areas' = vm.max_map_count, 'OutOfMemoryError' = lower ELK_HEAP)"
+              [ "$(svc_uptime_s elasticsearch)" -ge 240 ] && d_fix "restart elasticsearch" && dc restart elasticsearch >/dev/null 2>&1
+            fi ;;
     *) d_fail "Elasticsearch: HTTP $c" "vexor logs elasticsearch" ;;
   esac
   if [ "$c" = 200 ]; then
@@ -3220,7 +3353,7 @@ elk_doctor() {                 # ELK checks + predictable repairs
   c="$(kibana_code)"
   case "$c" in
     200) d_pass "Kibana https://$(public_host):$(env_def KIBANA_PORT 55601) available" ;;
-    503|502) if [ "$(svc_uptime_s kibana)" -lt 300 ]; then d_warn "Kibana still starting (HTTP $c)" "wait 2-3 min"
+    503|502) if d_starting kibana; then :
              else d_fail "Kibana not available (HTTP $c)" "vexor logs kibana   ('unable to authenticate user [kibana_system]' = password mismatch)"
                   d_fix "reset kibana_system password + restart kibana" && { es_curl POST /_security/user/kibana_system/_password -d "{\"password\":\"$(env_get KIBANA_SYSTEM_PASSWORD)\"}" >/dev/null; dc restart kibana >/dev/null 2>&1; }; fi ;;
     *) d_fail "nothing answers on Kibana port $(env_def KIBANA_PORT 55601) (HTTP ${c:-000})" "vexor doctor --fix"
@@ -3916,7 +4049,7 @@ n8n_workflow_import() {
   dc exec -T n8n n8n publish:workflow --id=vexorSocAlerts01 >"$RUN_TMP/n8n-publish" 2>&1 \
     || { tail -n 5 "$RUN_TMP/n8n-publish"; warn "imported, but publishing failed - open it in n8n and click Publish"; }
   dc restart n8n >/dev/null 2>&1        # a running n8n only picks up CLI changes after a restart
-  local i; for i in $(seq 1 30); do [ "$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:$(tool_port n8n)/healthz")" = 200 ] && break; sleep 2; done
+  wait_ready_run 90 0 n8n >/dev/null 2>&1 || true
   ok "workflow 'Vexor - SOC alerts' imported and published (webhook path: $(n8n_workflow_path))"
   n8n_owner_set || warn "n8n has no owner account yet: open https://$(public_host):$(tool_port n8n) now - the first visitor becomes the owner"
   say "file: $TOOLS_DIR/n8n/vexor-soc-alerts.workflow.json  (re-import after editing it, or edit the workflow in n8n)"
@@ -4778,7 +4911,7 @@ update_apply() {
   sed -i -E "s/(CERT_TOOL_VERSION=)[0-9.]+/\1$(cut -d. -f1,2 <<<"$target")/" "$CERTGEN_FILE"
   hdr "Restarting on $target"
   dc_all down && render_nginx && dc up -d || die "start failed - roll back with: vexor update rollback"
-  if wait_indexer 400 && wait_dashboard 300; then
+  if wait_stack; then
     post_start
     ok "Upgraded to $target"
     is_running wazuh.master && dc exec -T wazuh.master /var/ossec/bin/cluster_control -l
@@ -4987,10 +5120,11 @@ _vexor() {
   local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}" words
   local svcs="master worker worker2 worker3 indexer1 indexer2 indexer3 dashboard nginx managers indexers"
   if [ "$COMP_CWORD" -eq 1 ]; then
-    words="install info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console plan notify login tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
+    words="install info config start stop restart down scale wait-ready node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console plan notify login tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
   else
     case "$cmd" in
       start|stop|restart|shell|exec) words="$svcs" ;;
+      wait-ready|wait) words="$svcs elasticsearch kibana logstash n8n grafana portainer --timeout --json" ;;
       logs)    words="$svcs ossec api cluster alerts archives errors size -f -n --since" ;;
       config)  words="show get set edit validate plan apply --show-secrets" ;;
       plan)    words="--json" ;;
@@ -5463,6 +5597,7 @@ ${C_BD}Run${C_0} (everything SOC and the tool flags in .env enable)
   stop [svc..]                   stop containers (the watchdog leaves a stopped stack alone)
   restart [svc..]                restart everything or the given services
   down                           remove containers + network (volumes/data kept)
+  wait-ready [--timeout S] [--json] [svc..]   wait until services are running, healthy and answering (exit 1 + list on timeout)
   scale <1|2|3>                  number of worker managers (multi); nginx balancer updated
   status                         containers + indexer/manager cluster, agents, dashboard, disk
 
@@ -5654,6 +5789,7 @@ main() {
     restart)               cmd_restart "${args[@]}" ;;
     down)                  cmd_down ;;
     scale)                 cmd_scale "${args[@]}" ;;
+    wait-ready|wait)       cmd_wait_ready "${args[@]}" ;;
     node-type|nodetype|node_type|mode) cmd_node_type "${args[@]}" ;;
     status|st)             cmd_status ;;
     ps)                    dc_all ps ;;

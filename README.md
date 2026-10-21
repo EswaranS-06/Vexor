@@ -350,6 +350,7 @@ Notifications go to `NOTIFY_URL` (a Slack, Teams or Discord incoming webhook, or
 vexor notify test         # send a test notification
 vexor doctor              # about 60 checks, each problem with a hint
 vexor doctor --fix        # repair what can be repaired
+vexor wait-ready          # wait until every enabled service answers (--timeout 300, --json, or name services)
 vexor ai-context --print  # one report to paste into any AI assistant (secrets masked)
 ```
 

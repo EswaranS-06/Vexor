@@ -195,6 +195,7 @@ The web UI (`CONSOLE=true`, `https://PUBLIC_HOST:CONSOLE_PORT`). The README list
 | `stop [svc..]` | Stop containers. Stopping the whole stack sets the *stopped* marker, so the watchdog leaves it alone. |
 | `restart [svc..]` | Restart everything or the given services; managers are recreated. |
 | `down` | Remove containers and the network. Volumes are kept. |
+| `wait-ready [--timeout S] [--json] [svc..]` | Wait until the services (default: all enabled, 900 s) run, report healthy and answer: indexer, manager cluster and API, dashboard, Elasticsearch, Kibana, Logstash, n8n, Grafana, Portainer. Prints what it waits for, exits 0 when ready and 1 with a list of what is not. `install`, `start`, `restart`, `update` and CI use it; `doctor` uses the same check to say "still starting" instead of failing. |
 | `status` | Containers (state, uptime, restarts, OOM), Wazuh clusters and agents, ELK health, n8n forwarding, disk, the last health check, due reminders. |
 
 ## What runs
