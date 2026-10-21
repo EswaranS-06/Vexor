@@ -1,355 +1,257 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Vexor: SOC stack on one host</title>
-<meta name="description" content="Vexor runs Wazuh, the Elastic Stack, or both on one Docker host and keeps them healthy with one CLI that diagnoses and repairs common failures.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=JetBrains+Mono:wght@400;600&family=Public+Sans:wght@400;600&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --fog: #EEF1F5;
-    --paper: #F8FAFC;
-    --ink: #16233B;
-    --ink-2: #4A5970;
-    --line: #CBD3DE;
-    --teal: #13707B;
-    --teal-ink: #0C4E56;
-    --ok: #2F8C7A;
-    --warn: #B8841F;
-    --bad: #C8414B;
-    --term: #16233B;
-    --term-text: #DCE4EE;
-    --term-dim: #8B9BB2;
-    --display: "Bricolage Grotesque", "Segoe UI", sans-serif;
-    --body: "Public Sans", "Segoe UI", sans-serif;
-    --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --fog: #101A2C; --paper: #15223A; --ink: #E6ECF4; --ink-2: #A3B1C6; --line: #2C3B57;
-      --teal: #4FB6C0; --teal-ink: #8AD3DA; --ok: #5CC2AD; --warn: #E2B04F; --bad: #EE7480;
-      --term: #0B1424; --term-text: #DCE4EE; --term-dim: #7F90A9;
-    }
-  }
-  * { box-sizing: border-box; }
-  html { -webkit-text-size-adjust: 100%; }
-  body { margin: 0; background: var(--fog); color: var(--ink); font: 400 17px/1.6 var(--body); }
-  a { color: var(--teal-ink); text-underline-offset: 3px; }
-  a:focus-visible, button:focus-visible { outline: 3px solid var(--teal); outline-offset: 3px; border-radius: 4px; }
-  .wrap { max-width: 1160px; margin: 0 auto; padding: 0 24px; }
-  @media (max-width: 600px) { .wrap { padding: 0 16px; } }
-
-  /* header */
-  header.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 22px 0; }
-  .mark { font: 700 26px/1 var(--mono); color: var(--ink); text-decoration: none; letter-spacing: -0.02em; }
-  .mark span { color: var(--teal); }
-  nav.links { display: flex; gap: 22px; flex-wrap: wrap; }
-  nav.links a { color: var(--ink-2); text-decoration: none; font-weight: 600; font-size: 15px; }
-  nav.links a:hover { color: var(--ink); }
-  @media (max-width: 520px) { header.top { flex-direction: column; align-items: flex-start; gap: 10px; } nav.links { gap: 16px; } }
-
-  /* hero */
-  .hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); gap: 56px; align-items: center; padding: 40px 0 88px; }
-  @media (max-width: 960px) { .hero { grid-template-columns: 1fr; gap: 36px; padding-bottom: 64px; } }
-  h1 { font: 700 clamp(40px, 5.6vw, 68px)/1.02 var(--display); letter-spacing: -0.035em; margin: 0 0 22px; max-width: 13ch; }
-  .lede { font-size: 19px; color: var(--ink-2); max-width: 44ch; margin: 0 0 30px; }
-  .install { display: flex; align-items: stretch; max-width: 520px; background: var(--paper); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-  .install code { flex: 1; font: 400 14px/1.5 var(--mono); padding: 14px 16px; white-space: normal; overflow-wrap: anywhere; color: var(--ink); }
-  .install button { border: 0; border-left: 1px solid var(--line); background: transparent; color: var(--teal-ink); font: 600 14px var(--body); padding: 0 16px; cursor: pointer; }
-  .install button:hover { background: var(--fog); }
-  .ctas { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 22px; }
-  .btn { display: inline-block; padding: 12px 20px; border-radius: 8px; font-weight: 600; text-decoration: none; }
-  .btn.primary { background: var(--teal); color: #fff; }
-  .btn.primary:hover { background: var(--teal-ink); }
-  .btn.plain { color: var(--ink); border: 1px solid var(--line); }
-  .btn.plain:hover { border-color: var(--ink-2); }
-  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .btn.primary { color: #08202A; } }
-
-  /* terminal (the one memorable thing) */
-  .term, pre.cmd, .install code, .envline, .seg button { font-variant-ligatures: none; }
-  .term { background: var(--term); color: var(--term-text); border-radius: 14px; font: 400 13.5px/1.75 var(--mono); padding: 18px 22px 22px; box-shadow: 0 30px 60px -30px rgba(22, 35, 59, 0.55); min-height: 430px; }
-  .term .bar { display: flex; gap: 7px; margin-bottom: 14px; }
-  .term .bar i { width: 11px; height: 11px; border-radius: 50%; background: #34445F; }
-  .term .ln { white-space: pre-wrap; min-height: 1.75em; }
-  .term .p { color: var(--term-dim); }
-  .term .h { color: #fff; font-weight: 600; }
-  .term .ok { color: #6FD3BF; }
-  .term .warn { color: #F2C66B; }
-  .term .bad { color: #F48A93; }
-  .term .fix { color: #8CC8F5; }
-  .term .dim { color: var(--term-dim); }
-  .term .cursor { display: inline-block; width: 8px; height: 1.1em; background: var(--term-text); vertical-align: -2px; animation: blink 1s steps(1) infinite; }
-  @keyframes blink { 50% { opacity: 0; } }
-  @media (prefers-reduced-motion: reduce) { .term .cursor { animation: none; } }
-  .caption { font-size: 14px; color: var(--ink-2); margin-top: 12px; }
-
-  /* sections */
-  section { padding: 76px 0; border-top: 1px solid var(--line); }
-  h2 { font: 700 clamp(30px, 3.6vw, 42px)/1.1 var(--display); letter-spacing: -0.025em; margin: 0 0 14px; max-width: 22ch; }
-  .intro { color: var(--ink-2); max-width: 62ch; margin: 0 0 36px; }
-
-  /* SOC chooser */
-  .chooser { display: grid; grid-template-columns: 320px 1fr; gap: 40px; align-items: start; }
-  @media (max-width: 860px) { .chooser { grid-template-columns: 1fr; } }
-  fieldset { border: 0; margin: 0 0 26px; padding: 0; }
-  legend { font-weight: 600; margin-bottom: 10px; }
-  .seg { display: flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--paper); }
-  .seg button { flex: 1; border: 0; background: transparent; color: var(--ink-2); font: 600 15px var(--mono); padding: 12px 8px; cursor: pointer; }
-  .seg button + button { border-left: 1px solid var(--line); }
-  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--fog); }
-  .envline { font: 400 14px/1.7 var(--mono); color: var(--ink-2); background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
-  .envline b { color: var(--ink); font-weight: 600; }
-  .result { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 26px 28px; }
-  .result h3 { font: 700 22px/1.25 var(--display); margin: 0 0 6px; }
-  .result .sub { color: var(--ink-2); margin: 0 0 18px; }
-  .svc { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px 26px; }
-  .svc li { padding: 9px 0; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; }
-  .svc .n { font: 600 14.5px var(--mono); }
-  .svc .r { color: var(--ink-2); font-size: 14.5px; text-align: right; }
-  .meter { margin-top: 22px; display: flex; align-items: baseline; gap: 12px; }
-  .meter strong { font: 700 34px/1 var(--display); }
-  .meter span { color: var(--ink-2); }
-
-  /* repairs */
-  .repairs { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 0 48px; }
-  @media (max-width: 760px) { .repairs { grid-template-columns: 1fr; } }
-  .repairs li { padding: 18px 0; border-bottom: 1px solid var(--line); }
-  .repairs .prob { font-weight: 600; display: block; }
-  .repairs .prob::before { content: "✘ "; color: var(--bad); font-family: var(--mono); }
-  .repairs .rep { color: var(--ink-2); display: block; margin-top: 4px; }
-  .repairs .rep::before { content: "✔ "; color: var(--ok); font-family: var(--mono); }
-
-  /* tools */
-  .tools { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: var(--paper); }
-  @media (max-width: 900px) { .tools { grid-template-columns: 1fr 1fr; } }
-  @media (max-width: 520px) { .tools { grid-template-columns: 1fr; } }
-  .tool { padding: 22px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-  .tool h3 { font: 700 19px/1.2 var(--display); margin: 0 0 6px; }
-  .tool p { margin: 0 0 10px; color: var(--ink-2); font-size: 15px; }
-  .tool code { font: 400 13px var(--mono); color: var(--teal-ink); }
-
-  /* steps (a real sequence) */
-  ol.steps { list-style: none; counter-reset: s; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; }
-  @media (max-width: 860px) { ol.steps { grid-template-columns: 1fr; } }
-  ol.steps li { counter-increment: s; }
-  ol.steps li::before { content: counter(s); display: block; font: 700 44px/1 var(--display); color: var(--teal); margin-bottom: 10px; }
-  ol.steps h3 { font: 700 20px/1.25 var(--display); margin: 0 0 8px; }
-  ol.steps p { color: var(--ink-2); margin: 0 0 12px; }
-  pre.cmd { margin: 0; background: var(--term); color: var(--term-text); font: 400 13.5px/1.7 var(--mono); padding: 14px 16px; border-radius: 10px; overflow-x: auto; }
-
-  footer { border-top: 1px solid var(--line); padding: 30px 0 48px; color: var(--ink-2); font-size: 15px; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vexor · one command runs your SOC</title>
+  <meta name="description" content="Vexor runs Wazuh, ELK, n8n, Suricata and Zeek on one Docker host, wires them together, and keeps them healthy with one CLI.">
+  <meta name="theme-color" content="#f7f9fc">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23234bd6'/%3E%3Cpath d='M8 9l8 15 8-15' stroke='white' stroke-width='3.2' fill='none' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/tokens.css">
+  <link rel="stylesheet" href="assets/css/site.css">
+  <script type="module" src="assets/js/main.js"></script>
 </head>
 <body>
-<div class="wrap">
-  <header class="top">
-    <a class="mark" href="#">vexor<span>_</span></a>
-    <nav class="links" aria-label="Main">
-      <a href="https://github.com/EswaranS-06/Vexor#quick-start">Quick start</a>
-      <a href="https://github.com/EswaranS-06/Vexor/blob/main/VEXOR.md">CLI reference</a>
-      <a href="https://github.com/EswaranS-06/Vexor">GitHub</a>
-    </nav>
-  </header>
+  <a class="skip" href="#main">Skip to content</a>
 
-  <main>
-    <div class="hero">
-      <div>
-        <h1>A SOC stack that tells you what broke, and fixes it.</h1>
-        <p class="lede">Vexor runs Wazuh, the Elastic Stack, or both on one Docker host. One command sets it up; the same command checks it every hour and repairs the failures that usually take a SOC team an afternoon.</p>
-        <div class="install">
-          <code id="cmd">git clone https://github.com/EswaranS-06/Vexor.git &amp;&amp; cd Vexor &amp;&amp; sudo ./vexor install</code>
-          <button type="button" id="copy" aria-label="Copy the install command">Copy</button>
-        </div>
-        <div class="ctas">
-          <a class="btn primary" href="https://github.com/EswaranS-06/Vexor">View on GitHub</a>
-          <a class="btn plain" href="https://github.com/EswaranS-06/Vexor/blob/main/VEXOR.md">Read the CLI reference</a>
-        </div>
-      </div>
-      <div>
-        <div class="term" role="img" aria-label="Terminal running vexor doctor --fix: about sixty checks pass, one failure about demo users with default passwords is found and repaired, ending with 0 failed.">
-          <div class="bar" aria-hidden="true"><i></i><i></i><i></i></div>
-          <div id="screen" aria-hidden="true"></div>
-        </div>
-        <p class="caption">A real repair from a live install: demo indexer users with public default passwords, found and removed.</p>
+  <header class="nav" id="top">
+    <div class="nav__inner">
+      <a class="wordmark" href="#top" aria-label="Vexor home">
+        <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M7 8l9 16 9-16"/></svg>
+        <span>vexor</span>
+      </a>
+      <nav class="nav__links" aria-label="Sections">
+        <a href="#simulator">Simulator</a>
+        <a href="#commands">Commands</a>
+        <a href="#changes">What's new</a>
+        <a href="https://github.com/EswaranS-06/Vexor">GitHub</a>
+      </nav>
+      <div class="nav__right">
+        <button class="kbd-btn" type="button" data-open-palette aria-label="Open the command palette">
+          <span class="kbd-btn__label">Search commands</span>
+          <kbd><span data-mod>Ctrl</span> K</kbd>
+        </button>
+        <a class="btn btn--primary btn--sm" href="#install">Install</a>
       </div>
     </div>
+  </header>
 
-    <section id="choose">
-      <h2>Pick what runs. Switch any time.</h2>
-      <p class="intro">Three settings in <code>.env</code> decide the layout. Switching moves the data safely, so agents keep their keys and every alert stays where it is.</p>
-      <div class="chooser">
-        <div>
-          <fieldset>
-            <legend>SOC</legend>
-            <div class="seg" role="group" aria-label="SOC">
-              <button type="button" data-soc="wazuh" aria-pressed="true">wazuh</button>
-              <button type="button" data-soc="elk" aria-pressed="false">elk</button>
-              <button type="button" data-soc="both" aria-pressed="false">both</button>
-            </div>
-          </fieldset>
-          <fieldset>
-            <legend>Node type</legend>
-            <div class="seg" role="group" aria-label="Node type">
-              <button type="button" data-node="single" aria-pressed="true">single</button>
-              <button type="button" data-node="multi" aria-pressed="false">multi</button>
-            </div>
-          </fieldset>
-          <div class="envline" id="envline"></div>
+  <main id="main">
+    <!-- HERO -->
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero__copy">
+        <a class="live-chip" data-live-version href="https://github.com/EswaranS-06/Vexor/actions">
+          <span class="dot" aria-hidden="true"></span>
+          <span data-version-text>v1.2</span>
+          <span class="live-chip__sep" aria-hidden="true">/</span>
+          <span data-ci-text>Checking CI</span>
+        </a>
+        <h1 id="hero-title" class="hero__title">One command runs your whole SOC.</h1>
+        <p class="hero__lede">Vexor puts <strong>Wazuh</strong>, <strong>ELK</strong>, <strong>n8n</strong>, <strong>Suricata</strong> and <strong>Zeek</strong> on one Docker host, wires their alerts into each other, and keeps the stack healthy with a doctor that repairs what usually breaks.</p>
+
+        <div class="install-line">
+          <code id="install-cmd">git clone https://github.com/EswaranS-06/Vexor.git &amp;&amp; cd Vexor &amp;&amp; sudo ./vexor install</code>
+          <button class="copy-btn" type="button" data-copy-target="install-cmd" aria-label="Copy the install command">
+            <span data-copy-label>Copy</span>
+          </button>
         </div>
-        <div class="result" aria-live="polite">
-          <h3 id="r-title"></h3>
-          <p class="sub" id="r-sub"></p>
-          <ul class="svc" id="r-svc"></ul>
-          <div class="meter"><strong id="r-ram"></strong><span>RAM recommended</span></div>
+        <div class="hero__actions">
+          <a class="link-arrow" href="#simulator">Build a stack in the simulator</a>
+          <a class="link-plain" href="https://github.com/EswaranS-06/Vexor#readme">Read the README</a>
+        </div>
+
+        <ul class="hero__facts" aria-label="What runs">
+          <li><span>Wazuh</span> 4.14</li>
+          <li><span>Elastic</span> 9.5</li>
+          <li><span>n8n</span> 2.40</li>
+          <li><span>Suricata</span> 8.0</li>
+          <li><span>Zeek</span> 8.2</li>
+        </ul>
+      </div>
+
+      <figure class="session" aria-label="A Vexor session, replayed">
+        <figcaption class="session__head">
+          <span class="session__name">vexor · session replay</span>
+          <span class="session__step" data-session-step>0 / 5</span>
+        </figcaption>
+        <ol class="session__body" data-session aria-live="off"></ol>
+        <div class="session__foot">
+          <div class="session__rail" aria-hidden="true"><span data-session-progress></span></div>
+          <button class="ghost-btn" type="button" data-session-replay>Replay</button>
+        </div>
+      </figure>
+    </section>
+
+    <!-- WHAT'S NEW (live from GitHub) -->
+    <section class="changes" id="changes" aria-labelledby="changes-title">
+      <div class="section-head">
+        <h2 id="changes-title">What changed in each release</h2>
+        <p>Read live from the repository's tags and commit messages, so this list is never older than the code.</p>
+      </div>
+      <div class="changes__grid" data-changes>
+        <div class="changes__loading" role="status">Loading releases from GitHub…</div>
+      </div>
+    </section>
+
+    <!-- SIMULATOR (the one dark band) -->
+    <section class="band" id="simulator" aria-labelledby="sim-title">
+      <div class="band__inner">
+        <div class="section-head section-head--dark">
+          <h2 id="sim-title">Pick a stack. Watch it run.</h2>
+          <p>Choose what <code>.env</code> enables. The diagram shows the containers Vexor starts and how data moves between them; the scenarios replay real detections and repairs, step by step.</p>
+        </div>
+
+        <div class="sim">
+          <form class="sim__controls" data-sim-controls aria-label="Stack settings">
+            <fieldset class="seg">
+              <legend>SOC</legend>
+              <div class="seg__opts">
+                <label><input type="radio" name="soc" value="wazuh" checked><span>wazuh</span></label>
+                <label><input type="radio" name="soc" value="elk"><span>elk</span></label>
+                <label><input type="radio" name="soc" value="both"><span>both</span></label>
+              </div>
+            </fieldset>
+            <fieldset class="seg" data-needs-wazuh>
+              <legend>NODE_TYPE</legend>
+              <div class="seg__opts">
+                <label><input type="radio" name="node" value="single" checked><span>single</span></label>
+                <label><input type="radio" name="node" value="multi"><span>multi</span></label>
+              </div>
+            </fieldset>
+            <fieldset class="seg" data-needs-multi>
+              <legend>WORKER_COUNT</legend>
+              <div class="seg__opts">
+                <label><input type="radio" name="workers" value="1" checked><span>1</span></label>
+                <label><input type="radio" name="workers" value="2"><span>2</span></label>
+                <label><input type="radio" name="workers" value="3"><span>3</span></label>
+              </div>
+            </fieldset>
+            <fieldset class="toggles">
+              <legend>Tools</legend>
+              <label class="tog"><input type="checkbox" name="n8n" checked><span>N8N</span></label>
+              <label class="tog"><input type="checkbox" name="suricata" checked><span>SURICATA</span></label>
+              <label class="tog"><input type="checkbox" name="zeek"><span>ZEEK</span></label>
+              <label class="tog"><input type="checkbox" name="grafana"><span>GRAFANA</span></label>
+              <label class="tog"><input type="checkbox" name="portainer"><span>PORTAINER</span></label>
+            </fieldset>
+          </form>
+
+          <div class="sim__stage">
+            <div class="sim__diagram" data-diagram role="img" aria-label="Containers and data flows for the selected stack"></div>
+            <div class="sim__scenarios" role="group" aria-label="Scenarios">
+              <button class="scn" type="button" data-scenario="network">
+                <span class="scn__title">Network attack</span>
+                <span class="scn__sub">Suricata sid 2100498</span>
+              </button>
+              <button class="scn" type="button" data-scenario="ssh">
+                <span class="scn__title">SSH brute force</span>
+                <span class="scn__sub">agent → rule 5712</span>
+              </button>
+              <button class="scn" type="button" data-scenario="crash">
+                <span class="scn__title">A container dies</span>
+                <span class="scn__sub">watchdog + doctor --fix</span>
+              </button>
+            </div>
+          </div>
+
+          <aside class="sim__panel" aria-label="Stack details">
+            <dl class="stats">
+              <div><dt>Containers</dt><dd data-stat="containers">–</dd></div>
+              <div><dt>Host RAM</dt><dd data-stat="ram">–</dd></div>
+              <div><dt>Host ports</dt><dd data-stat="ports">–</dd></div>
+            </dl>
+            <div class="tabs" data-tabs>
+              <div class="tabs__list" role="tablist" aria-label="Details">
+                <button role="tab" type="button" id="tab-log" aria-controls="pane-log" aria-selected="true">Event log</button>
+                <button role="tab" type="button" id="tab-ps" aria-controls="pane-ps" aria-selected="false" tabindex="-1">Containers</button>
+                <button role="tab" type="button" id="tab-env" aria-controls="pane-env" aria-selected="false" tabindex="-1">.env + commands</button>
+              </div>
+              <div class="tabs__pane" role="tabpanel" id="pane-log" aria-labelledby="tab-log">
+                <ol class="log" data-log aria-live="polite">
+                  <li class="log__empty">Run a scenario to see each step here.</li>
+                </ol>
+              </div>
+              <div class="tabs__pane" role="tabpanel" id="pane-ps" aria-labelledby="tab-ps" hidden>
+                <table class="ps">
+                  <thead><tr><th scope="col">Service</th><th scope="col">State</th><th scope="col">Port</th></tr></thead>
+                  <tbody data-ps></tbody>
+                </table>
+              </div>
+              <div class="tabs__pane" role="tabpanel" id="pane-env" aria-labelledby="tab-env" hidden>
+                <pre class="envbox" data-env></pre>
+                <button class="ghost-btn ghost-btn--dark" type="button" data-copy-target-el="env">Copy</button>
+              </div>
+            </div>
+          </aside>
         </div>
       </div>
     </section>
 
-    <section id="repairs">
-      <h2>It fixes what usually breaks.</h2>
-      <p class="intro">Every check below came from a real failure while building and running the stack. <code>vexor doctor</code> runs about sixty checks; the hourly health timer repairs the ones it can and writes an AI-ready report for the rest.</p>
-      <ul class="repairs">
-        <li><span class="prob">Demo users log in with public default passwords</span><span class="rep">Removed from the indexer and pushed with securityadmin</span></li>
-        <li><span class="prob">A manager ignores your edited ossec.conf</span><span class="rep">Recreated, because the image only applies mounted config to a fresh container</span></li>
-        <li><span class="prob">An empty .env value followed by a comment</span><span class="rep">Comment moved to its own line, since Compose would use it as the value</span></li>
-        <li><span class="prob">Suricata runs with 0 signatures</span><span class="rep">Rules downloaded, ownership fixed, hot-reloaded</span></li>
-        <li><span class="prob">Suricata stats records flood Wazuh with decoder errors</span><span class="rep">Wazuh reads only alert and anomaly records</span></li>
-        <li><span class="prob">A new worker has no n8n integration script</span><span class="rep">Script installed, the manager recreated</span></li>
-        <li><span class="prob">An image download fails on a TLS error</span><span class="rep">Each missing image retried with back-off</span></li>
-        <li><span class="prob">Elasticsearch stays yellow on one node</span><span class="rep">Replicas set to 0 and the index template corrected</span></li>
-      </ul>
-    </section>
-
-    <section id="tools">
-      <h2>Add sensors and response with one command.</h2>
-      <p class="intro">Each one has its own commands for status, tests and day-to-day work. Vexor wires it into Wazuh and ELK, and serves every web tool over HTTPS through nginx with the dashboard's certificate.</p>
-      <div class="tools">
-        <div class="tool"><h3>Suricata</h3><p>IDS on your interface with the ET Open rules. High-severity alerts reach Wazuh at level 10; <code>suricata test</code> proves every hop.</p><code>vexor suricata enable</code></div>
-        <div class="tool"><h3>Zeek</h3><p>DNS, HTTP, TLS and SSH logs, notices raised as alerts, top talkers on demand.</p><code>vexor zeek enable</code></div>
-        <div class="tool"><h3>Grafana</h3><p>A Wazuh alerts dashboard on a read-only indexer user.</p><code>:53000</code></div>
-        <div class="tool"><h3>Portainer</h3><p>Every container on the host, with the admin password preset.</p><code>:59443</code></div>
-        <div class="tool"><h3>n8n</h3><p>Alerts arrive from every manager by webhook; a starter workflow routes them by severity, and a scoped API user lets it act.</p><code>vexor n8n connect</code></div>
+    <!-- INSTALL (a genuine sequence) -->
+    <section class="install" id="install" aria-labelledby="install-title">
+      <div class="section-head">
+        <h2 id="install-title">Install on a Linux host</h2>
+        <p>Docker Engine 24+ with Compose v2, systemd, and the RAM the simulator shows for your stack.</p>
       </div>
-    </section>
-
-    <section id="start">
-      <h2>Start in three commands.</h2>
       <ol class="steps">
-        <li><h3>Install</h3><p>Creates <code>.env</code>, passwords and certificates, then starts the stack.</p><pre class="cmd">sudo ./vexor install</pre></li>
-        <li><h3>Keep it healthy</h3><p>Adds the watchdog, the hourly health check, daily backups and a login summary.</p><pre class="cmd">sudo ./vexor daemon install</pre></li>
-        <li><h3>Enroll an agent</h3><p>Prints a copy-paste install command for Windows, Linux or macOS.</p><pre class="cmd">vexor agents enroll-cmd windows</pre></li>
+        <li>
+          <h3>Clone and install</h3>
+          <p>Creates <code>.env</code>, generates every password, the cluster key and the certificates, removes the demo users, and starts the stack.</p>
+          <pre class="cmd"><code>git clone https://github.com/EswaranS-06/Vexor.git
+cd Vexor &amp;&amp; sudo ./vexor install</code></pre>
+        </li>
+        <li>
+          <h3>Turn on self-healing</h3>
+          <p>Boot service, a watchdog every 5 minutes, an hourly <code>doctor --fix</code>, daily backups and maintenance.</p>
+          <pre class="cmd"><code>sudo ./vexor daemon install</code></pre>
+        </li>
+        <li>
+          <h3>Add what your SOC needs</h3>
+          <p>Each one has its own status, test and day-to-day commands. The simulator's <code>.env + commands</code> tab writes these for your pick.</p>
+          <pre class="cmd"><code>vexor soc both
+vexor suricata enable &amp;&amp; vexor suricata test
+vexor n8n enable &amp;&amp; vexor n8n connect &amp;&amp; vexor n8n workflow</code></pre>
+        </li>
       </ol>
+    </section>
+
+    <!-- COMMANDS (live from VEXOR.md) -->
+    <section class="commands" id="commands" aria-labelledby="commands-title">
+      <div class="section-head">
+        <h2 id="commands-title">Every command</h2>
+        <p>Loaded from <a href="https://github.com/EswaranS-06/Vexor/blob/main/VEXOR.md">VEXOR.md</a> on <code>main</code>. Filter, or press <kbd><span data-mod>Ctrl</span> K</kbd> anywhere.</p>
+      </div>
+      <div class="cmdref">
+        <div class="cmdref__bar">
+          <label class="search">
+            <span class="visually-hidden">Filter commands</span>
+            <input type="search" placeholder="Filter: n8n, test, backup…" data-cmd-filter autocomplete="off" spellcheck="false">
+          </label>
+          <div class="chips" data-cmd-groups role="group" aria-label="Command groups"></div>
+        </div>
+        <div class="cmdref__list" data-cmd-list>
+          <p class="cmdref__status" role="status">Loading VEXOR.md…</p>
+        </div>
+      </div>
     </section>
   </main>
 
-  <footer>
-    <span>Vexor is MIT licensed. Wazuh, Elastic and the bundled tools belong to their authors.</span>
-    <a href="https://github.com/EswaranS-06/Vexor">github.com/EswaranS-06/Vexor</a>
+  <footer class="foot">
+    <p><span class="wordmark wordmark--sm">vexor</span> · MIT · <a href="https://github.com/EswaranS-06/Vexor">github.com/EswaranS-06/Vexor</a> · <span data-foot-version>v1.2</span></p>
   </footer>
-</div>
 
-<script>
-(function () {
-  // ---- terminal: one orchestrated replay of a real doctor --fix run
-  var lines = [
-    ["p", "$ vexor doctor --fix"],
-    ["h", "==> Host"],
-    ["ok", "  ✔ docker daemon running (29.8.0)"],
-    ["ok", "  ✔ vm.max_map_count = 262144"],
-    ["h", "==> Configuration"],
-    ["ok", "  ✔ .env has no duplicate keys"],
-    ["ok", "  ✔ ports: agents + dashboard go through nginx"],
-    ["h", "==> Indexer"],
-    ["bad", "  ✘ demo users log in with public default passwords:"],
-    ["bad", "    kibanaro logstash readall snapshotrestore"],
-    ["fix", "      fixing: remove the OpenSearch demo users"],
-    ["ok", "  ✔ demo users removed"],
-    ["ok", "  ✔ cluster green, 1 nodes"],
-    ["h", "==> ELK (SOC=both, Elastic 9.5.4)"],
-    ["ok", "  ✔ Logstash pipeline running (818 events in)"],
-    ["ok", "  ✔ Kibana https://soc.example:55601 available"],
-    ["dim", ""],
-    ["ok", "  58 passed, 0 warnings, 0 failed"]
-  ];
-  var screen = document.getElementById("screen");
-  function add(cls, text) {
-    var d = document.createElement("div");
-    d.className = "ln " + cls; d.textContent = text; screen.appendChild(d);
-  }
-  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  if (reduce) {
-    lines.forEach(function (l) { add(l[0], l[1]); });
-  } else {
-    var i = 0;
-    var cursor = document.createElement("span"); cursor.className = "cursor";
-    (function next() {
-      if (i >= lines.length) { screen.lastChild.appendChild(cursor); return; }
-      var l = lines[i++]; add(l[0], l[1]);
-      var pause = l[0] === "p" ? 650 : l[0] === "fix" ? 900 : l[0] === "bad" ? 420 : 170;
-      setTimeout(next, pause);
-    })();
-  }
-
-  // ---- copy the install command
-  var copyBtn = document.getElementById("copy");
-  copyBtn.addEventListener("click", function () {
-    var text = document.getElementById("cmd").textContent;
-    var done = function () { copyBtn.textContent = "Copied"; setTimeout(function () { copyBtn.textContent = "Copy"; }, 1600); };
-    if (navigator.clipboard) { navigator.clipboard.writeText(text).then(done, function () { copyBtn.textContent = "Select and copy"; }); }
-  });
-
-  // ---- SOC / node type chooser (values mirror .env.example and vexor's RAM guidance)
-  var state = { soc: "wazuh", node: "single" };
-  var wazuh = {
-    single: [["wazuh.master", "agents, API, rules"], ["wazuh1.indexer", "alert store"]],
-    multi: [["wazuh.master", "agents, API, rules"], ["wazuh.worker", "analysis (1–3 workers)"],
-            ["wazuh1-3.indexer", "replicated alert store"]]
-  };
-  var common = [["wazuh.dashboard", "https :8080"], ["nginx", "agents :1514, every UI"]];
-  var elk = [["elasticsearch", "127.0.0.1:59200"], ["logstash", "beats :55044"], ["kibana", "https :55601"]];
-  var copy = {
-    wazuh: ["Wazuh only", "Agents enroll on 1515 and send to 1514; nginx balances them over the managers."],
-    elk: ["Elastic Stack only", "Wazuh is paused with its data and agent keys kept. Sensors and Beats feed Logstash."],
-    both: ["Wazuh and the Elastic Stack", "Logstash copies every Wazuh alert into Elasticsearch, so Kibana and the Wazuh dashboard show the same alerts."]
-  };
-  function ram() {
-    var base = state.node === "single" ? 8 : 16;
-    if (state.soc === "elk") base = 2;
-    if (state.soc !== "wazuh") base += 4;
-    return base + " GB";
-  }
-  function render() {
-    var list = [];
-    if (state.soc !== "elk") { list = list.concat(wazuh[state.node], common); } else { list.push(["nginx", "every UI"]); }
-    if (state.soc !== "wazuh") list = list.concat(elk);
-    document.getElementById("r-title").textContent = copy[state.soc][0] + (state.soc !== "elk" ? ", " + state.node + " node" : "");
-    document.getElementById("r-sub").textContent = copy[state.soc][1];
-    var ul = document.getElementById("r-svc"); ul.innerHTML = "";
-    list.forEach(function (s) {
-      var li = document.createElement("li");
-      var n = document.createElement("span"); n.className = "n"; n.textContent = s[0];
-      var r = document.createElement("span"); r.className = "r"; r.textContent = s[1];
-      li.appendChild(n); li.appendChild(r); ul.appendChild(li);
-    });
-    document.getElementById("r-ram").textContent = ram();
-    document.getElementById("envline").innerHTML = "SOC=<b>" + state.soc + "</b><br>NODE_TYPE=<b>" + state.node +
-      "</b><br><span>$ vexor soc " + state.soc + (state.soc !== "elk" ? "<br>$ vexor node-type " + state.node : "") + "</span>";
-    document.querySelectorAll("[data-node]").forEach(function (b) { b.disabled = state.soc === "elk"; b.style.opacity = state.soc === "elk" ? 0.45 : 1; });
-  }
-  function bind(attr) {
-    document.querySelectorAll("[data-" + attr + "]").forEach(function (b) {
-      b.addEventListener("click", function () {
-        state[attr] = b.getAttribute("data-" + attr);
-        document.querySelectorAll("[data-" + attr + "]").forEach(function (o) { o.setAttribute("aria-pressed", o === b ? "true" : "false"); });
-        render();
-      });
-    });
-  }
-  bind("soc"); bind("node"); render();
-})();
-</script>
+  <!-- command palette -->
+  <div class="palette" data-palette hidden>
+    <div class="palette__backdrop" data-palette-close></div>
+    <div class="palette__box" role="dialog" aria-modal="true" aria-label="Command palette">
+      <input class="palette__input" type="text" placeholder="Search commands and actions" aria-label="Search" data-palette-input autocomplete="off" spellcheck="false" role="combobox" aria-expanded="true" aria-controls="palette-list">
+      <ul class="palette__list" id="palette-list" role="listbox" data-palette-list></ul>
+      <p class="palette__hint"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>Enter</kbd> run or copy · <kbd>Esc</kbd> close</p>
+    </div>
+  </div>
+  <div class="toast" data-toast role="status" aria-live="polite"></div>
 </body>
 </html>

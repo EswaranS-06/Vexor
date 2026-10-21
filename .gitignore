@@ -19,3 +19,7 @@ _src/
 _live/
 *.tgz
 _stage/
+
+# design skills used to build docs/ (local only)
+skills/
+.hallmark/

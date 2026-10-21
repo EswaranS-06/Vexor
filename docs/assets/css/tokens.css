@@ -1,0 +1,91 @@
+/* Hallmark · genre: modern-minimal · macrostructure: Workbench (dev-tool / CLI) · theme: Cobalt
+ * tone: technical · anchor hue: cobalt 256 · enrichment: Tier A (live simulator, hand-built SVG)
+ * nav: bordered bar + ⌘K palette · footer: Ft2 inline single line
+ * status palette for data-dense panels after the Ant design skill (success / warning / danger)
+ * Hallmark · pre-emit critique: P5 H4 E4 S5 R4 V5
+ */
+:root {
+  /* paper + ink (Cobalt) */
+  --color-paper:      oklch(98.5% 0.004 250);
+  --color-paper-2:    oklch(96.5% 0.005 252);
+  --color-paper-3:    oklch(94%   0.006 254);
+  --color-rule:       oklch(91%   0.008 255);
+  --color-rule-2:     oklch(83%   0.011 255);
+  --color-muted:      oklch(52%   0.013 255);
+  --color-neutral:    oklch(46%   0.015 255);
+  --color-ink-2:      oklch(34%   0.018 257);
+  --color-ink:        oklch(24%   0.020 258);
+  --color-accent:     oklch(58%   0.20  256);
+  --color-accent-2:   oklch(52%   0.20  257);
+  --color-accent-soft: oklch(93%  0.04  256);
+  --color-accent-ink: oklch(99%   0.004 256);
+  --color-focus:      oklch(58%   0.20  256);
+
+  /* surfaces with alpha */
+  --color-nav-glass: oklch(98.5% 0.004 250 / 0.86);
+  --color-scrim:     oklch(24% 0.02 258 / 0.35);
+  --shadow-card:     0 1px 2px oklch(24% 0.02 258 / 0.06);
+  --shadow-pop:      0 18px 48px oklch(24% 0.02 258 / 0.18);
+
+  /* the one dark band (graphite) */
+  --color-graphite:   oklch(22%   0.016 260);
+  --color-graphite-2: oklch(26%   0.018 260);
+  --color-graphite-3: oklch(31%   0.020 260);
+  --color-graphite-rule: oklch(36% 0.02 260);
+  --color-on-graphite:   oklch(93% 0.008 255);
+  --color-on-graphite-2: oklch(74% 0.014 255);
+  --color-on-graphite-3: oklch(60% 0.016 255);
+  --color-accent-on-dark: oklch(70% 0.17 256);
+
+  /* status (Ant: success / warning / danger), tuned for both grounds */
+  --color-ok:        oklch(56% 0.14 150);
+  --color-ok-dark:   oklch(74% 0.15 150);
+  --color-warn:      oklch(64% 0.15 70);
+  --color-warn-dark: oklch(80% 0.14 75);
+  --color-bad:       oklch(55% 0.19 27);
+  --color-bad-dark:  oklch(70% 0.17 27);
+
+  /* type */
+  --font-display: "Space Grotesk", "Inter Tight", ui-sans-serif, system-ui, sans-serif;
+  --font-body:    "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono:    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --text-display:   clamp(2.5rem, 4.5vw + 0.75rem, 4.5rem);
+  --text-display-s: clamp(1.85rem, 3vw + 0.5rem, 2.75rem);
+  --text-xl:  1.25rem;
+  --text-lg:  1.125rem;
+  --text-md:  1rem;
+  --text-sm:  0.875rem;
+  --text-xs:  0.75rem;
+  --tracking-display: -0.03em;
+  --tracking-tight:   -0.015em;
+  --tracking-label:   0.06em;
+
+  /* space (4 pt) */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --space-8: 4rem;
+  --space-9: 6rem;
+  --section-gap: 7rem;
+
+  /* shape */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --rule-w: 1px;
+  --measure: 62ch;
+  --page-max: 76rem;
+
+  /* motion */
+  --ease-out:    cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in:     cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-micro: 120ms;
+  --dur-short: 220ms;
+  --dur-long:  420ms;
+}

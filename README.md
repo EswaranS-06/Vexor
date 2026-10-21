@@ -376,7 +376,7 @@ Vexor/
 │   ├── wazuh_indexer/            # opensearch.yml per node + internal users
 │   ├── wazuh_dashboard/          # dashboard config + Wazuh API connection
 │   └── nginx/nginx.conf.tpl      # the template nginx.conf is rendered from
-├── docs/index.html               # landing page (GitHub Pages)
+├── docs/                         # landing page: index.html + assets/ (GitHub Pages, no build step)
 ├── .github/workflows/            # ci.yml, pages.yml
 ├── .gitleaks.toml                # secret-scan settings used by CI
 └── README.md · VEXOR.md · LICENSE
