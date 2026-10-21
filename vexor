@@ -4345,11 +4345,19 @@ n8n_test() {                   # vexor n8n test [--level N] [--srcip IP]: a fake
   nonce="vexor-test-$(date +%s)-$$"
   body="$(printf '{"timestamp":"%s","rule":{"level":%s,"id":"100000","description":"Vexor test alert","groups":["vexor","test"]},"agent":{"id":"000","name":"vexor-test"},"manager":{"name":"vexor-test"},"id":"%s","full_log":"vexor n8n test %s","location":"vexor","data":{"srcip":"%s"}}' \
     "$(date -u +%Y-%m-%dT%H:%M:%S.000+0000)" "$level" "$nonce" "$nonce" "$srcip")"
-  # posted from inside the n8n container: the request reaches the webhook over the stack network, like a manager's
-  res="$(dc exec -T -e "VEXOR_URL=$url" -e "VEXOR_TOKEN=$tok" -e "VEXOR_BODY=$body" n8n node -e '
+  # posted from inside the n8n container: the request reaches the webhook over the stack network, like a manager's.
+  # Right after a restart (vexor n8n workflow restarts n8n) n8n answers /healthz before it has registered the
+  # published webhooks, so 404 / no answer is retried for up to 45 s. Neither starts an execution, so no double alert.
+  local post_end=$((SECONDS + 45)) waited=0
+  while :; do
+    res="$(dc exec -T -e "VEXOR_URL=$url" -e "VEXOR_TOKEN=$tok" -e "VEXOR_BODY=$body" n8n node -e '
 fetch(process.env.VEXOR_URL, {method: "POST", headers: {"Content-Type": "application/json", "X-Vexor-Token": process.env.VEXOR_TOKEN}, body: process.env.VEXOR_BODY})
   .then(async (r) => console.log(r.status + " " + (await r.text()).slice(0, 200).replace(/\s+/g, " ")), (e) => console.log("0 " + String(e.cause || e)));' 2>/dev/null)"
-  code="${res%% *}"
+    code="${res%% *}"
+    [[ "$code" =~ ^(404|0|)$ ]] && [ "$SECONDS" -lt "$post_end" ] || break
+    [ "$waited" = 1 ] || say "n8n has not registered the webhook yet (just restarted?) - retrying for up to 45 s"
+    waited=1; sleep 3
+  done
   case "$code" in
     2??) ;;
     404) die "the workflow is not published at $url (HTTP 404) - vexor n8n workflow   (imports and publishes it)" ;;
@@ -5980,7 +5988,10 @@ migrate_remove_old() {         # migrate_remove_old <from> <to>: old volumes wit
   [ ${#keep[@]} -gt 0 ] && warn "kept ${#keep[@]} old volume(s) that are in use or differ from their copy: ${keep[*]}"
   if [ ${#rm[@]} -eq 0 ]; then [ ${#keep[@]} -eq 0 ] && rm -f "$MIGRATED_FROM_FILE"; return 0; fi
   say "${#rm[@]} old volume(s) of project $from match their copy in project $to"
-  if [ "$ASSUME_YES" = 1 ] || { [ -t 0 ] && confirm "Remove the old '$from' volumes now (keep them if you want to check the stack first)?"; }; then
+  # right after the switch (3rd arg "first") --yes does not delete them: only a person at a terminal, or a later
+  # "vexor migrate --yes" once the stack has been checked
+  if { [ "${3:-}" != first ] && [ "$ASSUME_YES" = 1 ]; } \
+     || { [ -t 0 ] && [ "$ASSUME_YES" != 1 ] && confirm "Remove the old '$from' volumes now (keep them if you want to check the stack first)?"; }; then
     docker volume rm "${rm[@]}" >/dev/null && ok "removed ${#rm[@]} old volume(s)"
     [ ${#keep[@]} -eq 0 ] && rm -f "$MIGRATED_FROM_FILE"
   else
@@ -6040,7 +6051,7 @@ cmd_migrate() {
       QUIET=1 cmd_start || warn "start reported a problem - see: vexor doctor"
     else say "the stack was not running - start it with: vexor start"; fi
     hdr "Old volumes"
-    migrate_remove_old "$from" "$to"
+    migrate_remove_old "$from" "$to" first
   fi
   hdr "Old Shuffle images"
   migrate_shuffle_images
@@ -6439,7 +6450,8 @@ cmd_json() {                   # machine-readable state for the console (and scr
         "$(env_def WORKER_COUNT 1)" "$(indexer_count 2>/dev/null)" "$(public_host)" "$(layout_desc 2>/dev/null)" \
         "$(enabled_services | tr '\n' ' ')" "$tools" "$(cat "$STATE_DIR/health.last" 2>/dev/null)" "$(docker_root)" \
         "$(disk_pct "$(docker_root)")" "$(n8n_hook)" "$(n8n_level)" "$(reminders_due | tr '\n' $'\x1e')" \
-        "$( [ -f "$STATE_DIR/stopped" ] && echo 1 || echo 0)" "$(printf '%s\x1e' "${urls[@]}")" <<'PY'
+        "$( [ -f "$STATE_DIR/stopped" ] && echo 1 || echo 0)" "$(printf '%s\x1e' "${urls[@]}")" \
+        "$(project)" "$(project_is_legacy && echo 1 || echo 0)" <<'PY'
 import json, sys
 a = sys.argv[1:]
 hl = a[11].split("|")
@@ -6451,7 +6463,8 @@ print(json.dumps({
     "workers": a[5], "indexers": a[6], "public_host": a[7], "layout": a[8],
     "services": a[9].split(), "tools": {t: True for t in a[10].split()}, "health_last": health,
     "disk": {"path": a[12], "pct": int(a[13]) if a[13].isdigit() else None},
-    "n8n": {"hook": a[14], "level": a[15]}, "reminders": rem, "stopped": a[17] == "1", "urls": urls}))
+    "n8n": {"hook": a[14], "level": a[15]}, "reminders": rem, "stopped": a[17] == "1", "urls": urls,
+    "project": a[19], "legacy_project": a[20] == "1"}))
 PY
       ;;
     volumes)
