@@ -57,7 +57,7 @@ Around these, `vexor` handles certificates (local CA, your own, or Let's Encrypt
 | OS | Linux with systemd (tested on Ubuntu 24.04) |
 | Docker | Docker Engine 24 or later with the Compose v2 plugin |
 | RAM | `SOC=wazuh`: 8 GB (single) or 16 GB (multi). `SOC=both`: add about 4 GB. `SOC=elk`: about 6 GB. Each tool: 0.3–1 GB. |
-| Disk | 100 GB or more for the Docker data root. The Wazuh vulnerability feed alone needs about 13 GB per manager; `WAZUH_VULN_DETECTION=false` turns it off. `vexor install` and `vexor doctor` check every disk Docker uses (data root, volumes, image store, backups, the checkout), not only one. |
+| Disk | 100 GB or more for the Docker data root. Vulnerability detection is off by default: its CVE feed needs about 13 GB per manager (in the `*-wazuh-queue` volume). `WAZUH_VULN_DETECTION=true` turns it on; turning it off again deletes the downloaded feed, and `vexor doctor --fix` removes a leftover one. `vexor install` and `vexor doctor` check every disk Docker uses (data root, volumes, image store, backups, the checkout), not only one. |
 | Packages | `python3`, `openssl`, `curl`, `ss`, `flock` (`apt install python3 openssl curl iproute2 util-linux`) |
 | Ports | Wazuh: 8080, 1514, 1515, 514/udp, 55000. ELK and tools: their 5XXXX ports from `.env`. |
 

@@ -51,7 +51,7 @@ When `install` finds an earlier setup, it asks whether to reuse it or start clea
 
 ## Change management
 
-Disk settings: `DISK_WARN_PCT` (85) and `DISK_FAIL_PCT` (95) are the `doctor` limits for every disk Docker uses. `vexor install` warns below `DISK_WARN_FREE_GB` (15) and refuses below `DISK_MIN_FREE_GB` (5) free space on any of them; `vexor install --force` installs anyway. `WAZUH_VULN_DETECTION=false` switches the Wazuh vulnerability feed off in every manager (it needs about 13 GB per manager); `vexor config apply` recreates the managers. Data already downloaded stays until you remove the manager volumes.
+Disk settings: `DISK_WARN_PCT` (85) and `DISK_FAIL_PCT` (95) are the `doctor` limits for every disk Docker uses. `vexor install` warns below `DISK_WARN_FREE_GB` (15) and refuses below `DISK_MIN_FREE_GB` (5) free space on any of them; `vexor install --force` installs anyway. `WAZUH_VULN_DETECTION` (default `false`) switches Wazuh vulnerability detection in every manager; its CVE feed needs about 13 GB per manager in the `*-wazuh-queue` volume. `vexor config apply` recreates the managers; switching it off also deletes the downloaded feed (`/var/ossec/queue/vd`), and `vexor doctor --fix` removes one left from earlier.
 
 After editing `.env`: `vexor config validate`, then `vexor config apply`, then `vexor doctor`. Never use `down -v` or `reset` to apply settings, because they delete the data volumes.
 

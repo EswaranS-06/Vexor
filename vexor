@@ -294,7 +294,7 @@ DISK_WARN_PCT=85               # doctor/watchdog warn above this disk usage (ind
 DISK_FAIL_PCT=95               # doctor fails above this disk usage on any disk Docker uses (indexers go read-only)
 DISK_WARN_FREE_GB=15           # install warns when a disk Docker uses has less free space than this
 DISK_MIN_FREE_GB=5             # install refuses below this free space (override: vexor install --force)
-WAZUH_VULN_DETECTION=true      # false = turn the Wazuh vulnerability feed off in every manager (it needs about 13 GB per manager)
+WAZUH_VULN_DETECTION=false     # true = Wazuh vulnerability detection in every manager (its CVE feed needs about 13 GB of disk per manager)
 WATCHDOG_AUTOHEAL=yes          # watchdog restarts stopped containers / clears read-only index blocks
 BACKUP_TIME=01:30              # daily backup time (systemd timer, vexor daemon install)
 MAINT_TIME=02:15               # daily maintenance time: log pruning, retention, cert renewal
@@ -1492,6 +1492,13 @@ cmd_doctor() {
         d_warn "$svc runs an older ossec.conf than config/wazuh_cluster (edits not loaded)" "vexor restart $svc  (recreates it)"
         d_fix "recreate $svc to load its config" && dc_restart "$svc" >/dev/null 2>&1
       else d_pass "$svc runs the current ossec.conf"; fi
+      if ! vuln_on; then                       # detection off, but an earlier feed still fills the queue volume
+        local vb; vb="$(vuln_feed_bytes "$svc")"
+        if [ "${vb:-0}" -gt 104857600 ]; then
+          d_warn "$svc keeps a $((vb / 1073741824)) GB vulnerability feed although WAZUH_VULN_DETECTION=false" "vexor doctor --fix  (deletes /var/ossec/queue/vd)"
+          d_fix "delete the unused vulnerability feed in $svc" && dc exec -T "$svc" rm -rf /var/ossec/queue/vd /var/ossec/queue/vd_updater >/dev/null 2>&1
+        fi
+      fi
       if dc exec -T "$svc" filebeat test output >/dev/null 2>&1; then d_pass "$svc filebeat -> indexer OK"
       else d_fail "$svc filebeat cannot reach the indexer (alerts not shipped)" "vexor exec $(echo "$svc") filebeat test output"
            d_fix "restart $svc" && dc_restart "$svc"; fi
@@ -3503,8 +3510,22 @@ if s != o:
     print("changed")
 PY
 }
+vuln_on() { [[ "$(env_def WAZUH_VULN_DETECTION false)" =~ ^(true|yes|on|1)$ ]]; }
+vuln_feed_bytes() {            # vuln_feed_bytes <manager>: bytes of the downloaded CVE feed in its queue volume
+  dc exec -T "$1" sh -c 'du -sb /var/ossec/queue/vd /var/ossec/queue/vd_updater 2>/dev/null | awk "{s+=\$1} END {print s+0}"' 2>/dev/null | tr -dc 0-9
+}
+vuln_feed_clear() {            # detection off: delete the feed it downloaded (13 GB or so per manager); turning it on downloads it again
+  local m b total=0
+  for m in $(enabled_managers); do
+    is_running "$m" || continue
+    b="$(vuln_feed_bytes "$m")"; [ "${b:-0}" -gt 0 ] || continue
+    dc exec -T "$m" rm -rf /var/ossec/queue/vd /var/ossec/queue/vd_updater >/dev/null 2>&1 && total=$((total + b))
+  done
+  [ "$total" -gt 0 ] && ok "vulnerability feed removed from the managers ($((total / 1048576)) MB freed)"
+  return 0
+}
 sync_vuln_detection() {        # WAZUH_VULN_DETECTION -> <enabled> of <vulnerability-detection> in every manager ossec.conf; prints "changed"
-  python3 -I - "$(env_def WAZUH_VULN_DETECTION true)" "$CLUSTER_DIR"/wazuh_*.conf <<'PY'
+  python3 -I - "$(env_def WAZUH_VULN_DETECTION false)" "$CLUSTER_DIR"/wazuh_*.conf <<'PY'
 import re, sys
 want = "yes" if sys.argv[1].strip().lower() in ("true", "yes", "1", "on") else "no"
 pat = re.compile(r"(<vulnerability-detection>.*?<enabled>)(yes|no)(</enabled>)", re.S)
@@ -3746,6 +3767,7 @@ tools_post() {                 # after `docker compose up`: manager reload, user
     say "recreating $again- they load the sensor log sources / n8n integration (agents reconnect by themselves)"
     dc_restart $again >/dev/null 2>&1
   fi
+  [ "${VULN_CHANGED:-0}" = 1 ] && ! vuln_on && vuln_feed_clear
   if tool_on grafana; then
     { grafana_user_exists && grafana_user_ok && ! grep -q wazuhctl_grafana "$INTERNAL_USERS"; } || grafana_indexer_user add
   elif grafana_user_exists; then
@@ -6925,7 +6947,7 @@ if any(k.endswith("_PORT") for k in keys):
 if keys & {"SURICATA", "ZEEK", "ZEEK_WAZUH_LOGS", "N8N"}:
     notes.append("tools apply also updates the master's log sources / integration, which recreates the master")
 if "WAZUH_VULN_DETECTION" in keys:
-    notes.append("WAZUH_VULN_DETECTION changes ossec.conf, which recreates every manager (existing vulnerability data stays on disk until the volume is removed)")
+    notes.append("WAZUH_VULN_DETECTION changes ossec.conf, which recreates every manager (turning it off also deletes the downloaded CVE feed; on downloads it again, about 13 GB per manager)")
 orph = []
 for line in open(orphans, errors="replace"):
     v, _, b = line.rstrip("\n").partition("\t")
