@@ -92,7 +92,7 @@ vexor soc both                 # Elasticsearch + Logstash + Kibana next to Wazuh
 vexor n8n enable               # then open https://<host>:55678 and create the owner account
 vexor n8n connect              # alerts of level 7+ go to n8n
 vexor n8n workflow             # import + publish the "Vexor - SOC alerts" starter workflow
-vexor n8n test                 # send a test alert through the real path
+vexor n8n test                 # fake alert through the published workflow; shows which steps ran
 ```
 
 Enroll an agent and remove the browser certificate warning:
@@ -213,11 +213,13 @@ Each step is skipped when its setting is empty. The credentials (Wazuh API, Elas
 ```bash
 vexor n8n                        # owner account, forwarding per manager, webhook registered, errors
 vexor n8n connect --level 10     # change the threshold
-vexor n8n test                   # runs the real integration script with a test alert
+vexor n8n test                   # fake alert through the published workflow; shows which steps ran
 vexor n8n backup                 # export workflows + credentials (credentials stay encrypted)
 ```
 
 n8n has no account until someone opens it: the first visitor becomes the owner, so open it right after enabling it.
+
+`vexor n8n test [--level N] [--srcip IP]` posts a fake alert (default level 12, source 192.0.2.10) from inside the n8n container with the `X-Vexor-Token`, then reads the run for up to 40 seconds and prints one line per workflow step: ✔ ran, – not reached, ✘ error. It tells you when the workflow is not published or when it checks another token. With `N8N_AUTO_BLOCK=approve` the test also sends an approval request to chat; nothing is blocked unless someone opens the link.
 
 ### Suricata
 
