@@ -4820,7 +4820,7 @@ _vexor() {
   local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}" words
   local svcs="master worker worker2 worker3 indexer1 indexer2 indexer3 dashboard nginx managers indexers"
   if [ "$COMP_CWORD" -eq 1 ]; then
-    words="install info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console plan notify tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
+    words="install info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console plan notify login tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
   else
     case "$cmd" in
       start|stop|restart|shell|exec) words="$svcs" ;;
@@ -4828,6 +4828,7 @@ _vexor() {
       config)  words="show get set edit validate plan apply --show-secrets" ;;
       plan)    words="--json" ;;
       notify)  words="status test send fail warn ok info" ;;
+      login)   words="dashboard indexer api enroll kibana elasticsearch logstash grafana portainer n8n console wazuh elk --json" ;;
       update)  words="check apply rollback images latest --no-backup --force" ;;
       cert)    words="status create export-ca serve-ca import letsencrypt renew use-default internal-regen --force --email --staging --dns" ;;
       passwd)  words="admin kibanaserver api --generate" ;;
@@ -5063,6 +5064,86 @@ if nginx_lines:
     print(f"  nginx.conf: {len(nginx_lines)} changed lines (reload)")
 for n in notes:
     print(f"  → {n}")
+PY
+}
+
+# ============================================================== login: every user + password Vexor manages
+# vexor login [service|container ...] [--json]   (root only - prints secrets; also on the console's Logins page)
+cmd_login() {
+  local json=0 a; local -a want=()
+  for a in "$@"; do [ "$a" = --json ] && json=1 || want+=("$a"); done
+  local h; h="$(public_host)"
+  local on_w=0 on_e=0; soc_wazuh && on_w=1; soc_elk && on_e=1
+  python3 -I - "$json" "$h" "$on_w" "$on_e" "$(enabled_tools | tr '\n' ' ')" "$(console_on && echo 1 || echo 0)" "$ENV_FILE" "${want[@]}" <<'PY'
+import json, re, sys
+as_json, host, on_w, on_e, tools, con, envf, *want = sys.argv[1:]
+on_w, on_e, con, tools = on_w == "1", on_e == "1", con == "1", set(tools.split())
+env = {}
+for line in open(envf, errors="replace"):
+    m = re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$", line.rstrip("\n"))
+    if m:
+        v = m.group(2); c = re.search(r"\s+#", v)
+        env[m.group(1)] = (v[: c.start()] if c and not v.startswith("#") else v).strip().strip('"').strip("'")
+g = lambda k, d="": env.get(k) or d
+pw = lambda k: "" if g(k) in ("", "CHANGE_ME") else g(k)
+# id, service (container), name, url, user, password key, enabled, note
+E = [
+    ("dashboard", "wazuh.dashboard", "Wazuh dashboard", f"https://{host}:{g('PROXY_PORT', '8080')}", g("INDEXER_USERNAME", "admin"), "INDEXER_PASSWORD", on_w, "same user as the indexer admin"),
+    ("indexer", "wazuh1.indexer", "Wazuh indexer API", f"https://127.0.0.1:{g('INDEXER_HOST_PORT', '9200')}", g("INDEXER_USERNAME", "admin"), "INDEXER_PASSWORD", on_w, "bound to INDEXER_BIND (this host only by default)"),
+    ("kibanaserver", "wazuh.dashboard", "Dashboard -> indexer (internal)", "", g("DASHBOARD_USERNAME", "kibanaserver"), "DASHBOARD_PASSWORD", on_w, "used by the dashboard container; change with vexor passwd kibanaserver"),
+    ("api", "wazuh.master", "Wazuh API", f"https://{host}:{g('API_PORT', '55000')}", g("API_USERNAME", "wazuh-wui"), "API_PASSWORD", on_w, "POST /security/user/authenticate for a token"),
+    ("api-n8n", "wazuh.master", "Wazuh API for n8n", "https://wazuh.master:55000", g("WAZUH_N8N_USER", "vexor-n8n"), "WAZUH_N8N_PASSWORD", on_w and bool(pw("WAZUH_N8N_PASSWORD")), "least privilege: agents, active response (vexor n8n credentials)"),
+    ("enroll", "wazuh.master", "Agent enrollment", f"{host}:{g('ENROLL_PORT', '1515')}", "", "AGENT_ENROLL_PASSWORD", on_w and bool(pw("AGENT_ENROLL_PASSWORD")), "agents send it when they enroll (vexor agents enroll-cmd includes it)"),
+    ("kibana", "kibana", "Kibana", f"https://{host}:{g('KIBANA_PORT', '55601')}", "elastic", "ELASTIC_PASSWORD", on_e, "the Elastic superuser"),
+    ("elasticsearch", "elasticsearch", "Elasticsearch API", f"http://127.0.0.1:{g('ES_PORT', '59200')}", "elastic", "ELASTIC_PASSWORD", on_e, "bound to ES_BIND (this host only by default)"),
+    ("kibana_system", "kibana", "Kibana -> Elasticsearch (internal)", "", "kibana_system", "KIBANA_SYSTEM_PASSWORD", on_e, "used by the Kibana container"),
+    ("logstash", "logstash", "Logstash writer (internal)", "http://elasticsearch:9200", "vexor_logstash", "LOGSTASH_ES_PASSWORD", on_e, "can only write vexor-*"),
+    ("es-n8n", "elasticsearch", "Elasticsearch for n8n", "http://elasticsearch:9200", "vexor_n8n", "ES_N8N_PASSWORD", on_e and bool(pw("ES_N8N_PASSWORD")), "read vexor-* (vexor n8n credentials)"),
+    ("grafana", "grafana", "Grafana", f"https://{host}:{g('GRAFANA_PORT', '53000')}", "admin", "GRAFANA_ADMIN_PASSWORD", "grafana" in tools, "applied on Grafana's first start; a change made inside Grafana is not tracked"),
+    ("grafana-indexer", "grafana", "Grafana -> indexer (internal)", "https://wazuh1.indexer:9200", "grafana", "GRAFANA_INDEXER_PASSWORD", "grafana" in tools and on_w, "read-only on the Wazuh indices"),
+    ("portainer", "portainer", "Portainer", f"https://{host}:{g('PORTAINER_PORT', '59443')}", "admin", "PORTAINER_ADMIN_PASSWORD", "portainer" in tools, "applied on Portainer's first start; a change made inside Portainer is not tracked"),
+    ("n8n", "n8n", "n8n", f"https://{host}:{g('N8N_PORT', '55678')}", "(the owner you created)", "", "n8n" in tools, "n8n keeps its own accounts; lost the owner? vexor n8n reset-owner"),
+    ("n8n-token", "n8n", "n8n webhook token (X-Vexor-Token)", g("N8N_HOOK_URL"), "", "N8N_HOOK_TOKEN", "n8n" in tools and bool(pw("N8N_HOOK_TOKEN")), "sent with every alert; the starter workflow checks it"),
+    ("console", "console", "Vexor Console", f"https://{host}:{g('CONSOLE_PORT', '50443')}", g("CONSOLE_USER", "admin"), "CONSOLE_PASSWORD", con, "vexor console password --generate rotates it"),
+]
+NOLOGIN = {"nginx": "nginx has no login; it serves the UIs above", "suricata": "Suricata has no login (vexor suricata)",
+           "zeek": "Zeek has no login (vexor zeek)"}
+ALIAS = {"wazuh": "wazuh.master", "master": "wazuh.master", "manager": "wazuh.master", "workers": "wazuh.master",
+         "wazuh.worker": "wazuh.master", "wazuh2.worker": "wazuh.master", "wazuh3.worker": "wazuh.master",
+         "indexer1": "wazuh1.indexer", "wazuh2.indexer": "wazuh1.indexer", "wazuh3.indexer": "wazuh1.indexer",
+         "indexers": "wazuh1.indexer", "es": "elasticsearch", "elastic": "elasticsearch", "elk": "elk", "ui": "console"}
+rows = []
+for eid, svc, name, url, user, key, en, note in E:
+    if want:
+        hit = False
+        for w in want:
+            w = ALIAS.get(w.lower(), w.lower())
+            if w in (eid, svc, name.lower()) or (w == "elk" and svc in ("kibana", "elasticsearch", "logstash")) or (w == "wazuh" and svc.startswith("wazuh")):
+                hit = True
+        if not hit:
+            continue
+    elif not en:
+        continue
+    rows.append({"id": eid, "service": svc, "name": name, "url": url, "user": user, "password": pw(key) if key else "",
+                 "key": key, "enabled": bool(en), "note": note})
+missing = [w for w in want if not any(ALIAS.get(w.lower(), w.lower()) in (r["id"], r["service"]) or w.lower() in ("elk", "wazuh") for r in rows)]
+if as_json == "1":
+    print(json.dumps({"logins": rows, "nologin": {w: NOLOGIN[w] for w in want if w in NOLOGIN}})); sys.exit()
+if not rows and not missing:
+    print("  nothing enabled has a login"); sys.exit()
+print("==> Logins  (secrets shown - keep this output private)")
+for r in rows:
+    off = "" if r["enabled"] else "   [not running: its stack/tool is off]"
+    print(f"\n  {r['name']}{off}")
+    if r["url"]:
+        print(f"    url       {r['url']}")
+    if r["user"]:
+        print(f"    user      {r['user']}")
+    if r["key"]:
+        print(f"    password  {r['password'] or '(not generated yet - starts with the service)'}")
+    print(f"    note      {r['note']}")
+for w in missing:
+    print(f"\n  {w}: {NOLOGIN.get(w.lower(), 'no login known for this name - try: vexor login (all) or a service name from vexor status')}")
 PY
 }
 
@@ -5311,6 +5392,10 @@ ${C_BD}Certificates${C_0} (dashboard on port $(env_def PROXY_PORT 8080))
   cert use-default               back to the built-in self-signed certificate
   cert internal-regen            re-issue internal node certificates (restarts the stack)
 
+${C_BD}Logins${C_0}
+  login [service|container ..]   url, user and password of every login Vexor manages (all enabled ones without
+                                 arguments); names like wazuh.master, kibana, grafana, elk, console work. --json
+
 ${C_BD}Security${C_0}
   passwd admin|kibanaserver|api [--generate]  change a password on the running stack (+ .env)
   agents password on [pw]|off|show            require a password for agent enrollment
@@ -5386,7 +5471,7 @@ main() {
   if [ -f "$ENV_FILE" ] && [ "$(id -u)" -eq 0 ] && [[ "$cmd" != help && "$cmd" != completion ]]; then
     ensure_env_defaults >/dev/null; env_drop_legacy >/dev/null; migrate_layout
     case "$cmd" in   # action history (feeds ai-context); read-only commands are not logged
-      help|version|--version|-v|completion|status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check|wazuh|suricata|zeek|json|plan) ;;
+      help|version|--version|-v|completion|status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check|wazuh|suricata|zeek|json|plan|login|logins|creds) ;;
       doctor|troubleshoot|check) [ "${args[0]:-}" = --fix ] && echo "$(ts) doctor --fix" >> "$HISTORY_FILE" ;;
       *) mkdir -p "$STATE_DIR"; echo "$(ts) $cmd ${args[0]:-} ${args[1]:-}" | mask_secrets >> "$HISTORY_FILE" ;;
     esac
@@ -5426,6 +5511,7 @@ main() {
     console|ui)            cmd_console "${args[@]}" ;;
     plan)                  cmd_plan "${args[@]}" ;;
     notify)                cmd_notify "${args[@]}" ;;
+    login|logins|creds)    cmd_login "${args[@]}" ;;
     json)                  cmd_json "${args[@]}" ;;
     shuffle)               die "Shuffle was replaced by n8n in vexor 1.2.0 - see: vexor n8n" ;;
     tools|tool)            cmd_tools "${args[@]}" ;;

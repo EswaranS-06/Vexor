@@ -74,6 +74,7 @@ sudo ./vexor install          # creates .env, generates passwords and certificat
 sudo ./vexor daemon install   # vexor on PATH, start at boot, watchdog, health checks, backups
 vexor info --show-secrets     # URLs and logins
 vexor console password        # login for the web console
+vexor login                   # url, user and password of every login Vexor manages
 ```
 
 Open the Wazuh dashboard at `https://<host>:8080` and log in as `admin`. The first start takes 1–2 minutes. Everything below can also be done from the **Vexor Console** at `https://<host>:50443`.
@@ -251,7 +252,8 @@ A web UI for the whole stack at `https://<host>:CONSOLE_PORT` (50443), on by def
 | Ports | Every port from `.env` with what uses it and whether it listens; edit, check (range, duplicates, in use), apply |
 | Volumes | Every volume with its size and users; back up one or all, full backup, remove unused |
 | Stacks | Per stack: status, tests, alerts, n8n connect, Zeek logs, enable or disable tools, switch SOC, node type, workers |
-| Health | Doctor, doctor --fix, recent errors, AI report |
+| Health | Doctor, doctor --fix, recent errors, AI report, notifications |
+| Logins | Every login Vexor manages (url, user, password); passwords stay hidden until you show or copy one, and each reveal is audited |
 | Settings | Every `.env` value (secrets hidden), edit and apply; rotate passwords |
 | Terminal | Any `vexor` command, with suggestions and history |
 | Activity | Every command run from the console, and the audit log |

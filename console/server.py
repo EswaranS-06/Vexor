@@ -85,7 +85,7 @@ CATALOG = {
     "indexers": "danger", "update": "danger", "config": "change", "daemon": "change", "prune-logs": "change",
     "maintenance": "change", "watchdog": "change", "support-bundle": "change", "ai-context": "read",
     "indexer": "read", "api": "read", "passwd": "danger", "reset": "danger", "console": "change", "plan": "read",
-    "notify": "change",
+    "notify": "change", "login": "change",
 }
 READ_SUBS = {
     "tools": {"status", "ls", ""}, "soc": {"status", ""}, "elk": {"status", "indices", "search", "explain", ""},
@@ -346,6 +346,14 @@ def pending():
     return {"known": True, "keys": keys}
 
 
+def logins():
+    out = run_quick([str(VEXOR), "--no-color", "login", "--json"], timeout=30)
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"logins": []}
+
+
 def plan(changes):
     args = [str(VEXOR), "--no-color", "plan", "--json"] + [f"{k}={v}" for k, v in changes.items()]
     out = run_quick(args, timeout=180)
@@ -496,6 +504,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(settings())
         if p == "/api/pending":
             return self.send_json(pending())
+        if p == "/api/logins":           # list without secrets; passwords come one at a time from /reveal
+            rows = logins().get("logins", [])
+            return self.send_json([{k: v for k, v in r.items() if k != "password"} | {"hasPassword": bool(r.get("password"))} for r in rows])
         if p == "/api/catalog":
             return self.send_json({"commands": CATALOG, "read": {k: sorted(v) for k, v in READ_SUBS.items()},
                                    "danger": {k: sorted(v) for k, v in DANGER_SUBS.items()}, "blocked": sorted(BLOCKED)})
@@ -598,6 +609,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             changes = {str(k): str(v) for k, v in (data.get("changes") or {}).items()
                        if re.fullmatch(r"[A-Z][A-Z0-9_]*", str(k)) and not SECRET_RE.search(str(k))}
             return self.send_json(plan(changes))
+        if p == "/api/logins/reveal":
+            lid = str(data.get("id", ""))
+            row = next((r for r in logins().get("logins", []) if r["id"] == lid), None)
+            if not row:
+                return self.send_json({"error": "no such login"}, 404)
+            audit(s["user"], f"revealed the password of '{row['name']}' ({row['user'] or row['key']})")
+            return self.send_json({"id": lid, "password": row.get("password", "")})
         self.send_json({"error": "not found"}, 404)
 
     def apply_settings(self, s, data):

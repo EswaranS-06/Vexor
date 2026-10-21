@@ -169,3 +169,5 @@ body.has-out .app { grid-template-columns: 14rem minmax(0, 1fr) minmax(0, 32rem)
   .cards { grid-template-columns: minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; } }
+
+.secret { display: inline-block; min-width: 7rem; margin-right: var(--space-2); overflow-wrap: anywhere; }

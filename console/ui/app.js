@@ -392,7 +392,7 @@ async function vTerminal() {
     const ok = await run(c);
     if (ok) { hist.unshift(c); try { sessionStorage.setItem("vx-hist", JSON.stringify([...new Set(hist)].slice(0, 30))); } catch { /* private mode */ } drawHist(); inp.select(); }
   });
-  view().addEventListener("click", (e) => { const b = e.target.closest("[data-fill]"); if (b) { inp.value = b.dataset.fill; inp.focus(); } });
+  view().onclick = (e) => { const b = e.target.closest("[data-fill]"); if (b) { inp.value = b.dataset.fill; inp.focus(); } };
 }
 
 async function vActivity() {
@@ -409,11 +409,48 @@ async function vActivity() {
   $$("[data-job]").forEach((b) => b.addEventListener("click", () => openJob(JSON.parse(b.dataset.job))));
 }
 
+async function vLogins() {
+  setTitle("Logins");
+  loading("logins");
+  const { data: rows } = await api("/api/logins");
+  view().innerHTML = `
+    <p class="lede">Every login Vexor manages, for the stacks and tools that are on. Passwords stay hidden until you show or copy one; each one you reveal is written to the audit log. Same as <code>vexor login</code> on the host.</p>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Service</th><th>Address</th><th>User</th><th>Password</th><th>About</th></tr></thead>
+      <tbody>${rows.map((r) => `<tr>
+        <td><b>${esc(r.name)}</b><div class="muted small mono">${esc(r.service)}</div></td>
+        <td class="mono small">${r.url && /^https:\/\//.test(r.url) && !/\/\/(127\.0\.0\.1|localhost|wazuh[\w.]*|n8n|elasticsearch|kibana)[:/]/.test(r.url) ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.url)}</a>` : esc(r.url || "-")}</td>
+        <td class="mono">${esc(r.user || "-")}${r.user && !r.user.startsWith("(") ? ` <button type="button" class="link-btn small" data-copy-text="${esc(r.user)}">copy</button>` : ""}</td>
+        <td class="mono">${r.hasPassword ? `<span class="secret" data-secret="${esc(r.id)}">••••••••••</span>
+            <button type="button" class="btn btn--xs btn--ghost" data-show="${esc(r.id)}">Show</button>
+            <button type="button" class="btn btn--xs btn--ghost" data-copy-secret="${esc(r.id)}">Copy</button>` : r.key ? pill("not generated yet", "warn") : '<span class="muted">-</span>'}</td>
+        <td class="small muted">${esc(r.note)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">Nothing enabled has a login.</td></tr>'}</tbody></table></div>
+    <p class="muted small">Grafana and Portainer apply their admin password on first start only; if you changed it inside the tool, Vexor no longer knows it. n8n keeps its own accounts.</p>`;
+  const reveal = async (id) => {
+    const { status, data } = await api("/api/logins/reveal", { body: { id } });
+    if (status !== 200) { toast(data.error || "Could not read the password.", "bad"); return null; }
+    return data.password;
+  };
+  const copyText = async (t) => { try { await navigator.clipboard.writeText(t); toast("Copied."); } catch { toast("Copy is blocked here; use Show and select it.", "bad"); } };
+  view().onclick = async (e) => {
+    const sh = e.target.closest("[data-show]"), cp = e.target.closest("[data-copy-secret]"), cu = e.target.closest("[data-copy-text]");
+    if (sh) {
+      const span = $(`[data-secret="${sh.dataset.show}"]`);
+      if (sh.textContent === "Hide") { span.textContent = "••••••••••"; sh.textContent = "Show"; return; }
+      const pw = await reveal(sh.dataset.show);
+      if (pw != null) { span.textContent = pw; sh.textContent = "Hide"; setTimeout(() => { span.textContent = "••••••••••"; sh.textContent = "Show"; }, 30000); }
+    }
+    if (cp) { const pw = await reveal(cp.dataset.copySecret); if (pw != null) copyText(pw); }
+    if (cu) copyText(cu.dataset.copyText);
+  };
+}
+
 // ---------------------------------------------------------------- router
-const ROUTES = { overview: vOverview, containers: vContainers, ports: vPorts, volumes: vVolumes, stacks: vStacks, health: vHealth, settings: vSettings, terminal: vTerminal, activity: vActivity };
+const ROUTES = { overview: vOverview, containers: vContainers, ports: vPorts, volumes: vVolumes, stacks: vStacks, health: vHealth, logins: vLogins, settings: vSettings, terminal: vTerminal, activity: vActivity };
 let routing = false;
 async function route(soft = false) {
   if (routing) return;
+  if (!soft) view().onclick = null;
   const key = (location.hash || "#overview").slice(1);
   const fn = ROUTES[key] || vOverview;
   $$("[data-nav] a").forEach((a) => a.setAttribute("aria-current", a.getAttribute("href") === "#" + key ? "page" : "false"));

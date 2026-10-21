@@ -247,6 +247,12 @@ nginx serves one certificate for the Wazuh dashboard, Kibana and every web tool.
 
 Wazuh password policy: 8–64 characters from letters, digits and `. * + ? -`, with an upper-case letter, a lower-case letter, a digit and a symbol. Wazuh API user names are 4–64 characters.
 
+## Logins
+
+| Command | Description |
+|---|---|
+| `login [service\|container ..] [--json]` | URL, user and password of every login Vexor manages: Wazuh dashboard, indexer and API, the n8n API user, the enrollment password, Kibana and Elasticsearch (and their internal users), Grafana, Portainer, the n8n webhook token, the console. Without arguments: everything that is enabled. Names such as `wazuh.master`, `kibana`, `grafana`, `elk` or `wazuh` select a subset; nginx, Suricata and Zeek have no login. The console's Logins page shows the same, with passwords hidden until revealed. |
+
 ## Data
 
 | Command | Description |
