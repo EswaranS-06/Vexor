@@ -60,7 +60,7 @@ select.in { width: auto; cursor: pointer; }
 .login__box { width: min(24rem, 100%); display: grid; gap: var(--space-4); border: var(--rule-w) solid var(--color-rule); border-radius: var(--radius-lg); padding: var(--space-6); background: var(--color-paper); box-shadow: var(--shadow-card); }
 .login__box h1 { font-size: 1.6rem; }
 .login__box label { display: grid; gap: var(--space-1); font: 500 var(--text-xs)/1 var(--font-mono); color: var(--color-muted); text-transform: uppercase; letter-spacing: var(--tracking-label); }
-.login__box input { font: 400 var(--text-md)/1.2 var(--font-body); color: var(--color-ink); border: var(--rule-w) solid var(--color-rule-2); border-radius: var(--radius-md); padding: 0.7rem; min-height: 44px; }
+.login__box input { font: 400 var(--text-md)/1.2 var(--font-body); color: var(--color-ink); background: var(--color-paper-2); border: var(--rule-w) solid var(--color-rule-2); border-radius: var(--radius-md); padding: 0.7rem; min-height: 44px; }
 .login__err { color: var(--color-bad); min-height: 1.2em; }
 .login__hint { font-size: var(--text-xs); color: var(--color-muted); }
 
@@ -224,3 +224,65 @@ body.has-out .app { grid-template-columns: 14rem minmax(0, 1fr) minmax(0, 32rem)
 @keyframes map-flow { to { stroke-dashoffset: -13; } }
 @media (prefers-reduced-motion: reduce) { .medge.is-live .medge__line { animation: none; } }
 @media (max-width: 1080px) { .map-layout { grid-template-columns: minmax(0, 1fr); } .map-panel { position: static; } }
+
+/* ---------------------------------------------------------------- dark mode (console only; the site stays light)
+   auto follows the device; the sidebar toggle pins light or dark (html[data-theme], set by ui/theme.js) */
+:root { color-scheme: light; }
+:root[data-theme="dark"] {
+  --color-paper:   oklch(17% 0.014 260);
+  --color-paper-2: oklch(20% 0.016 260);
+  --color-paper-3: oklch(24% 0.018 260);
+  --color-rule:    oklch(30% 0.018 260);
+  --color-rule-2:  oklch(39% 0.020 258);
+  --color-muted:   oklch(68% 0.016 255);
+  --color-neutral: oklch(73% 0.014 255);
+  --color-ink-2:   oklch(86% 0.010 255);
+  --color-ink:     oklch(95% 0.006 255);
+  --color-accent:      oklch(70% 0.16 256);
+  --color-accent-2:    oklch(76% 0.14 256);
+  --color-accent-soft: oklch(30% 0.07 256);
+  --color-accent-ink:  oklch(16% 0.02 258);
+  --color-focus:       oklch(72% 0.16 256);
+  --color-ok:   oklch(74% 0.15 150);
+  --color-warn: oklch(80% 0.14 75);
+  --color-bad:  oklch(70% 0.17 27);
+  --color-graphite:      oklch(13% 0.012 260);
+  --color-graphite-2:    oklch(16% 0.014 260);
+  --color-graphite-3:    oklch(20% 0.016 260);
+  --color-graphite-rule: oklch(28% 0.018 260);
+  --color-nav-glass: oklch(17% 0.014 260 / 0.86);
+  --color-scrim:     oklch(5% 0.01 260 / 0.6);
+  --shadow-card: 0 1px 2px oklch(0% 0 0 / 0.4);
+  --shadow-pop:  0 18px 48px oklch(0% 0 0 / 0.55);
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-paper:   oklch(17% 0.014 260);
+    --color-paper-2: oklch(20% 0.016 260);
+    --color-paper-3: oklch(24% 0.018 260);
+    --color-rule:    oklch(30% 0.018 260);
+    --color-rule-2:  oklch(39% 0.020 258);
+    --color-muted:   oklch(68% 0.016 255);
+    --color-neutral: oklch(73% 0.014 255);
+    --color-ink-2:   oklch(86% 0.010 255);
+    --color-ink:     oklch(95% 0.006 255);
+    --color-accent:      oklch(70% 0.16 256);
+    --color-accent-2:    oklch(76% 0.14 256);
+    --color-accent-soft: oklch(30% 0.07 256);
+    --color-accent-ink:  oklch(16% 0.02 258);
+    --color-focus:       oklch(72% 0.16 256);
+    --color-ok:   oklch(74% 0.15 150);
+    --color-warn: oklch(80% 0.14 75);
+    --color-bad:  oklch(70% 0.17 27);
+    --color-graphite:      oklch(13% 0.012 260);
+    --color-graphite-2:    oklch(16% 0.014 260);
+    --color-graphite-3:    oklch(20% 0.016 260);
+    --color-graphite-rule: oklch(28% 0.018 260);
+    --color-nav-glass: oklch(17% 0.014 260 / 0.86);
+    --color-scrim:     oklch(5% 0.01 260 / 0.6);
+    --shadow-card: 0 1px 2px oklch(0% 0 0 / 0.4);
+    --shadow-pop:  0 18px 48px oklch(0% 0 0 / 0.55);
+    color-scheme: dark;
+  }
+}

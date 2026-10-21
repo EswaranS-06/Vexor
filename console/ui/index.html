@@ -9,6 +9,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <meta name="color-scheme" content="light dark">
+  <script src="/ui/theme.js"></script>
   <link rel="stylesheet" href="/site/css/tokens.css">
   <link rel="stylesheet" href="/ui/console.css">
   <script type="module" src="/ui/app.js"></script>
@@ -62,6 +64,7 @@
       </nav>
       <div class="side__foot">
         <p data-whoami></p>
+        <button class="link-btn" type="button" data-theme-toggle aria-label="Colour theme">Theme: auto</button>
         <button class="link-btn" type="button" data-logout>Sign out</button>
       </div>
     </aside>

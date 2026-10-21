@@ -744,11 +744,22 @@ async function vMap() {
   tick();
 }
 
+// ---------------------------------------------------------------- theme (auto -> light -> dark)
+const THEMES = ["auto", "light", "dark"];
+function themeNow() { try { return localStorage.getItem("vx-theme") || "auto"; } catch { return "auto"; } }
+function setTheme(t) {
+  if (t === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  try { if (t === "auto") localStorage.removeItem("vx-theme"); else localStorage.setItem("vx-theme", t); } catch { /* storage blocked */ }
+  $("[data-theme-toggle]").textContent = `Theme: ${t}`;
+}
+$("[data-theme-toggle]").addEventListener("click", () => setTheme(THEMES[(THEMES.indexOf(themeNow()) + 1) % THEMES.length]));
+setTheme(themeNow());
+
 // ---------------------------------------------------------------- router
 const ROUTES = { overview: vOverview, map: vMap, containers: vContainers, ports: vPorts, volumes: vVolumes, stacks: vStacks, health: vHealth, logins: vLogins, settings: vSettings, terminal: vTerminal, activity: vActivity, reset: vReset };
-let routing = false;
+let routing = false, again = null;
 async function route(soft = false) {
-  if (routing) return;
+  if (routing) { again = again === false ? false : soft; return; }   // a page change while one loads runs after it
   if (!soft) view().onclick = null;
   const key = (location.hash || "#overview").slice(1);
   const fn = ROUTES[key] || vOverview;
@@ -758,6 +769,7 @@ async function route(soft = false) {
   routing = true;
   try { await fn(); } catch (e) { if (e.message !== "login required") view().innerHTML = `<p class="err">${esc(e.message)}</p>`; }
   routing = false;
+  if (again !== null) { const s = again; again = null; route(s); }
 }
 window.addEventListener("hashchange", () => route());
 $("[data-refresh]").addEventListener("click", () => route());
