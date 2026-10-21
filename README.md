@@ -77,6 +77,8 @@ vexor console password        # login for the web console
 vexor login                   # url, user and password of every login Vexor manages
 ```
 
+On a terminal, long steps (image pulls, certificate generation, `docker compose up`) show one live progress line; `--verbose` (or `VEXOR_VERBOSE=1`) prints the full docker output instead, and CI logs get one plain line per step.
+
 If `install` finds an earlier setup (`.env`, certificates, state or volumes), it asks whether to reuse it (the default) or start clean. `sudo ./vexor install --fresh` starts clean without asking: it deletes the old containers, volumes and generated files, and keeps backups.
 
 To remove Vexor, run `sudo ./vexor uninstall`. It shows what it will remove and asks first. It removes only this project's containers, network, volumes, generated files and systemd units. `--keep-data` keeps the volumes and files, and `--images` also removes the images.
