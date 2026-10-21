@@ -275,6 +275,7 @@ Wazuh password policy: 8–64 characters from letters, digits and `. * + ? -`, w
 | `images prune [--yes]` | Remove old image versions of this stack (same repository, other tag) that no container uses. Offered at the end of `update apply`. |
 | `reset [containers\|data\|full\|purge]` | From removing containers up to a full wipe; backups are never deleted. |
 | `uninstall [--keep-data] [--images] [--yes]` | Remove Vexor: systemd units, PATH link, the containers, network and volumes of the compose project (and its `-certs` helper), and the generated files in the checkout (`.env`, `.state`, certificates, `backups/` inside the checkout, `reports/`, `tools-data/` and the like). It shows a plan and asks first. Git-tracked files and other projects are never touched. `--keep-data` keeps the volumes and files. `--images` also removes the stack's images unless another container uses them. Running it again prints "already clean". |
+| `migrate [--yes]` | Rename the Docker project `wazuh` (installs before 2.0) to `vexor`: copies and verifies every volume, removes the old containers and network, starts the stack. The old volumes are removed only after you confirm. Also removes unused old Shuffle Wazuh app images. |
 
 ## Health automation
 

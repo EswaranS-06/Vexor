@@ -150,6 +150,8 @@ Everything is decided in `.env`. Each setting has a command that changes it safe
 
 Compose files: `docker-compose.yml` (Wazuh and nginx), `docker-compose.elk.yml`, `docker-compose.tools.yml` and the generated `docker-compose.override.yml`. `COMPOSE_FILE` and `COMPOSE_PROFILES` in `.env` select what starts, so always use `vexor`, not plain `docker compose up`.
 
+The Docker Compose project is named `vexor` (`COMPOSE_PROJECT_NAME` in `.env`), so containers, volumes and the network are called `vexor-…`, `vexor_…` and `vexor_default`. Installs from before 2.0 used `wazuh` and keep that name until you run `vexor migrate`: it stops the stack, copies every `wazuh_*` volume to `vexor_*`, checks each copy, removes the old containers and network and starts the stack again. The old volumes stay until you confirm (or run `vexor migrate --yes` later), and it refuses to start without enough free disk for the copy. It also offers to remove unused images of the old Shuffle Wazuh app (`frikky/shuffle:*wazuh*`). `vexor doctor` and `vexor status` remind you while the old name is in use.
+
 ---
 
 ## The components
