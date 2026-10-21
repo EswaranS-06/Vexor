@@ -848,8 +848,17 @@ gen_internal_certs() {
   [ -f "$INT_CERT_DIR/root-ca.pem" ]
 }
 cmd_install() {
-  local a; for a in "$@"; do [ "$a" = --force ] && INSTALL_FORCE=1; done      # --force: install even when a disk is nearly full
+  local fresh_req=0 a
+  for a in "$@"; do
+    case "$a" in
+      --fresh)  fresh_req=1 ;;
+      --force)  INSTALL_FORCE=1 ;;      # install even when a disk is nearly full
+      -y|--yes) ASSUME_YES=1 ;;
+      *) die "usage: vexor install [--fresh] [--force] [--yes]" ;;
+    esac
+  done
   take_lock
+  lc_fresh "$fresh_req"
   if [ ! -f "$ENV_FILE" ]; then
     [ -f "$ROOT/.env.example" ] || die ".env and .env.example not found in $ROOT"
     cp "$ROOT/.env.example" "$ENV_FILE"; chmod 600 "$ENV_FILE"; ok "created .env from .env.example (edit it any time: vexor config edit)"
@@ -5072,6 +5081,225 @@ EOF
   say "Start fresh with: ${C_BD}vexor install${C_0}"
 }
 
+# ============================================================== uninstall / fresh install
+# Scoped to the compose projects $(project) and $(project)-certs (the certificate generator).
+# Generated files are deleted only inside the checkout, and never when git tracks them.
+LC_RUNTIME=(.env .state backups reports tools-data config/tools config/elk docker-compose.override.yml
+            config/nginx/nginx.conf config/nginx/letsencrypt config/nginx/certs config/wazuh_indexer_ssl_certs)
+LC_CONTAINERS=(); LC_NETWORKS=(); LC_VOLUMES=(); LC_IMAGES=(); LC_IMAGES_KEPT=(); LC_FILES=()
+lc_projects() { echo "$(project) $(project)-certs"; }
+lc_in() { local x="$1" y; shift; for y in "$@"; do [ "$x" = "$y" ] && return 0; done; return 1; }
+lc_git() { git -c safe.directory="$ROOT" -C "$ROOT" "$@"; }
+lc_git_mode() {                # git: spare tracked files | plain: no .git (tarball) | unsafe: .git that git cannot read
+  if [ ! -e "$ROOT/.git" ]; then echo plain
+  elif command -v git >/dev/null && lc_git rev-parse --git-dir >/dev/null 2>&1; then echo git
+  else echo unsafe; fi
+}
+lc_runtime_paths() {           # lc_runtime_paths [--keep-backups]: generated paths that exist (relative to ROOT)
+  local mode rel bd f list=(); mode="$(lc_git_mode)"
+  [ "$mode" = unsafe ] && return 0
+  for rel in "${LC_RUNTIME[@]}"; do [ "${1:-}" = --keep-backups ] && [ "$rel" = backups ] && continue; list+=("$rel"); done
+  bd="$(backup_dir)"
+  [ "${1:-}" != --keep-backups ] && [[ "$bd" == "$ROOT"/* ]] && list+=("${bd#"$ROOT"/}")
+  for f in "$ROOT"/support-*.tar.gz; do [ -e "$f" ] && list+=("${f#"$ROOT"/}"); done
+  for rel in $(printf '%s\n' "${list[@]}" | sort -u); do
+    [ -e "$ROOT/$rel" ] || [ -L "$ROOT/$rel" ] || continue
+    if [ "$mode" = git ]; then
+      if [ -n "$(lc_git ls-files -- "$rel" | head -1)" ]; then
+        lc_git ls-files -o -- "$rel"            # tracked content inside (.gitkeep): only untracked files go
+      else echo "$rel"; fi
+    elif [ -d "$ROOT/$rel" ] && [ -n "$(find "$ROOT/$rel" -name .gitkeep -print -quit)" ]; then
+      (cd "$ROOT" && find "$rel" -type f ! -name .gitkeep)
+    else echo "$rel"; fi
+  done
+}
+lc_compose_images() {          # images the stack's compose files reference
+  docker_ok || return 0
+  { [ -f "$ENV_FILE" ] && dc_all config --images 2>/dev/null
+    (cd "$ROOT" && docker compose -f "$CERTGEN_FILE" config --images 2>/dev/null); } | sort -u
+}
+lc_foreign_users() {           # names of containers outside our projects that use image $1
+  local p n; docker ps -a --filter "ancestor=$1" --format '{{.Label "com.docker.compose.project"}}|{{.Names}}' 2>/dev/null \
+    | while IFS='|' read -r p n; do lc_in "$p" "$(project)" "$(project)-certs" || printf '%s ' "$n"; done
+}
+lc_collect() {                 # lc_collect <volumes 0|1> <images 0|1> <files none|all|keep-backups>
+  local want_vols="$1" want_imgs="$2" files="$3" p c v img users
+  LC_CONTAINERS=(); LC_NETWORKS=(); LC_VOLUMES=(); LC_IMAGES=(); LC_IMAGES_KEPT=(); LC_FILES=()
+  if docker_ok; then
+    for p in $(lc_projects); do
+      mapfile -t -O "${#LC_CONTAINERS[@]}" LC_CONTAINERS < <(docker ps -aq --filter "label=com.docker.compose.project=$p" 2>/dev/null)
+      mapfile -t -O "${#LC_NETWORKS[@]}" LC_NETWORKS < <(docker network ls --filter "label=com.docker.compose.project=$p" --format '{{.Name}}' 2>/dev/null)
+      [ "$want_vols" = 1 ] && mapfile -t -O "${#LC_VOLUMES[@]}" LC_VOLUMES < <(docker volume ls -q --filter "label=com.docker.compose.project=$p" 2>/dev/null)
+    done
+    if [ "$want_vols" = 1 ]; then   # + anonymous volumes that only our containers use
+      for c in "${LC_CONTAINERS[@]}"; do
+        for v in $(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}} {{end}}{{end}}' "$c" 2>/dev/null); do
+          [[ "$v" =~ ^[0-9a-f]{64}$ ]] || continue
+          lc_in "$v" "${LC_VOLUMES[@]}" && continue
+          users="$(docker ps -a --filter "volume=$v" --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+                   | while read -r p; do lc_in "$p" "$(project)" "$(project)-certs" || echo x; done)"
+          [ -z "$users" ] && LC_VOLUMES+=("$v")
+        done
+      done
+    fi
+    if [ "$want_imgs" = 1 ]; then
+      for img in $( { lc_compose_images; for c in "${LC_CONTAINERS[@]}"; do docker inspect -f '{{.Config.Image}}' "$c" 2>/dev/null; done; } | sort -u); do
+        docker image inspect "$img" >/dev/null 2>&1 || continue
+        users="$(lc_foreign_users "$img")"
+        if [ -n "$users" ]; then LC_IMAGES_KEPT+=("$img (used by: ${users% })"); else LC_IMAGES+=("$img"); fi
+      done
+    fi
+  fi
+  case "$files" in
+    all)          mapfile -t LC_FILES < <(lc_runtime_paths) ;;
+    keep-backups) mapfile -t LC_FILES < <(lc_runtime_paths --keep-backups) ;;
+  esac
+}
+lc_units() {                   # what `daemon install` wrote: units, completion, login message, PATH link
+  local f
+  for f in "$SYSTEMD_DIR/$UNIT.service" "$SYSTEMD_DIR/$UNIT"-*.service "$SYSTEMD_DIR/$UNIT"-*.timer \
+           /etc/bash_completion.d/vexor /etc/update-motd.d/99-vexor; do [ -e "$f" ] && echo "$f"; done
+  [ "$(readlink -f /usr/local/bin/vexor 2>/dev/null)" = "$SELF" ] && echo /usr/local/bin/vexor
+  return 0
+}
+lc_size() { du -sh "$1" 2>/dev/null | cut -f1; }
+lc_count() {                   # number of things lc_collect found, + units with $1=units
+  local n=$(( ${#LC_CONTAINERS[@]} + ${#LC_NETWORKS[@]} + ${#LC_VOLUMES[@]} + ${#LC_IMAGES[@]} + ${#LC_FILES[@]} ))
+  [ "${1:-}" = units ] && n=$(( n + $(lc_units | wc -l) ))
+  echo "$n"
+}
+lc_plan() {                    # print what lc_collect found (+ units)
+  local x mp units; units="$(lc_units)"
+  if [ -n "$units" ]; then say "${C_BD}systemd units, PATH link, completion:${C_0}"; printf '%s\n' "$units" | sed 's/^/    /'; fi
+  if [ ${#LC_CONTAINERS[@]} -gt 0 ]; then
+    say "${C_BD}containers (${#LC_CONTAINERS[@]}):${C_0}"
+    for x in "${LC_CONTAINERS[@]}"; do say "  $(docker inspect -f '{{.Name}}' "$x" 2>/dev/null | sed 's#^/##')"; done
+  fi
+  if [ ${#LC_NETWORKS[@]} -gt 0 ]; then say "${C_BD}networks:${C_0}"; for x in "${LC_NETWORKS[@]}"; do say "  $x"; done; fi
+  if [ ${#LC_VOLUMES[@]} -gt 0 ]; then
+    say "${C_BD}volumes (${#LC_VOLUMES[@]}) - agents, alerts, indices, tool data:${C_0}"
+    for x in "${LC_VOLUMES[@]}"; do
+      mp="$(docker volume inspect -f '{{.Mountpoint}}' "$x" 2>/dev/null)"
+      say "  $(printf '%-56s %s' "$x" "$(lc_size "$mp")")"
+    done
+  fi
+  if [ ${#LC_IMAGES[@]} -gt 0 ]; then say "${C_BD}images:${C_0}"; for x in "${LC_IMAGES[@]}"; do say "  $x"; done; fi
+  if [ ${#LC_IMAGES_KEPT[@]} -gt 0 ]; then say "${C_BD}images kept:${C_0}"; for x in "${LC_IMAGES_KEPT[@]}"; do say "  $x"; done; fi
+  if [ ${#LC_FILES[@]} -gt 0 ]; then
+    say "${C_BD}files in $ROOT:${C_0}"
+    for x in "${LC_FILES[@]}"; do say "  $(printf '%-56s %s' "$x" "$(lc_size "$ROOT/$x")")"; done
+  fi
+  return 0
+}
+lc_remove() {                  # remove what lc_collect found (units are separate)
+  local x n
+  if [ ${#LC_CONTAINERS[@]} -gt 0 ]; then
+    n=0; for x in "${LC_CONTAINERS[@]}"; do docker rm -f "$x" >/dev/null 2>&1 && n=$((n + 1)); done
+    ok "removed $n container(s)"
+  fi
+  if [ ${#LC_NETWORKS[@]} -gt 0 ]; then
+    n=0; for x in "${LC_NETWORKS[@]}"; do if docker network rm "$x" >/dev/null 2>&1; then n=$((n + 1)); else warn "network $x not removed (in use?)"; fi; done
+    ok "removed $n network(s)"
+  fi
+  if [ ${#LC_VOLUMES[@]} -gt 0 ]; then
+    n=0; for x in "${LC_VOLUMES[@]}"; do if docker volume rm "$x" >/dev/null 2>&1; then n=$((n + 1)); else warn "volume $x not removed (in use?)"; fi; done
+    ok "removed $n volume(s)"
+  fi
+  if [ ${#LC_IMAGES[@]} -gt 0 ]; then
+    n=0
+    for x in "${LC_IMAGES[@]}"; do
+      if [ -n "$(lc_foreign_users "$x")" ]; then warn "image $x kept (used by another container now)"
+      elif docker image rm "$x" >/dev/null 2>&1; then n=$((n + 1))
+      else warn "image $x not removed"; fi
+    done
+    ok "removed $n image(s)"
+  fi
+  if [ ${#LC_FILES[@]} -gt 0 ]; then
+    for x in "${LC_FILES[@]}"; do
+      [ -n "$x" ] && [[ "$x" != /* && "$x" != *..* ]] || continue     # relative paths inside the checkout only
+      rm -rf -- "${ROOT:?}/$x"
+    done
+    ok "removed ${#LC_FILES[@]} generated file(s)/folder(s)"
+  fi
+  return 0
+}
+cmd_uninstall() {
+  local keep=0 imgs=0 a files=all bd
+  for a in "$@"; do
+    case "$a" in
+      --keep-data) keep=1 ;;
+      --images)    imgs=1 ;;
+      -y|--yes)    ASSUME_YES=1 ;;
+      *) die "usage: vexor uninstall [--keep-data] [--images] [--yes]" ;;
+    esac
+  done
+  take_lock
+  docker_ok || warn "Docker is not running: containers, networks, volumes and images are not checked"
+  if [ "$keep" = 0 ] && [ "$(lc_git_mode)" = unsafe ]; then
+    warn "$ROOT has .git but git cannot read it: generated files are kept (install git, or delete them by hand)"
+  fi
+  [ "$keep" = 1 ] && files=none
+  lc_collect "$((1 - keep))" "$imgs" "$files"
+  hdr "Uninstall Vexor (compose projects $(lc_projects | sed 's/ / and /'))"
+  if [ "$(lc_count units)" = 0 ]; then ok "nothing to remove - already clean"; return 0; fi
+  lc_plan
+  say ""
+  if [ "$keep" = 1 ]; then say "kept (--keep-data): volumes, .env, certificates, .state, backups"
+  else
+    say "${C_R}Volumes and generated files are deleted for good${C_0} (--keep-data keeps them)."
+    bd="$(backup_dir)"; [[ "$bd" == "$ROOT"/* ]] || say "kept: backups in $bd (outside the checkout)"
+  fi
+  [ "$imgs" = 1 ] || say "images are kept (--images removes them)"
+  say "never touched: other compose projects, git-tracked files, anything outside $ROOT"
+  say ""
+  confirm "Remove all of the above?" || die "Aborted"
+  hdr "Removing"
+  if [ -n "$(lc_units)" ]; then
+    daemon_uninstall
+    [ "$(readlink -f /usr/local/bin/vexor 2>/dev/null)" = "$SELF" ] && rm -f /usr/local/bin/vexor
+    rm -f /etc/bash_completion.d/vexor /etc/update-motd.d/99-vexor
+  fi
+  lc_remove
+  say ""
+  if [ "$keep" = 1 ]; then ok "uninstalled; data kept - start again with: ${C_BD}vexor install${C_0}"
+  else ok "uninstalled - reinstall any time with: ${C_BD}vexor install${C_0}"; fi
+}
+lc_existing() {                # what an earlier install left (one line each; empty = nothing)
+  local n=0 p
+  [ -f "$ENV_FILE" ] && echo ".env (passwords and settings)"
+  [ -f "$INT_CERT_DIR/root-ca.pem" ] && echo "internal certificates ($INT_CERT_DIR)"
+  [ -n "$(find "$PROXY_CERT_DIR" -type f ! -name .gitkeep -print -quit 2>/dev/null)" ] && echo "dashboard certificate ($PROXY_CERT_DIR)"
+  [ -n "$(find "$STATE_DIR" -mindepth 1 -print -quit 2>/dev/null)" ] && echo "state ($STATE_DIR)"
+  if docker_ok; then
+    for p in $(lc_projects); do n=$(( n + $(docker volume ls -q --filter "label=com.docker.compose.project=$p" 2>/dev/null | wc -l) )); done
+    [ "$n" -gt 0 ] && echo "$n Docker volume(s) of project $(project) (agents, alerts, indices)"
+  fi
+  return 0
+}
+lc_fresh() {                   # lc_fresh <0|1>: 1 = install --fresh; 0 = ask reuse/clean when a setup exists (tty only)
+  local forced="$1" found a
+  found="$(lc_existing)"
+  [ -n "$found" ] || return 0
+  if [ "$forced" = 0 ]; then
+    [ -t 0 ] && [ "$ASSUME_YES" = 0 ] || return 0           # no tty or --yes: reuse, as before
+    hdr "Existing setup found"
+    printf '%s\n' "$found" | sed 's/^/    /'
+    say "Reuse keeps passwords, certificates and data. Start clean deletes them (backups are kept)."
+    read -r -p "  [R]euse (default) / start [c]lean: " a
+    [[ "$a" =~ ^[cC] ]] || { ok "reusing the existing setup"; return 0; }
+  else
+    hdr "Fresh install: removing the existing setup"
+    printf '%s\n' "$found" | sed 's/^/    /'
+  fi
+  [ "$(lc_git_mode)" = unsafe ] && die "$ROOT has .git but git cannot read it - install git, or delete the generated files by hand"
+  # volumes go too: the indexers keep the old password hashes, which the new .env would not match
+  lc_collect 1 0 keep-backups
+  lc_plan
+  confirm_word DELETE "Deletes the containers, volumes (agents, alerts, indices) and generated files above. Backups are kept." || die "Aborted"
+  lc_remove
+  ok "clean - continuing with a new install"
+}
+
 # ============================================================== update
 latest_versions() {            # stable 4.x versions, newest first
   local out
@@ -5374,11 +5602,13 @@ _vexor() {
   local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}" words
   local svcs="master worker worker2 worker3 indexer1 indexer2 indexer3 dashboard nginx managers indexers"
   if [ "$COMP_CWORD" -eq 1 ]; then
-    words="install info config start stop restart down scale wait-ready node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console plan notify login tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes disk images reset daemon watchdog maintenance completion help"
+    words="install uninstall info config start stop restart down scale wait-ready node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console plan notify login tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes disk images reset daemon watchdog maintenance completion help"
   else
     case "$cmd" in
       start|stop|restart|shell|exec) words="$svcs" ;;
       wait-ready|wait) words="$svcs elasticsearch kibana logstash n8n grafana portainer --timeout --json" ;;
+      install) words="--fresh --force --yes" ;;
+      uninstall) words="--keep-data --images --yes" ;;
       logs)    words="$svcs ossec api cluster alerts archives errors size -f -n --since" ;;
       config)  words="show get set edit validate plan apply --show-secrets" ;;
       plan)    words="--json" ;;
@@ -5854,8 +6084,12 @@ ${C_BD}vexor${C_0} $VEXOR_VERSION - Vexor SOC stack manager: Wazuh, ELK, n8n, Su
 Layout: $(layout_desc)
 
 ${C_BD}Setup${C_0}
-  install [--force]              first-time setup: kernel, passwords, certificates, start (safe to re-run);
+  install [--fresh] [--force]    first-time setup: kernel, passwords, certificates, start (safe to re-run);
+                                 asks reuse/start clean when a setup exists, --fresh starts clean (backups kept);
                                  --force installs although a disk is nearly full
+  uninstall [--keep-data] [--images] [--yes]
+                                 remove this project's containers, network, volumes, generated files and
+                                 systemd units (plan + confirm first); --keep-data keeps volumes and files
   info [--show-secrets]          dashboard URL, login, agent ports, certificate mode
   config show|get|set|edit|validate|apply     view / change .env settings, apply them
   plan [KEY=VALUE ..] [--json]   what an apply would change: settings, containers recreated/created/removed,
@@ -6048,7 +6282,7 @@ main() {
   if [ -f "$ENV_FILE" ] && [ "$(id -u)" -eq 0 ] && [[ "$cmd" != help && "$cmd" != completion ]]; then
     ensure_env_defaults >/dev/null; env_drop_legacy >/dev/null; migrate_layout
     case "$cmd" in   # action history (feeds ai-context); read-only commands are not logged
-      help|version|--version|-v|completion|status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check|wazuh|suricata|zeek|json|plan|login|logins|creds|disk) ;;
+      help|version|--version|-v|completion|status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check|wazuh|suricata|zeek|json|plan|login|logins|creds|disk|uninstall) ;;
       doctor|troubleshoot|check) [ "${args[0]:-}" = --fix ] && echo "$(ts) doctor --fix" >> "$HISTORY_FILE" ;;
       *) mkdir -p "$STATE_DIR"; echo "$(ts) $cmd ${args[0]:-} ${args[1]:-}" | mask_secrets >> "$HISTORY_FILE" ;;
     esac
@@ -6056,6 +6290,7 @@ main() {
 
   case "$cmd" in
     install|setup)         cmd_install "${args[@]}" ;;
+    uninstall)             cmd_uninstall "${args[@]}" ;;
     info|urls)             cmd_info "${args[@]}" ;;
     config|conf)           cmd_config "${args[@]}" ;;
     start|up)              cmd_start "${args[@]}" ;;
