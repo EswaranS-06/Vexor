@@ -10,7 +10,7 @@
 # =============================================================================
 set -uo pipefail
 
-VEXOR_VERSION="1.2.0"
+VEXOR_VERSION="2.0.0-alpha.1"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 ROOT="$(dirname "$SELF")"
 ENV_FILE="$ROOT/.env"
@@ -214,6 +214,11 @@ N8N_ALERT_GROUPS=
 N8N_HOOK_TOKEN=
 WAZUH_N8N_USER=vexor-n8n
 SOC=wazuh                      # wazuh | elk | both  - switch with: vexor soc <value>
+CONSOLE=true                   # Vexor Console web UI (vexor console enable|disable)
+CONSOLE_PORT=50443             # console port (50000-59999), HTTPS with the dashboard certificate
+CONSOLE_BIND=0.0.0.0           # address the console listens on
+CONSOLE_USER=admin
+CONSOLE_PASSWORD=CHANGE_ME     # generated when the console starts (vexor console password)
 ELK_VERSION=9.5.4              # Elasticsearch / Logstash / Kibana version
 ELK_HEAP=1g                    # Elasticsearch JVM heap
 LOGSTASH_HEAP=512m
@@ -1258,6 +1263,12 @@ cmd_doctor() {
   fi
 
   [ -n "$(n8n_hook)" ] && n8n_doctor
+  if console_on && command -v systemctl >/dev/null; then
+    hdr "Console"
+    if console_answers; then d_pass "console answers on $(console_url)"
+    else d_fail "console not answering on port $(console_port)" "vexor console logs"
+         d_fix "install + restart the console service" && { rm -f "$STATE_DIR/console.fingerprint"; console_sync >/dev/null; }; fi
+  fi
 
   hdr "Logs (last 15 min)"
   local cid name cnt
@@ -1382,6 +1393,8 @@ cmd_info() {
   local tl; for tl in $(web_tools); do [ "$tl" = kibana ] && continue; printf '  %-12s %s\n' "$tl" "https://$h:$(tool_port "$tl")  ($(tool_desc "$tl"))"; done
   tool_on suricata && printf '  %-12s %s\n' "suricata" "IDS on $(sniff_iface) -> Wazuh alerts (rule groups: suricata)"
   tool_on zeek && printf '  %-12s %s\n' "zeek" "network logs on $(sniff_iface) -> Wazuh (rule groups: zeek)"
+  console_on && printf '  %-12s %s\n' "Console" "${C_BD}$(console_url)${C_0}  user $(env_def CONSOLE_USER admin) / $( [ "$show" = 1 ] && env_get CONSOLE_PASSWORD || echo '******** (--show-secrets)')"
+  return 0
 }
 cmd_config() {
   local sub="${1:-show}"; shift || true
@@ -2399,6 +2412,7 @@ gen_secret() {                 # gen_secret KEY [hex]: generate a value when it 
 }
 tools_validate_ports() {       # web tool ports: 50000-59999, unique, not used by other services/programs
   local t p seen=" $(env_def PROXY_PORT 8080) $(env_def AGENT_PORT 1514) $(env_def ENROLL_PORT 1515) $(env_def API_PORT 55000) $(indexer_port) " ok=0
+  console_on && seen+="$(console_port) "
   soc_elk && seen+="$(es_port) $(env_def LOGSTASH_BEATS_PORT 55044) "
   for t in $(web_tools); do
     p="$(tool_port "$t")"
@@ -2557,7 +2571,7 @@ sync_master_localfiles() {     # sensor logs -> master ossec.conf (localfile); p
 import re, sys
 path, sur, zeek, zlogs = sys.argv[1], sys.argv[2] == "1", sys.argv[3] == "1", [x.strip() for x in sys.argv[4].split(",") if x.strip()]
 s = open(path).read(); o = s
-s = re.sub(r"[ \t]*<!-- (?:vexor|wazuhctl):sensors:begin.*?<!-- (?:vexor|wazuhctl):sensors:end -->\n?", "", s, flags=re.S)
+pat = re.compile(r"[ \t]*<!-- (?:vexor|wazuhctl):sensors:begin.*?<!-- (?:vexor|wazuhctl):sensors:end -->\n?", re.S)
 lf = []
 if sur:   # alerts + anomalies only: stats/flow records have hundreds of fields ("Too many fields for JSON decoder")
     lf.append(("json", "/var/log/suricata/eve.json", '"event_type":"(alert|anomaly)"'))
@@ -2569,6 +2583,13 @@ if lf:
         rst = f'    <restrict type="PCRE2">{only}</restrict>\n' if only else ""
         blk += f"  <localfile>\n    <log_format>{fmt}</log_format>\n    <location>{loc}</location>\n{rst}  </localfile>\n"
     blk += "  <!-- vexor:sensors:end -->\n"
+else:
+    blk = ""
+# replace the block where it is (keeps its position next to other managed blocks); append only when missing
+if pat.search(s):
+    first = [True]
+    s = pat.sub(lambda m: (blk if first.pop() else "") if first else "", s)
+elif blk:
     s = s.replace("</ossec_config>", blk + "</ossec_config>", 1)
 if s != o:
     open(path, "w").write(s)          # in-place write keeps the bind-mounted inode
@@ -3197,6 +3218,7 @@ apply_all() {                  # the one reconcile path: render everything, pull
   elk_post
   soc_wazuh && wait_dashboard 240
   nginx_reload >/dev/null 2>&1 || true
+  console_sync || true
   return 0
 }
 cmd_elk() {
@@ -3565,9 +3587,14 @@ block = ("  <!-- vexor:n8n:begin (managed by: vexor n8n) -->\n"
 changed = False
 for f in files:
     s = open(f).read(); o = s
-    s = re.sub(r"[ \t]*<!-- (?:vexor|wazuhctl):(?:n8n|shuffle):begin.*?<!-- (?:vexor|wazuhctl):(?:n8n|shuffle):end -->\n?", "", s, flags=re.S)
-    if url:
-        s = s.replace("</ossec_config>", block + "</ossec_config>", 1)
+    s = re.sub(r"[ \t]*<!-- (?:vexor|wazuhctl):shuffle:begin.*?<!-- (?:vexor|wazuhctl):shuffle:end -->\n?", "", s, flags=re.S)
+    pat = re.compile(r"[ \t]*<!-- (?:vexor|wazuhctl):n8n:begin.*?<!-- (?:vexor|wazuhctl):n8n:end -->\n?", re.S)
+    want = block if url else ""
+    if pat.search(s):                  # replace in place: keeps its position next to the sensors block
+        first = [True]
+        s = pat.sub(lambda m: (want if first.pop() else "") if first else "", s)
+    elif want:
+        s = s.replace("</ossec_config>", want + "</ossec_config>", 1)
     if s != o:
         open(f, "w").write(s)          # in-place write keeps the bind-mounted inode
         changed = True
@@ -3916,7 +3943,7 @@ for line in sys.stdin:
     except (KeyError, ValueError):
         ts = e.get("timestamp", "")[:19]
     rows.append("%s  sev %s  %-5s %21s -> %-21s %s (sid %s)" % (ts, a.get("severity"), e.get("proto", ""),
-                "%s:%s" % (e.get("src_ip"), e.get("src_port", "")), "%s:%s" % (e.get("dest_ip"), e.get("dest_port", "")), a.get("signature"), a.get("signature_id")))
+                "%s:%s" % (e["src_ip"], e.get("src_port", "")) if e.get("src_ip") else "(non-IP)", "%s:%s" % (e["dest_ip"], e.get("dest_port", "")) if e.get("dest_ip") else "", a.get("signature"), a.get("signature_id")))
 print("\n".join(rows[-n:]) if rows else "  no alerts")' "$n" "$since"
 }
 # plain-HTTP pages whose body is "uid=0(root)..." - real traffic that matches sid 2100498 (GPL ATTACK_RESPONSE id check returned root)
@@ -4636,6 +4663,7 @@ daemon_uninstall() {
   legacy_cleanup
   rm -f /etc/update-motd.d/99-vexor
   systemctl disable "$UNIT.service" >/dev/null 2>&1      # not --now: that would stop the stack
+  systemctl disable --now "$UNIT-console.service" >/dev/null 2>&1; rm -f "$SYSTEMD_DIR/$UNIT-console.service"
   rm -f "$SYSTEMD_DIR/$UNIT.service"
   systemctl daemon-reload
   [ "$(readlink -f /usr/local/bin/vexor 2>/dev/null)" = "$SELF" ] && rm -f /usr/local/bin/vexor
@@ -4652,6 +4680,7 @@ cmd_daemon() {
       ln -sf "$SELF" /usr/local/bin/vexor
       completion_script > /etc/bash_completion.d/vexor
       systemctl daemon-reload
+      console_sync || true
       systemctl enable "$UNIT.service" >/dev/null 2>&1
       systemctl is-active -q "$UNIT.service" || systemctl start "$UNIT.service" --no-block
       local t; for t in watchdog health backup maintenance; do systemctl enable --now "$UNIT-$t.timer" >/dev/null 2>&1; done
@@ -4707,7 +4736,7 @@ _vexor() {
   local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}" words
   local svcs="master worker worker2 worker3 indexer1 indexer2 indexer3 dashboard nginx managers indexers"
   if [ "$COMP_CWORD" -eq 1 ]; then
-    words="install info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
+    words="install info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
   else
     case "$cmd" in
       start|stop|restart|shell|exec) words="$svcs" ;;
@@ -4718,6 +4747,7 @@ _vexor() {
       passwd)  words="admin kibanaserver api --generate" ;;
       agents)  words="list summary outdated remove enroll-cmd password linux rpm windows macos on off show --name --group" ;;
       wazuh)   words="status alerts logtest rules agents cluster -n --level --grep" ;;
+      console) words="status enable disable restart url password logs --generate" ;;
       n8n)     words="status enable disable connect disconnect test workflow credentials backup reset-owner logs --level --groups import file" ;;
       suricata) words="status enable disable alerts test update-rules logs -n --since" ;;
       zeek)    words="status enable disable show notices top test logs hosts ports dns conn dns http ssl ssh notice weird -n" ;;
@@ -4750,6 +4780,137 @@ cmd_completion() {
   else completion_script; fi
 }
 
+# ============================================================== console (web UI) + JSON for it
+# vexor-console.service runs console/server.py (python3 stdlib) as root on CONSOLE_BIND:CONSOLE_PORT with the
+# dashboard certificate. Every action in the UI is a `vexor` command from an allowlist (see console/server.py).
+console_on() { [[ "$(env_def CONSOLE true)" =~ ^(true|yes|on|1)$ ]]; }
+console_port() { env_def CONSOLE_PORT 50443; }
+console_url() { echo "https://$(public_host):$(console_port)"; }
+console_fingerprint() {        # restart the console only when something it reads at start changed
+  { cat "$ROOT/console/server.py" 2>/dev/null; echo "$(console_port) $(env_def CONSOLE_BIND 0.0.0.0) $(env_get PROXY_CERT) $(env_get PROXY_KEY)";
+    stat -c %Y "$ROOT/$(env_def PROXY_CERT ./config/wazuh_indexer_ssl_certs/wazuh.dashboard.pem)" 2>/dev/null; } | md5sum | cut -d' ' -f1
+}
+console_unit() {
+  cat > "$SYSTEMD_DIR/$UNIT-console.service.tmp" <<EOF
+[Unit]
+Description=Vexor Console - web UI for vexor ($ROOT)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$ROOT
+ExecStart=/usr/bin/env python3 -I $ROOT/console/server.py
+Restart=on-failure
+RestartSec=5
+# a restart must not kill a vexor command the console started (e.g. a config apply that changed CONSOLE_PORT)
+KillMode=process
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if cmp -s "$SYSTEMD_DIR/$UNIT-console.service.tmp" "$SYSTEMD_DIR/$UNIT-console.service"; then
+    rm -f "$SYSTEMD_DIR/$UNIT-console.service.tmp"; return 1
+  fi
+  mv "$SYSTEMD_DIR/$UNIT-console.service.tmp" "$SYSTEMD_DIR/$UNIT-console.service"; return 0
+}
+console_sync() {               # make the service match CONSOLE in .env (called by start/apply/daemon install)
+  command -v systemctl >/dev/null || return 0
+  [ -f "$ROOT/console/server.py" ] || return 0
+  if ! console_on; then
+    if systemctl is-enabled -q "$UNIT-console.service" 2>/dev/null || systemctl is-active -q "$UNIT-console.service" 2>/dev/null; then
+      systemctl disable --now "$UNIT-console.service" >/dev/null 2>&1; ok "console stopped (CONSOLE=false)"
+    fi
+    return 0
+  fi
+  local p; p="$(console_port)"
+  [[ "$p" =~ ^5[0-9]{4}$ ]] || { bad "CONSOLE_PORT=$p - use a port in 50000-59999"; return 1; }
+  if port_listening "$p" && ! ss -Hltnp "( sport = :$p )" 2>/dev/null | has 'python3'; then
+    bad "CONSOLE_PORT=$p is used by another program: $(ss -Hltnp "( sport = :$p )" | awk '{print $NF}' | head -1)"; return 1
+  fi
+  gen_secret CONSOLE_PASSWORD
+  local changed=0 fp; console_unit && changed=1
+  systemctl daemon-reload
+  systemctl enable "$UNIT-console.service" >/dev/null 2>&1
+  fp="$(console_fingerprint)"
+  if [ "$changed" = 1 ] || [ "$fp" != "$(cat "$STATE_DIR/console.fingerprint" 2>/dev/null)" ] || ! systemctl is-active -q "$UNIT-console.service"; then
+    systemctl restart "$UNIT-console.service" && echo "$fp" > "$STATE_DIR/console.fingerprint"
+    local i; for i in $(seq 1 20); do console_answers && break; sleep 0.5; done
+    console_answers && ok "console: $(console_url)  (user $(env_def CONSOLE_USER admin))" || bad "console did not start - vexor console logs"
+  fi
+  return 0
+}
+console_answers() { [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 4 "https://127.0.0.1:$(console_port)/api/session" 2>/dev/null)" = 200 ]; }
+cmd_console() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    status)
+      hdr "Vexor Console"
+      console_on || { warn "CONSOLE=false - turn it on: vexor console enable"; return 0; }
+      systemctl is-active -q "$UNIT-console.service" && ok "service $UNIT-console running" || bad "service $UNIT-console not running - vexor console restart"
+      console_answers && ok "answers on $(console_url)" || bad "nothing answers on port $(console_port)"
+      say "user: $(env_def CONSOLE_USER admin)   password: vexor console password"
+      say "actions are logged to $STATE_DIR/console-audit.log" ;;
+    enable|on) take_lock; env_set CONSOLE true; console_sync ;;
+    disable|off) take_lock; env_set CONSOLE false; console_sync ;;
+    restart) take_lock; rm -f "$STATE_DIR/console.fingerprint"; console_sync ;;
+    url) console_url ;;
+    password)
+      if [ "${1:-}" = "--generate" ]; then
+        env_set CONSOLE_PASSWORD "$(gen_pw)"; chmod 600 "$ENV_FILE"
+        ok "new console password: $(env_get CONSOLE_PASSWORD)   (sessions stay valid until they expire)"
+      else
+        gen_secret CONSOLE_PASSWORD >/dev/null; say "user $(env_def CONSOLE_USER admin)  password $(env_get CONSOLE_PASSWORD)"
+      fi ;;
+    logs) journalctl --no-pager -n "${1:-80}" -u "$UNIT-console.service" ;;
+    *) die "usage: vexor console [status] | enable | disable | restart | url | password [--generate] | logs [N]" ;;
+  esac
+}
+
+cmd_json() {                   # machine-readable state for the console (and scripts)
+  case "${1:-state}" in
+    state)
+      local tools="" t urls=()
+      for t in "${TOOLS[@]}"; do tool_on "$t" && tools+="$t "; done
+      soc_wazuh && urls+=("Wazuh dashboard|https://$(public_host):$(env_def PROXY_PORT 8080)")
+      soc_elk && urls+=("Kibana|https://$(public_host):$(env_def KIBANA_PORT 55601)")
+      for t in $(web_tools); do [ "$t" = kibana ] || urls+=("$t|https://$(public_host):$(tool_port "$t")"); done
+      console_on && urls+=("Console|$(console_url)")
+      python3 -I - "$VEXOR_VERSION" "$(cur_version 2>/dev/null)" "$(soc)" "$(node_type 2>/dev/null)" "$(desired_node_type 2>/dev/null)" \
+        "$(env_def WORKER_COUNT 1)" "$(indexer_count 2>/dev/null)" "$(public_host)" "$(layout_desc 2>/dev/null)" \
+        "$(enabled_services | tr '\n' ' ')" "$tools" "$(cat "$STATE_DIR/health.last" 2>/dev/null)" "$(docker_root)" \
+        "$(disk_pct "$(docker_root)")" "$(n8n_hook)" "$(n8n_level)" "$(reminders_due | tr '\n' $'\x1e')" \
+        "$( [ -f "$STATE_DIR/stopped" ] && echo 1 || echo 0)" "$(printf '%s\x1e' "${urls[@]}")" <<'PY'
+import json, sys
+a = sys.argv[1:]
+hl = a[11].split("|")
+health = {"epoch": int(hl[0]), "status": hl[1], "pass": int(hl[2]), "warn": int(hl[3]), "fail": int(hl[4])} if len(hl) >= 5 and hl[0].isdigit() else {}
+rem = [dict(zip(("msg", "cmd"), r.split("|", 1))) for r in a[16].split("\x1e") if r.strip()]
+urls = dict(u.split("|", 1) for u in a[18].split("\x1e") if "|" in u)
+print(json.dumps({
+    "vexor": a[0], "wazuh_version": a[1], "soc": a[2], "node_type": a[3], "node_type_env": a[4],
+    "workers": a[5], "indexers": a[6], "public_host": a[7], "layout": a[8],
+    "services": a[9].split(), "tools": {t: True for t in a[10].split()}, "health_last": health,
+    "disk": {"path": a[12], "pct": int(a[13]) if a[13].isdigit() else None},
+    "n8n": {"hook": a[14], "level": a[15]}, "reminders": rem, "stopped": a[17] == "1", "urls": urls}))
+PY
+      ;;
+    volumes)
+      local v mp first=1
+      printf '['
+      for v in $(project_volumes); do
+        mp="$(docker volume inspect -f '{{.Mountpoint}}' "$v" 2>/dev/null)"
+        [ "$first" = 1 ] || printf ','; first=0
+        python3 -I -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "short": sys.argv[1].split("_", 1)[-1], "bytes": int(sys.argv[2] or 0), "users": sys.argv[3].split()}), end="")' \
+          "$v" "$(du -sb "$mp" 2>/dev/null | cut -f1)" "$(vol_users "$v")"
+      done
+      printf ']\n' ;;
+    *) die "usage: vexor json state | volumes" ;;
+  esac
+}
+
 # ============================================================== help / main
 cmd_help() {
   cat <<EOF
@@ -4768,6 +4929,13 @@ ${C_BD}Run${C_0} (everything SOC and the tool flags in .env enable)
   down                           remove containers + network (volumes/data kept)
   scale <1|2|3>                  number of worker managers (multi); nginx balancer updated
   status                         containers + indexer/manager cluster, agents, dashboard, disk
+
+${C_BD}Console${C_0} (web UI - CONSOLE=true, https://PUBLIC_HOST:CONSOLE_PORT)
+  console [status] | url         is it up, where
+  console enable | disable       start / stop the vexor-console service
+  console password [--generate]  show / rotate the login (user CONSOLE_USER)
+  console restart | logs [N]     restart it / its journal
+  json state | volumes           machine-readable state (what the console reads)
 
 ${C_BD}SOC stack${C_0} (SOC in .env: wazuh | elk | both)
   soc [status]                   which stacks run, Kibana / Beats endpoints
@@ -4929,7 +5097,7 @@ main() {
   if [ -f "$ENV_FILE" ] && [ "$(id -u)" -eq 0 ] && [[ "$cmd" != help && "$cmd" != completion ]]; then
     ensure_env_defaults >/dev/null; env_drop_legacy >/dev/null; migrate_layout
     case "$cmd" in   # action history (feeds ai-context); read-only commands are not logged
-      help|version|--version|-v|completion|status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check|wazuh|suricata|zeek) ;;
+      help|version|--version|-v|completion|status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check|wazuh|suricata|zeek|json) ;;
       doctor|troubleshoot|check) [ "${args[0]:-}" = --fix ] && echo "$(ts) doctor --fix" >> "$HISTORY_FILE" ;;
       *) mkdir -p "$STATE_DIR"; echo "$(ts) $cmd ${args[0]:-} ${args[1]:-}" | mask_secrets >> "$HISTORY_FILE" ;;
     esac
@@ -4966,6 +5134,8 @@ main() {
     n8n|soar)              cmd_n8n "${args[@]}" ;;
     suricata|ids)          cmd_suricata "${args[@]}" ;;
     zeek)                  cmd_zeek "${args[@]}" ;;
+    console|ui)            cmd_console "${args[@]}" ;;
+    json)                  cmd_json "${args[@]}" ;;
     shuffle)               die "Shuffle was replaced by n8n in vexor 1.2.0 - see: vexor n8n" ;;
     tools|tool)            cmd_tools "${args[@]}" ;;
     soc)                   cmd_soc "${args[@]}" ;;

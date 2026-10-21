@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vexor Console</title>
+  <meta name="robots" content="noindex">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23234bd6'/%3E%3Cpath d='M8 9l8 15 8-15' stroke='white' stroke-width='3.2' fill='none' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/site/css/tokens.css">
+  <link rel="stylesheet" href="/ui/console.css">
+  <script type="module" src="/ui/app.js"></script>
+</head>
+<body>
+  <!-- login -->
+  <main class="login" data-login hidden>
+    <form class="login__box" data-login-form>
+      <p class="brand"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M7 8l9 16 9-16"/></svg> vexor console</p>
+      <h1>Sign in</h1>
+      <label><span>User</span><input name="user" autocomplete="username" value="admin" required></label>
+      <label><span>Password</span><input name="password" type="password" autocomplete="current-password" required autofocus></label>
+      <p class="login__err" data-login-err role="alert"></p>
+      <button class="btn btn--primary" type="submit">Sign in</button>
+      <p class="login__hint">Password: <code>vexor console password</code> on the host.</p>
+    </form>
+  </main>
+
+  <!-- app -->
+  <div class="app" data-app hidden>
+    <aside class="side">
+      <p class="brand"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M7 8l9 16 9-16"/></svg> vexor console</p>
+      <nav class="side__nav" aria-label="Sections" data-nav>
+        <a href="#overview">Overview</a>
+        <a href="#containers">Containers</a>
+        <a href="#ports">Ports</a>
+        <a href="#volumes">Volumes</a>
+        <a href="#stacks">Stacks</a>
+        <a href="#health">Health</a>
+        <a href="#settings">Settings</a>
+        <a href="#terminal">Terminal</a>
+        <a href="#activity">Activity</a>
+      </nav>
+      <div class="side__foot">
+        <p data-whoami></p>
+        <button class="link-btn" type="button" data-logout>Sign out</button>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+      <header class="top">
+        <h1 data-title>Overview</h1>
+        <div class="top__meta" data-topmeta></div>
+        <button class="btn btn--ghost btn--sm" type="button" data-refresh>Refresh</button>
+      </header>
+      <div class="view" data-view aria-live="polite"></div>
+    </main>
+
+    <aside class="out" data-out aria-label="Command output" hidden>
+      <header class="out__head">
+        <code class="out__cmd" data-out-cmd></code>
+        <span class="out__st" data-out-st></span>
+        <button class="btn btn--ghost btn--xs" type="button" data-out-stop>Stop</button>
+        <button class="btn btn--ghost btn--xs" type="button" data-out-close aria-label="Close output">Close</button>
+      </header>
+      <pre class="out__body" data-out-body></pre>
+    </aside>
+  </div>
+
+  <dialog class="confirm" data-confirm>
+    <form method="dialog" class="confirm__box">
+      <h2 data-confirm-title>Run this?</h2>
+      <code class="confirm__cmd" data-confirm-cmd></code>
+      <p class="confirm__text" data-confirm-text></p>
+      <label class="confirm__word" data-confirm-wordbox hidden><span>Type <b data-confirm-word></b> to confirm</span><input data-confirm-input autocomplete="off"></label>
+      <div class="confirm__actions">
+        <button class="btn btn--ghost" value="cancel">Cancel</button>
+        <button class="btn btn--primary" value="ok" data-confirm-ok>Run</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

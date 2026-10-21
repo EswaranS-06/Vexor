@@ -11,7 +11,7 @@ vexor <command> [subcommand] [options]
 ## Contents
 
 - [Installation](#installation) · [Conventions](#conventions) · [Change management](#change-management)
-- Stack commands: [Wazuh](#wazuh) · [ELK](#elk) · [n8n](#n8n) · [Suricata](#suricata) · [Zeek](#zeek) · [other tools](#other-tools)
+- Stack commands: [Wazuh](#wazuh) · [ELK](#elk) · [n8n](#n8n) · [Suricata](#suricata) · [Zeek](#zeek) · [other tools](#other-tools) · [console](#console)
 - Platform commands: [setup](#setup) · [run](#run) · [what runs](#what-runs) · [troubleshoot](#troubleshoot) · [update](#update) · [certificates](#certificates) · [security](#security) · [data](#data) · [health automation](#health-automation) · [automation](#automation)
 - [What `doctor --fix` repairs](#what-doctor---fix-repairs) · [Files and state](#files-and-state) · [Exit codes](#exit-codes) · [Extending vexor](#extending-vexor)
 
@@ -160,6 +160,19 @@ Needs `ZEEK=true`.
 | `tools update-rules` | Same as `suricata update-rules`. |
 
 Grafana gets an OpenSearch datasource and a **Wazuh alerts overview** dashboard (login `admin` / `GRAFANA_ADMIN_PASSWORD`). Portainer's admin password is `PORTAINER_ADMIN_PASSWORD`, applied on its first start.
+
+## Console
+
+The web UI (`CONSOLE=true`, `https://PUBLIC_HOST:CONSOLE_PORT`). The README lists its pages.
+
+| Command | Description |
+|---|---|
+| `console [status]` | Whether the `vexor-console` service runs and the console answers. |
+| `console url` | The console address. |
+| `console enable \| disable` | Set `CONSOLE` and start or stop the service. `start`, `config apply` and `daemon install` keep it in step. |
+| `console password [--generate]` | Show the login, or set a new password. |
+| `console restart \| logs [N]` | Restart the service / its journal. A restart does not stop a command the console started. |
+| `json state \| volumes` | Machine-readable stack state and volume sizes (what the console reads). |
 
 ---
 

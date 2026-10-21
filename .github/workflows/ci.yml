@@ -24,10 +24,16 @@ jobs:
       - name: Help and version run without a stack
         run: |
           ./vexor --no-color help > help.txt
-          for section in Wazuh ELK n8n Suricata Zeek; do
+          for section in Console Wazuh ELK n8n Suricata Zeek; do
             grep -q "^$section " help.txt || { echo "help is missing the $section section"; exit 1; }
           done
           ./vexor --no-color version
+
+      - name: Console code
+        run: |
+          python3 -m py_compile console/server.py
+          node --input-type=module --check < console/ui/app.js
+          python3 .github/console_allowlist_test.py
 
       - name: Generated compose files match the committed ones
         run: |

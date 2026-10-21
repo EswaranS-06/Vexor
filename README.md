@@ -24,7 +24,7 @@ You choose what runs in `.env`, and `vexor` wires everything together: certifica
 3. [Quick start](#quick-start)
 4. [Choosing what runs](#choosing-what-runs)
 5. [How the pieces connect](#how-the-pieces-connect)
-6. [The components](#the-components): [Wazuh](#wazuh) · [ELK](#elk) · [n8n](#n8n) · [Suricata](#suricata) · [Zeek](#zeek) · [Grafana and Portainer](#grafana-and-portainer)
+6. [The components](#the-components): [Wazuh](#wazuh) · [ELK](#elk) · [n8n](#n8n) · [Suricata](#suricata) · [Zeek](#zeek) · [Grafana and Portainer](#grafana-and-portainer) · [Vexor Console](#vexor-console)
 7. [Change management](#change-management)
 8. [Data, retention and backups](#data-retention-and-backups)
 9. [Self-healing and troubleshooting](#self-healing-and-troubleshooting)
@@ -73,9 +73,10 @@ cd Vexor
 sudo ./vexor install          # creates .env, generates passwords and certificates, starts the stack
 sudo ./vexor daemon install   # vexor on PATH, start at boot, watchdog, health checks, backups
 vexor info --show-secrets     # URLs and logins
+vexor console password        # login for the web console
 ```
 
-Open the Wazuh dashboard at `https://<host>:8080` and log in as `admin`. The first start takes 1–2 minutes.
+Open the Wazuh dashboard at `https://<host>:8080` and log in as `admin`. The first start takes 1–2 minutes. Everything below can also be done from the **Vexor Console** at `https://<host>:50443`.
 
 Add the rest of the SOC:
 
@@ -239,6 +240,30 @@ vexor zeek test
 
 Grafana gets an OpenSearch datasource with the read-only indexer user `grafana` and a **Wazuh alerts overview** dashboard. Portainer's admin password comes from `PORTAINER_ADMIN_PASSWORD`. Both are served only through nginx, on `GRAFANA_PORT` (53000) and `PORTAINER_PORT` (59443).
 
+### Vexor Console
+
+A web UI for the whole stack at `https://<host>:CONSOLE_PORT` (50443), on by default (`CONSOLE=true`). It runs on the host as the `vexor-console` service, uses the dashboard certificate, and signs in with `CONSOLE_USER` / `CONSOLE_PASSWORD` (`vexor console password`).
+
+| Page | What you can do |
+|---|---|
+| Overview | Stack, containers running, last health check, disk, links to every UI, reminders, quick actions |
+| Containers | State, CPU, memory, ports, image; logs and live log follow; start, stop, restart |
+| Ports | Every port from `.env` with what uses it and whether it listens; edit, check (range, duplicates, in use), apply |
+| Volumes | Every volume with its size and users; back up one or all, full backup, remove unused |
+| Stacks | Per stack: status, tests, alerts, n8n connect, Zeek logs, enable or disable tools, switch SOC, node type, workers |
+| Health | Doctor, doctor --fix, recent errors, AI report |
+| Settings | Every `.env` value (secrets hidden), edit and apply; rotate passwords |
+| Terminal | Any `vexor` command, with suggestions and history |
+| Activity | Every command run from the console, and the audit log |
+
+Every action is a `vexor` command, run without a shell from an allowlist, so the console and the CLI behave the same. Reading runs at once, changes ask for confirmation, and anything that deletes data or switches layout asks you to type the command name. Commands that need a terminal (`shell`, `exec`, `wazuh logtest`, `config edit`) stay in SSH. All actions go to `.state/console-audit.log`.
+
+```bash
+vexor console                 # is it up, where
+vexor console disable         # stop it (CONSOLE=false)
+vexor console password --generate
+```
+
 ---
 
 ## Change management
@@ -376,6 +401,7 @@ Vexor/
 │   ├── wazuh_indexer/            # opensearch.yml per node + internal users
 │   ├── wazuh_dashboard/          # dashboard config + Wazuh API connection
 │   └── nginx/nginx.conf.tpl      # the template nginx.conf is rendered from
+├── console/                      # Vexor Console: server.py (python3 stdlib) + ui/
 ├── docs/                         # landing page: index.html + assets/ (GitHub Pages, no build step)
 ├── .github/workflows/            # ci.yml, pages.yml
 ├── .gitleaks.toml                # secret-scan settings used by CI
