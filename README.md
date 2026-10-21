@@ -264,7 +264,7 @@ A web UI for the whole stack at `https://<host>:CONSOLE_PORT` (50443), on by def
 |---|---|
 | Overview | Stack, containers running, last health check, disk usage per drive (amber from 85%, red from 95%), links to every UI, reminders, quick actions |
 | Map | Live map of the containers and the connections between them, with traffic rates and status; tap a container for details, logs, restart |
-| Containers | State, CPU, memory, ports, image; logs and live log follow; start, stop, restart |
+| Containers | State, CPU, memory, ports, image; a ⋯ menu per row (logs, follow, restart, stop or start, show on map); tick rows for bulk start, stop, restart or logs in one command |
 | Ports | Every port from `.env` with what uses it and whether it listens; edit, check (range, duplicates, in use), apply |
 | Volumes | Every volume with its size and users; back up one or all, full backup, remove unused |
 | Stacks | Per stack: status, tests, alerts, n8n connect, Zeek logs, enable or disable tools, switch SOC, node type, workers |
@@ -277,7 +277,7 @@ A web UI for the whole stack at `https://<host>:CONSOLE_PORT` (50443), on by def
 
 The Map is drawn only from what the host sees: one `docker inspect` of the project's containers, plus each container's own `/proc/<pid>/net` (traffic counters and open TCP/UDP sockets). A line between two containers means a connection is open right now; it moves while both ends carry traffic, and addresses outside the project's networks (agents, browsers, other hosts) show as one External box. Green is running, amber an issue (unhealthy, restarting, 3 or more restarts, killed for memory, network errors), red offline, dashed missing (the layout expects it but there is no container). It refreshes every 3 seconds while the page is open. Without root access to `/proc` (Docker Desktop, for one) it shows the containers without traffic.
 
-The console follows the device's light or dark setting. **Theme** in the sidebar switches between auto, light and dark; the choice is kept in that browser.
+The sidebar has an icon for every page and collapses to icons only with the button at its top (the choice is kept in that browser; on a phone it becomes a scrolling top bar). The console follows the device's light or dark setting. **Theme** in the sidebar switches between auto, light and dark; the choice is kept in that browser.
 
 Every action is a `vexor` command, run without a shell from an allowlist, so the console and the CLI behave the same. Reading runs at once, changes ask for confirmation, and anything that deletes data or switches layout asks you to type the command name. Commands that need a terminal (`shell`, `exec`, `wazuh logtest`, `config edit`) stay in SSH. All actions go to `.state/console-audit.log`.
 
