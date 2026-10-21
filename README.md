@@ -271,8 +271,11 @@ vexor console password --generate
 After editing `.env`, validate and apply. **Never use `down -v` or `reset` to apply settings**: they delete the volumes that hold every alert, agent key, rule and workflow.
 
 ```bash
+vexor plan                    # what the apply would change: settings, containers, downtime
 vexor config validate && vexor config apply && vexor doctor
 ```
+
+`vexor plan KEY=VALUE` previews a change before you write it, and `config apply` prints the plan first (and asks, when you run it in a terminal). The console shows the same plan in its confirmation.
 
 | You changed | Apply with |
 |---|---|
@@ -313,7 +316,7 @@ Never put a comment on the same line as an **empty** value in `.env`: Docker Com
 `vexor daemon install` sets up `vexor.service` (start at boot) and four timers:
 
 - **Watchdog**, every 5 minutes: starts enabled containers that are down and clears read-only index blocks.
-- **Health check**, every hour (`HEALTH_INTERVAL`): runs `doctor --fix` and re-checks. Anything still broken produces an AI-ready report and a reminder.
+- **Health check**, every hour (`HEALTH_INTERVAL`): runs `doctor --fix` and re-checks. Anything still broken produces an AI-ready report, a reminder, and a notification.
 - **Backup**, daily (`BACKUP_TIME`).
 - **Maintenance**, daily (`MAINT_TIME`): prunes logs, applies retention, renews certificates, updates the Suricata rules and rotates the sensor logs.
 
@@ -336,7 +339,10 @@ Each of these came from a real failure while building and running the stack:
 | `kibana_system` or the Logstash writer cannot log in | Resets the user or role |
 | nginx out of date, http:// on an HTTPS port | Re-renders and reloads nginx |
 
+Notifications go to `NOTIFY_URL` (a Slack, Teams or Discord incoming webhook, or any URL that takes JSON). When it is empty and n8n is connected, they go to your n8n webhook as a Wazuh-shaped alert, so the starter workflow routes them by severity. `NOTIFY_ON=fail|warn|off` decides when; a problem that lasts is sent again every `NOTIFY_REPEAT_HOURS`, and a recovered message follows. The watchdog also reports containers it had to start.
+
 ```bash
+vexor notify test         # send a test notification
 vexor doctor              # about 60 checks, each problem with a hint
 vexor doctor --fix        # repair what can be repaired
 vexor ai-context --print  # one report to paste into any AI assistant (secrets masked)

@@ -85,6 +85,7 @@ CATALOG = {
     "indexers": "danger", "update": "danger", "config": "change", "daemon": "change", "prune-logs": "change",
     "maintenance": "change", "watchdog": "change", "support-bundle": "change", "ai-context": "read",
     "indexer": "read", "api": "read", "passwd": "danger", "reset": "danger", "console": "change", "plan": "read",
+    "notify": "change",
 }
 READ_SUBS = {
     "tools": {"status", "ls", ""}, "soc": {"status", ""}, "elk": {"status", "indices", "search", "explain", ""},
@@ -92,7 +93,7 @@ READ_SUBS = {
     "agents": {"list", "summary", "outdated", "enroll-cmd", ""}, "cert": {"status", ""}, "backup": {"list", "ls"},
     "retention": {"show", ""}, "volumes": {"ls", "list", ""}, "reminders": {"list", ""}, "config": {"show", "get", "validate"},
     "daemon": {"status", "logs", ""}, "console": {"status", "url", ""}, "update": {"check", ""},
-    "indexers": {"status", ""}, "node-type": {"status", ""},
+    "indexers": {"status", ""}, "node-type": {"status", ""}, "notify": {"status", ""},
 }
 DANGER_SUBS = {
     "volumes": {"rm", "prune", "restore"}, "backup": {"restore-snapshot", "restore-manager", "restore-config"},

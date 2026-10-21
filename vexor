@@ -214,6 +214,9 @@ N8N_ALERT_GROUPS=
 N8N_HOOK_TOKEN=
 WAZUH_N8N_USER=vexor-n8n
 SOC=wazuh                      # wazuh | elk | both  - switch with: vexor soc <value>
+NOTIFY_ON=fail                 # health alerts off the host: fail | warn | off (vexor notify)
+NOTIFY_URL=
+NOTIFY_REPEAT_HOURS=6          # re-send a problem that persists
 CONSOLE=true                   # Vexor Console web UI (vexor console enable|disable)
 CONSOLE_PORT=50443             # console port (50000-59999), HTTPS with the dashboard certificate
 CONSOLE_BIND=0.0.0.0           # address the console listens on
@@ -1263,6 +1266,10 @@ cmd_doctor() {
   fi
 
   [ -n "$(n8n_hook)" ] && n8n_doctor
+  if [ -n "$(notify_target)" ] && [ -s "$STATE_DIR/notify.err" ]; then
+    hdr "Notifications"
+    d_warn "the last health notification was not delivered: $(cat "$STATE_DIR/notify.err")" "vexor notify test"
+  fi
   if console_on && command -v systemctl >/dev/null; then
     hdr "Console"
     if console_answers; then d_pass "console answers on $(console_url)"
@@ -3338,6 +3345,12 @@ cmd_autoheal() {               # timer: doctor --fix, re-check, record result, r
     reminder_rm health-problem
   fi
   while IFS='|' read -r msg cmd; do [ -n "$msg" ] && log "REMINDER: $msg -> $cmd"; done < <(reminders_due)
+  local detail
+  detail="${p:-0} passed, ${w:-0} warnings, ${f:-0} failed.
+$(grep -E '✘|!' "$RUN_TMP/doctor.txt" | grep -v 'Run vexor doctor' | sed -E 's/^ *(✘|!) */- /' | head -n 8)
+$(grep -E 'fixing:' "$RUN_TMP/doctor-fix.txt" | sed -E 's/^ *[^a-z]*fixing: */- repaired: /' | head -n 5)
+$( [ "$status" = FAIL ] && echo "AI report: $(ls -1t "$REPORT_DIR"/ai-context-*.md 2>/dev/null | head -1)")"
+  notify_health "$status" "$detail"
   return 0
 }
 mask_secrets() {
@@ -4555,12 +4568,15 @@ cmd_watchdog() {
   [ -f "$STATE_DIR/stopped" ] && exit 0
   grep -qE '^(INDEXER|DASHBOARD|API)_PASSWORD=CHANGE_ME' "$ENV_FILE" && exit 0
   local heal; heal="$(env_def WATCHDOG_AUTOHEAL yes)"
-  local svc run; run="$(running_services)"
+  local svc run started=""; run="$(running_services)"
   for svc in $(enabled_services); do
     grep -qx "$svc" <<<"$run" && continue
-    if [ "$heal" = yes ]; then log "$svc not running - starting it"; dc up -d "$svc" >/dev/null 2>&1 || log "failed to start $svc"
-    else log "$svc not running (WATCHDOG_AUTOHEAL=no)"; fi
+    if [ "$heal" = yes ]; then log "$svc not running - starting it"; dc up -d "$svc" >/dev/null 2>&1 && started+="$svc " || log "failed to start $svc"
+    else log "$svc not running (WATCHDOG_AUTOHEAL=no)"; started+="$svc(down) "; fi
   done
+  if [ -n "$started" ] && [ "$(env_def NOTIFY_ON fail)" != off ] && ! file_fresh "$STATE_DIR/notify.watchdog" 60; then
+    notify_send warn "Vexor on $(hostname): watchdog acted" "Containers that were not running: $started" && touch "$STATE_DIR/notify.watchdog"
+  fi
   local dp warn_pct; warn_pct="$(env_def DISK_WARN_PCT 85)"; dp="$(disk_pct "$(docker_root)")"
   [ "${dp:-0}" -ge "$warn_pct" ] && log "WARNING docker disk ${dp}% used"
   if [ "$(ix_code)" = 200 ]; then
@@ -4743,13 +4759,14 @@ _vexor() {
   local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}" words
   local svcs="master worker worker2 worker3 indexer1 indexer2 indexer3 dashboard nginx managers indexers"
   if [ "$COMP_CWORD" -eq 1 ]; then
-    words="install info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console plan tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
+    words="install info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console plan notify tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
   else
     case "$cmd" in
       start|stop|restart|shell|exec) words="$svcs" ;;
       logs)    words="$svcs ossec api cluster alerts archives errors size -f -n --since" ;;
       config)  words="show get set edit validate plan apply --show-secrets" ;;
       plan)    words="--json" ;;
+      notify)  words="status test send fail warn ok info" ;;
       update)  words="check apply rollback images latest --no-backup --force" ;;
       cert)    words="status create export-ca serve-ca import letsencrypt renew use-default internal-regen --force --email --staging --dns" ;;
       passwd)  words="admin kibanaserver api --generate" ;;
@@ -4786,6 +4803,95 @@ EOF
 cmd_completion() {
   if [ "${1:-}" = install ]; then completion_script > /etc/bash_completion.d/vexor && ok "installed - open a new shell"
   else completion_script; fi
+}
+
+# ============================================================== notifications: health results off the host
+# NOTIFY_URL  Slack / Teams / Discord incoming webhook, or any URL that takes JSON. Empty + n8n connected ->
+#             the n8n webhook, as a Wazuh-shaped alert (rule.level 12 fail / 7 warn / 3 recovered), so the
+#             starter workflow routes it by severity. NOTIFY_VIA_N8N=no turns that off.
+# NOTIFY_ON   fail (default) | warn | off      NOTIFY_REPEAT_HOURS   re-send a problem that persists (default 6)
+notify_target() {
+  local u; u="$(env_get NOTIFY_URL)"
+  [ -z "$u" ] && [ -n "$(n8n_hook)" ] && [ "$(env_def NOTIFY_VIA_N8N yes)" = yes ] && u="n8n"
+  echo "$u"
+}
+notify_send() {                # notify_send <fail|warn|ok|info> <title> <body>  -> 0 when delivered
+  local url; url="$(notify_target)"; [ -n "$url" ] || return 1
+  local n8n_url=""
+  if [ "$url" = n8n ]; then  # the managers' internal n8n address is not reachable from the host: go through nginx
+    n8n_url="$(n8n_hook | sed -E -e "s#^https?://n8n:5678#https://127.0.0.1:$(tool_port n8n)#" \
+                                 -e "s#^https://($(public_host)|localhost):$(tool_port n8n)/#https://127.0.0.1:$(tool_port n8n)/#")"
+  fi
+  python3 -I - "$url" "$1" "$2" "$3" "$(hostname)" "$(public_host)" "$(env_get N8N_HOOK_TOKEN)" "$n8n_url" "$(env_def NOTIFY_FORMAT auto)" "$STATE_DIR/notify.err" <<'PY'
+import json, ssl, sys, time, urllib.request
+url, level, title, body, host, pub, token, n8n_url, fmt, errf = sys.argv[1:11]
+headers = {"Content-Type": "application/json", "User-Agent": "vexor-notify"}
+ctx = None
+if url == "n8n":
+    url = n8n_url
+    lvl = {"fail": 12, "warn": 7, "ok": 3, "info": 3}.get(level, 3)
+    payload = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000%z"), "id": f"vexor-{int(time.time())}",
+               "rule": {"level": lvl, "id": "vexor-health", "description": title, "groups": ["vexor", "health"]},
+               "agent": {"id": "000", "name": host}, "manager": {"name": host}, "full_log": body, "location": "vexor"}
+    headers.update({"X-Vexor-Token": token, "X-Vexor-Source": "vexor-health"})
+    if "127.0.0.1" in url:
+        ctx = ssl._create_unverified_context()   # our own nginx, self-signed by default
+else:
+    icon = {"fail": "🔴", "warn": "🟠", "ok": "🟢", "info": "🔵"}.get(level, "")
+    text = f"{icon} {title}\n{body}"
+    kind = fmt if fmt != "auto" else ("slack" if "hooks.slack.com" in url else "discord" if "discord.com/api/webhooks" in url
+                                      else "teams" if ("webhook.office.com" in url or "logic.azure.com" in url) else "json")
+    payload = {"slack": {"text": text}, "teams": {"text": text.replace("\n", "<br>")}, "discord": {"content": text[:1900]},
+               "json": {"source": "vexor", "level": level, "title": title, "body": body, "host": host, "public_host": pub,
+                        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}}[kind]
+try:
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+        code = r.status
+    if code >= 300:
+        raise RuntimeError(f"HTTP {code}")
+    open(errf, "w").close()
+except Exception as e:  # noqa: BLE001 - any delivery failure is reported the same way
+    open(errf, "w").write(f"{time.strftime('%F %T')} {type(e).__name__}: {e}\n")
+    sys.exit(1)
+PY
+}
+notify_health() {              # called by autoheal with the new status; decides whether to send
+  local status="$1" detail="$2" on prev pepoch now repeat
+  on="$(env_def NOTIFY_ON fail)"; [ "$on" = off ] && return 0
+  [ -n "$(notify_target)" ] || return 0
+  IFS='|' read -r prev pepoch < "$STATE_DIR/notify.last" 2>/dev/null || { prev=OK; pepoch=0; }
+  now="$(date +%s)"; repeat=$(( $(env_def NOTIFY_REPEAT_HOURS 6) * 3600 ))
+  local bad=0; [ "$status" = FAIL ] && bad=1; [ "$status" = WARN ] && [ "$on" = warn ] && bad=1
+  if [ "$bad" = 1 ]; then
+    if [ "$prev" != "$status" ] || [ $(( now - ${pepoch:-0} )) -ge "$repeat" ]; then
+      notify_send "$(tr 'A-Z' 'a-z' <<<"$status")" "Vexor on $(hostname): health check $status" "$detail" \
+        && { echo "$status|$now" > "$STATE_DIR/notify.last"; log "notification sent ($status)"; } || log "notification failed: $(cat "$STATE_DIR/notify.err" 2>/dev/null)"
+    fi
+  elif [ "$prev" != OK ]; then
+    notify_send ok "Vexor on $(hostname): recovered" "$detail" && { echo "OK|$now" > "$STATE_DIR/notify.last"; log "notification sent (recovered)"; }
+  fi
+  return 0
+}
+cmd_notify() {
+  case "${1:-status}" in
+    status)
+      hdr "Notifications"
+      local t; t="$(notify_target)"
+      if [ -z "$t" ]; then warn "no target: set NOTIFY_URL (Slack, Teams, Discord or JSON webhook), or connect n8n (vexor n8n connect)"; return 0; fi
+      [ "$t" = n8n ] && say "target : n8n webhook $(n8n_hook) (as a Wazuh-shaped alert)" || say "target : $(sed -E 's#(https?://[^/]+/).{6,}#\1…#' <<<"$t")"
+      say "when   : NOTIFY_ON=$(env_def NOTIFY_ON fail), repeat every $(env_def NOTIFY_REPEAT_HOURS 6) h while it lasts, plus a recovered message"
+      [ -s "$STATE_DIR/notify.err" ] && bad "last delivery failed: $(cat "$STATE_DIR/notify.err")" || ok "last delivery ok (or nothing sent yet)"
+      [ -f "$STATE_DIR/notify.last" ] && say "last sent: $(cut -d'|' -f1 "$STATE_DIR/notify.last") at $(date -d "@$(cut -d'|' -f2 "$STATE_DIR/notify.last")" '+%F %H:%M')" ;;
+    test)
+      notify_send info "Vexor on $(hostname): test notification" "If you can read this, health alerts from vexor reach you. $(date '+%F %T')" \
+        && ok "test notification delivered" || die "delivery failed: $(cat "$STATE_DIR/notify.err" 2>/dev/null || echo 'no target - set NOTIFY_URL')" ;;
+    send)
+      local lvl="${2:-info}"; shift 2 2>/dev/null || true
+      [[ "$lvl" =~ ^(fail|warn|ok|info)$ ]] || die "usage: vexor notify send <fail|warn|ok|info> <message>"
+      notify_send "$lvl" "Vexor on $(hostname)" "$*" && ok "sent" || die "delivery failed: $(cat "$STATE_DIR/notify.err" 2>/dev/null)" ;;
+    *) die "usage: vexor notify [status] | test | send <fail|warn|ok|info> <message>" ;;
+  esac
 }
 
 # ============================================================== plan: preview what an apply would change
@@ -5163,6 +5269,7 @@ ${C_BD}Indexer cluster${C_0}
 
 ${C_BD}Health automation${C_0}
   autoheal                       doctor --fix, re-check, record result; unknown problems -> AI report + reminder
+  notify [status] | test | send <level> <msg>   health alerts to NOTIFY_URL (Slack/Teams/Discord/JSON) or n8n
   ai-context [--print]           one Markdown file with architecture, settings, status, doctor, errors (masked)
                                  - paste it into any AI chat to get a diagnosis
   reminders [list] | done <id>   follow-up tasks (e.g. indexer cleanup); shown in status, doctor, SSH login
@@ -5257,6 +5364,7 @@ main() {
     zeek)                  cmd_zeek "${args[@]}" ;;
     console|ui)            cmd_console "${args[@]}" ;;
     plan)                  cmd_plan "${args[@]}" ;;
+    notify)                cmd_notify "${args[@]}" ;;
     json)                  cmd_json "${args[@]}" ;;
     shuffle)               die "Shuffle was replaced by n8n in vexor 1.2.0 - see: vexor n8n" ;;
     tools|tool)            cmd_tools "${args[@]}" ;;

@@ -183,6 +183,7 @@ The web UI (`CONSOLE=true`, `https://PUBLIC_HOST:CONSOLE_PORT`). The README list
 | `install` | First-time setup, safe to re-run. It checks prerequisites and sets `vm.max_map_count`, then creates `.env` and detects `PUBLIC_HOST`. It generates the passwords and the cluster key, removes the OpenSearch demo users, and creates the internal certificates and a local-CA dashboard certificate. Finally it starts the selected stack and waits until it is ready. |
 | `info [--show-secrets]` | URLs and logins (Wazuh dashboard, Kibana, tools), agent and API ports, certificate mode. |
 | `config show [--show-secrets]` / `get KEY` / `set KEY VALUE` | View or set values; keys with their own command are redirected to it. |
+| `plan [KEY=VALUE ..] [--json]` | What an apply would change, without changing anything: settings since the last apply (or the ones given), containers recreated, created and removed (a compose dry-run against temp-rendered files), nginx changes, and the downtime each means. |
 | `config edit` / `validate` / `apply` | Edit `.env` with validation and rollback / check it / apply it (renders nginx and the override, pulls missing images with retries, recreates what changed). |
 
 ## Run
@@ -261,6 +262,7 @@ Wazuh password policy: 8–64 characters from letters, digits and `. * + ? -`, w
 | Command | Description |
 |---|---|
 | `autoheal` | What the health timer runs: `doctor --fix`, a re-check, the result in `.state/health.last`; remaining problems produce an AI report and a reminder. |
+| `notify [status] \| test \| send <fail\|warn\|ok\|info> <msg>` | Health alerts: to `NOTIFY_URL` (Slack, Teams, Discord, JSON) or, when empty, to the n8n webhook. Sent by the hourly check (`NOTIFY_ON`, repeated every `NOTIFY_REPEAT_HOURS`, then a recovered message) and when the watchdog starts containers. |
 | `ai-context [--print]` | One Markdown report covering the architecture and data flow (including n8n forwarding), settings, host, containers, the full doctor output, Wazuh and ELK state, recent errors and the action history. Secrets are masked. |
 | `reminders [list] \| done <id>` | Follow-up tasks; shown in `status`, `doctor` and the SSH login summary. |
 | `watchdog` / `maintenance` / `motd` | One watchdog pass / daily maintenance / the login summary. |

@@ -335,7 +335,9 @@ async function vHealth() {
   view().innerHTML = `
     <p class="lede">The doctor runs about 60 checks. With --fix it repairs what it safely can, the same as the hourly timer.</p>
     <div class="actions">${btn("Run doctor", ["doctor"], "btn--primary")}${btn("Doctor --fix", ["doctor", "--fix"])}${btn("Health details", ["health"])}${btn("Recent errors", ["logs", "errors", "--since", "1h"])}${btn("Reminders", ["reminders"])}${btn("AI report", ["ai-context", "--print"])}${btn("Watchdog pass", ["watchdog"])}</div>
-    <div class="doc-sum" data-doc-sum hidden></div>`;
+    <section class="block"><h2>Notifications</h2>
+      <p class="muted">The hourly check sends problems it could not fix to <code>NOTIFY_URL</code> (Slack, Teams, Discord or any JSON webhook), or to your n8n webhook when that is empty. Set the URL and <code>NOTIFY_ON</code> under Settings.</p>
+      <div class="actions">${btn("Notification status", ["notify"])}${btn("Send a test", ["notify", "test"], "btn--primary")}</div></section>`;
   bindRunButtons(view());
 }
 
