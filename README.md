@@ -309,7 +309,7 @@ Never put a comment on the same line as an **empty** value in `.env`: Docker Com
 | Manager logs | `/var/ossec/logs` (volume) | `MANAGER_LOG_RETENTION_DAYS` |
 | Container logs | Docker `json-file` | `LOG_MAX_SIZE` × `LOG_MAX_FILE` |
 
-`vexor backup` (daily with the daemon) saves an indexer snapshot, the master's state, the n8n, Grafana and Portainer volumes, and the configuration. Restore with `vexor backup restore-snapshot | restore-manager | restore-config`. Keep `.env`: it holds `N8N_ENCRYPTION_KEY`, without which n8n credentials cannot be decrypted. Elasticsearch data is not in the backup yet; use `vexor volumes backup elk-es-data --stop`.
+`vexor backup` (daily with the daemon) saves an indexer snapshot, the master's state, the n8n, Grafana and Portainer volumes, and the configuration. Restore with `vexor backup restore-snapshot | restore-manager | restore-config`. Keep `.env`: it holds `N8N_ENCRYPTION_KEY`, without which n8n credentials cannot be decrypted. With `SOC=elk` or `both` the backup also takes an Elasticsearch snapshot of `vexor-*` and the Kibana saved objects (repository `backups/es-snapshots`); restore with `vexor backup restore-es <id>`.
 
 ---
 
@@ -426,7 +426,7 @@ Created at run time and ignored by git: `.env`, `.state/`, `backups/`, `reports/
 - Everything runs on one host. The clusters protect against a failed container, not a failed host.
 - Up to three workers are predefined.
 - Wazuh 5.x uses a different deployment layout and is not covered by `vexor update apply`.
-- Elasticsearch runs as a single node and is not yet in `vexor backup`.
+- Elasticsearch runs as a single node.
 
 ## License
 

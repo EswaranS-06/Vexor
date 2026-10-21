@@ -257,7 +257,8 @@ Wazuh password policy: 8–64 characters from letters, digits and `. * + ? -`, w
 
 | Command | Description |
 |---|---|
-| `backup [run] \| list \| register` | Wazuh indexer snapshot, master state, n8n, Grafana and Portainer volumes, configuration; prunes old backups. |
+| `backup [run] \| list \| register` | Wazuh indexer snapshot, Elasticsearch snapshot (`vexor-*` + Kibana saved objects, when ELK runs), master state, n8n, Grafana and Portainer volumes, configuration; prunes old backups and snapshots. |
+| `backup restore-es <es-snap-id> [--indices P] [--rename] [--kibana]` | Restore Elasticsearch indices (and with `--kibana` the saved objects) from an `es-snap-*` snapshot. |
 | `backup restore-snapshot <id> [--indices P] [--rename]` / `restore-manager <stamp>` / `restore-config <file>` | Restore indices / agent keys, rules and groups / `.env` and `config/`. |
 | `n8n backup [dir]` | Workflows and credentials as JSON. |
 | `retention [show\|apply]` / `prune-logs` | Wazuh index retention / delete old manager logs. |

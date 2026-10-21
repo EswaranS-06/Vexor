@@ -2949,6 +2949,7 @@ services:
       xpack.security.transport.ssl.enabled: "false"
       xpack.license.self_generated.type: basic
       ingest.geoip.downloader.enabled: "false"
+      path.repo: /usr/share/elasticsearch/snapshots
       ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-}
     ulimits:
       memlock: {soft: -1, hard: -1}
@@ -2957,6 +2958,7 @@ services:
       - "${ES_BIND:-127.0.0.1}:${ES_PORT:-59200}:9200"
     volumes:
       - elk-es-data:/usr/share/elasticsearch/data
+      - ${BACKUP_DIR:-./backups}/es-snapshots:/usr/share/elasticsearch/snapshots
 
   kibana:                                # https://PUBLIC_HOST:KIBANA_PORT (through nginx) - login elastic
     profiles: ["elk"]
@@ -3116,6 +3118,7 @@ elk_prepare() {                # before `docker compose up`
   local p; for p in KIBANA_PORT LOGSTASH_BEATS_PORT ES_PORT; do
     [[ "$(env_def "$p" x)" =~ ^5[0-9]{4}$ ]] || die "$p=$(env_get "$p") - ELK ports must be in 50000-59999"
   done
+  es_snapshot_dir >/dev/null
   logstash_certs || warn "Beats input stays without TLS until the certificate can be issued"
   write_logstash_config
 }
@@ -3202,6 +3205,9 @@ elk_doctor() {                 # ELK checks + predictable repairs
     fi
     if [ "$(es_code /_ilm/policy/vexor-retention)" = 200 ] && [ "$(es_code /_index_template/vexor)" = 200 ]; then d_pass "retention (ILM) + index template present"
     else d_warn "ILM policy / index template missing" "vexor doctor --fix"; d_fix "apply ELK retention + template" && elk_retention_apply >/dev/null; fi
+    if [ "$(es_code "/_snapshot/$ES_SNAP_REPO")" = 200 ]; then d_pass "Elasticsearch snapshot repository registered (vexor backup includes ELK)"
+    else d_warn "Elasticsearch snapshot repository not registered yet" "vexor doctor --fix   (or the next vexor backup)"
+         d_fix "register the Elasticsearch snapshot repository" && es_snapshot_register >/dev/null; fi
     if [ "$(curl -s -o /dev/null -w '%{http_code}' -u "vexor_logstash:$(env_get LOGSTASH_ES_PASSWORD)" "http://127.0.0.1:$(es_port)/_security/_authenticate")" = 200 ]; then
       d_pass "Logstash user vexor_logstash can log in"
     else d_fail "Logstash user vexor_logstash cannot log in (events are not stored)" "vexor doctor --fix"; d_fix "re-create users/roles" && elk_post >/dev/null 2>&1; fi
@@ -4315,6 +4321,31 @@ prune_logs() {
 }
 
 # ============================================================== backup / restore
+ES_SNAP_REPO="vexor-backup"
+es_snapshot_dir() { local d; d="$(backup_dir)/es-snapshots"; mkdir -p "$d"; chown 1000:0 "$d"; chmod 770 "$d"; echo "$d"; }
+es_snapshot_register() {
+  es_snapshot_dir >/dev/null
+  es_curl PUT "/_snapshot/$ES_SNAP_REPO" -d '{"type":"fs","settings":{"location":"/usr/share/elasticsearch/snapshots","compress":true}}' 2>/dev/null | has '"acknowledged":true'
+}
+es_snapshot_run() {            # es_snapshot_run <stamp>: vexor-* + Kibana saved objects (data views, dashboards)
+  soc_elk || return 0
+  [ "$(es_code /_cluster/health)" = 200 ] || { warn "Elasticsearch not reachable - ELK snapshot skipped"; return 1; }
+  es_snapshot_register || { bad "Elasticsearch snapshot repository could not be registered (path.repo; recreate elasticsearch: vexor restart elasticsearch)"; return 1; }
+  local r st
+  r="$(es_curl PUT "/_snapshot/$ES_SNAP_REPO/es-snap-$1?wait_for_completion=true" --max-time 7200 \
+        -d '{"indices":"vexor-*","ignore_unavailable":true,"include_global_state":false,"feature_states":["kibana"]}' 2>/dev/null)"
+  st="$(pj 'print(d.get("snapshot",{}).get("state","FAILED"))' <<<"$r" 2>/dev/null || echo FAILED)"
+  if [ "$st" = SUCCESS ]; then ok "Elasticsearch snapshot es-snap-$1 (vexor-* + Kibana saved objects)"
+  else bad "Elasticsearch snapshot: $st $(head -c 300 <<<"$r")"; return 1; fi
+}
+es_snapshot_prune() {          # es_snapshot_prune <cutoff-epoch>
+  soc_elk && [ "$(es_code "/_snapshot/$ES_SNAP_REPO")" = 200 ] || return 0
+  es_curl GET "/_snapshot/$ES_SNAP_REPO/_all" 2>/dev/null | pj '
+for s in d.get("snapshots", []):
+    if int(s.get("end_time_in_millis", 0)) // 1000 < int(sys.argv[1]): print(s["snapshot"])' "$1" | while read -r id; do
+    [ -n "$id" ] && es_curl DELETE "/_snapshot/$ES_SNAP_REPO/$id" >/dev/null 2>&1 && say "pruned Elasticsearch snapshot $id"
+  done
+}
 snapshot_register() {
   local dir; dir="$(backup_dir)/snapshots"; mkdir -p "$dir"; chown 1000:1000 "$dir"
   ix PUT "/_snapshot/$SNAP_REPO" -d '{"type":"fs","settings":{"location":"/mnt/snapshots","compress":true}}' | has '"acknowledged":true'
@@ -4339,6 +4370,7 @@ backup_run() {
     docker run --rm -v "${p}_${vol}:/data:ro" -v "$dir/config:/backup" "$ALPINE_IMAGE" \
       tar czf "/backup/${vol}-${stamp}.tar.gz" -C /data . && ok "volume $vol"
   done
+  es_snapshot_run "$stamp" || true
   tar czf "$dir/config/stack-config-${stamp}.tar.gz" -C "$ROOT" config .env docker-compose.yml generate-indexer-certs.yml vexor 2>/dev/null \
     && ok "stack config (.env, config/, certs)"
   chmod 600 "$dir"/config/*"${stamp}"* 2>/dev/null
@@ -4352,6 +4384,7 @@ for s in d:
       [ -n "$id" ] && ix DELETE "/_snapshot/$SNAP_REPO/$id" >/dev/null && say "pruned snapshot $id"
     done
   fi
+  es_snapshot_prune "$(date -d "-${keep} days" +%s)"
   ok "backup $stamp done (keeping $keep days)"
 }
 cmd_backup() {
@@ -4362,6 +4395,10 @@ cmd_backup() {
     list|ls)
       hdr "Indexer snapshots"
       if [ "$(ix_code)" = 200 ]; then ix GET "/_cat/snapshots/$SNAP_REPO?v&h=id,status,start_time,duration,indices,total_shards"; else warn "indexer unreachable"; fi
+      if soc_elk && [ "$(es_code "/_snapshot/$ES_SNAP_REPO")" = 200 ]; then
+        hdr "Elasticsearch snapshots"
+        es_curl GET "/_cat/snapshots/$ES_SNAP_REPO?v&h=id,status,start_time,duration,indices" 2>/dev/null
+      fi
       hdr "Config / manager backups ($(backup_dir)/config)"
       ls -1t "$(backup_dir)/config" 2>/dev/null | head -n 40 | sed 's/^/  /'
       hint "restore: vexor backup restore-snapshot <id> | restore-manager <stamp> | restore-config <file>" ;;
@@ -4377,6 +4414,20 @@ b={"indices":sys.argv[1],"ignore_unavailable":True,"include_global_state":False,
 if sys.argv[2]=="1": b.update(rename_pattern="(.+)", rename_replacement="restored-$1")
 print(json.dumps(b))' "$idx" "$rename")"
       ix POST "/_snapshot/$SNAP_REPO/$snap/_restore?wait_for_completion=true" --max-time 7200 -d "$body" | pretty ;;
+    restore-es)
+      soc_elk || die "ELK is off (SOC=$(soc))"
+      local snap="${1:-}" idx="vexor-*" rename=0 kib=0; shift || true
+      while [ $# -gt 0 ]; do case "$1" in --indices) idx="${2:?}"; shift ;; --rename) rename=1 ;; --kibana) kib=1 ;; esac; shift; done
+      [ -n "$snap" ] || die "usage: vexor backup restore-es <es-snap-id> [--indices 'vexor-zeek-*'] [--rename] [--kibana]   (ids: vexor backup list)"
+      [ "$rename" = 1 ] || warn "open indices with the same name make the restore fail - use --rename to restore as restored-<name>"
+      confirm "Restore $idx$( [ "$kib" = 1 ] && echo ' and the Kibana saved objects') from $snap?" || die "Aborted"
+      take_lock
+      local body; body="$(python3 -I -c 'import json,sys
+b={"indices":sys.argv[1],"ignore_unavailable":True,"include_global_state":False,"include_aliases":False}
+if sys.argv[2]=="1": b.update(rename_pattern="(.+)", rename_replacement="restored-$1")
+b["feature_states"]=["kibana"] if sys.argv[3]=="1" else ["none"]
+print(json.dumps(b))' "$idx" "$rename" "$kib")"
+      es_curl POST "/_snapshot/$ES_SNAP_REPO/$snap/_restore?wait_for_completion=true" --max-time 7200 -d "$body" | pretty ;;
     restore-manager)
       local stamp="${1:-}" dir f vol; dir="$(backup_dir)/config"
       [ -n "$stamp" ] || die "usage: vexor backup restore-manager <stamp>   (e.g. 20261015-013000, see: vexor backup list)"
@@ -4845,7 +4896,7 @@ _vexor() {
       node-type) words="status single multi --dry-run --no-backup --indexers" ;;
       reminders) words="list done" ;;
       ai-context) words="--print" ;;
-      backup)  words="run list register restore-snapshot restore-manager restore-config --rename --indices" ;;
+      backup)  words="run list register restore-snapshot restore-es restore-manager restore-config --rename --indices --kibana" ;;
       retention) words="show apply" ;;
       volumes) words="ls backup restore rm prune all --stop --out" ;;
       reset)   words="containers data full purge" ;;
@@ -5424,6 +5475,7 @@ ${C_BD}Health automation${C_0}
 ${C_BD}Data${C_0}
   backup [run]|list|register     indexer snapshot + manager state + config (keeps SNAPSHOT_RETENTION_DAYS)
   backup restore-snapshot <id> [--indices P] [--rename] | restore-manager <stamp> | restore-config <file>
+  backup restore-es <es-snap-id> [--indices P] [--rename] [--kibana]   Elasticsearch (SOC=elk|both) is in every backup
   retention [show|apply]         delete indices older than INDEX_RETENTION_DAYS
   prune-logs                     delete rotated manager logs older than MANAGER_LOG_RETENTION_DAYS
   volumes ls | backup <vol|all> [--stop] [--out DIR] | restore <vol> <file> | rm <vol> | prune
