@@ -10,7 +10,7 @@
 # =============================================================================
 set -uo pipefail
 
-VEXOR_VERSION="1.0.0"
+VEXOR_VERSION="1.2.0"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 ROOT="$(dirname "$SELF")"
 ENV_FILE="$ROOT/.env"
@@ -159,6 +159,10 @@ if out != src:
     print("fixed")
 PY
 }
+env_drop_legacy() {            # settings of removed features (Shuffle was replaced by n8n in 1.2.0)
+  grep -q '^SHUFFLE_' "$ENV_FILE" 2>/dev/null || return 0
+  sed -i '/^SHUFFLE_/d' "$ENV_FILE"; say "removed the old SHUFFLE_* settings from .env (Shuffle was replaced by n8n)"
+}
 ensure_env_defaults() {        # adds settings introduced by vexor to older .env files
   local added=0 line key
   while IFS= read -r line; do
@@ -204,6 +208,11 @@ GRAFANA_ADMIN_PASSWORD=CHANGE_ME     # generated when GRAFANA=true (grafana logi
 GRAFANA_INDEXER_PASSWORD=CHANGE_ME   # read-only indexer user "grafana" used by the datasource
 PORTAINER_ADMIN_PASSWORD=CHANGE_ME   # portainer login: admin (applied on its first start)
 N8N_ENCRYPTION_KEY=CHANGE_ME         # encrypts n8n credentials - keep it, back it up
+N8N_ALERT_LEVEL=7                    # alerts with this level or higher go to n8n (vexor n8n connect)
+N8N_HOOK_URL=
+N8N_ALERT_GROUPS=
+N8N_HOOK_TOKEN=
+WAZUH_N8N_USER=vexor-n8n
 SOC=wazuh                      # wazuh | elk | both  - switch with: vexor soc <value>
 ELK_VERSION=9.5.4              # Elasticsearch / Logstash / Kibana version
 ELK_HEAP=1g                    # Elasticsearch JVM heap
@@ -892,6 +901,7 @@ print("%s active, %s disconnected, %s never connected, %s pending" % (c.get("act
   node_type_pending && warn "NODE_TYPE=$(pending_target) in .env, the stack runs as $(node_type) - apply with: vexor node-type $(pending_target)"
   fi
   soc_elk && elk_status_lines
+  [ -n "$(n8n_hook)" ] && ok "Alerts -> n8n: level >= $(n8n_level) to $(n8n_hook)"
   local dr dp; dr="$(docker_root)"; dp="$(disk_pct "$dr")"
   if [ "${dp:-0}" -ge "$(env_def DISK_WARN_PCT 85)" ]; then warn "Disk: $dr ${dp}% used"; else ok "Disk: $dr ${dp}% used"; fi
   [ -f "$STATE_DIR/stopped" ] && warn "Marked as stopped (watchdog idle) - vexor start clears it"
@@ -1155,13 +1165,18 @@ cmd_doctor() {
     done
     if api_login; then d_pass "Wazuh API login OK ($(env_def API_USERNAME wazuh-wui))"
     else d_fail "Wazuh API login failed" "vexor passwd api"; fi
-    # outgoing integrations (Shuffle, Slack, VirusTotal...): a dead target only shows up in ossec.log
+    # outgoing integrations (n8n, Slack, VirusTotal...): a dead target only shows up in ossec.log
     local isvc ierr
     for isvc in $(enabled_managers); do
       is_running "$isvc" || continue
       ierr="$(dc exec -T "$isvc" bash -c 'c="$(date -u -d "-1 hour" "+%Y/%m/%d %H:%M:%S")"
         awk -v c="$c" "substr(\$0,1,19) >= c && /wazuh-integratord: ERROR: Unable to run integration/" /var/ossec/logs/ossec.log 2>/dev/null \
           | sed -E "s/.*integration for ([^ ]+).*/\1/" | sort | uniq -c | tr "\n" " "' 2>/dev/null)"
+      local jtf; jtf="$(dc exec -T "$isvc" sh -c 'tail -n 20000 /var/ossec/logs/ossec.log | grep -c "Too many fields for JSON decoder"' 2>/dev/null)"
+      if [ "${jtf:-0}" -gt 50 ]; then
+        d_warn "$isvc: $jtf events rejected by the JSON decoder (too many fields - usually Suricata stats/flow records)" "vexor tools apply   (Wazuh then reads only Suricata alerts/anomalies)"
+        [ "$isvc" = wazuh.master ] && d_fix "restrict the Suricata source + recreate the master"           && { [ "$(sync_master_localfiles)" = changed ] && dc_restart wazuh.master >/dev/null 2>&1; }
+      fi
       if [ -n "${ierr// /}" ]; then
         d_warn "$isvc: integration deliveries failing in the last hour (count name): $ierr" "target down or moved - fix the URL in config/wazuh_cluster/*.conf, or remove the <integration> block; then: vexor restart managers"
       fi
@@ -1241,6 +1256,8 @@ cmd_doctor() {
     fi
     local du; du="$(du -sh "$TOOLS_DATA" 2>/dev/null | cut -f1)"; [ -n "$du" ] && say "sensor logs on disk: $du (kept $(env_def TOOLS_LOG_RETENTION_DAYS 7) days)"
   fi
+
+  [ -n "$(n8n_hook)" ] && n8n_doctor
 
   hdr "Logs (last 15 min)"
   local cid name cnt
@@ -2542,14 +2559,15 @@ path, sur, zeek, zlogs = sys.argv[1], sys.argv[2] == "1", sys.argv[3] == "1", [x
 s = open(path).read(); o = s
 s = re.sub(r"[ \t]*<!-- (?:vexor|wazuhctl):sensors:begin.*?<!-- (?:vexor|wazuhctl):sensors:end -->\n?", "", s, flags=re.S)
 lf = []
-if sur:
-    lf.append(("json", "/var/log/suricata/eve.json"))
+if sur:   # alerts + anomalies only: stats/flow records have hundreds of fields ("Too many fields for JSON decoder")
+    lf.append(("json", "/var/log/suricata/eve.json", '"event_type":"(alert|anomaly)"'))
 if zeek:
-    lf += [("json", f"/var/log/zeek/{n}.log") for n in zlogs]
+    lf += [("json", f"/var/log/zeek/{n}.log", "") for n in zlogs]
 if lf:
     blk = "  <!-- vexor:sensors:begin (managed by: vexor tools - SURICATA/ZEEK in .env) -->\n"
-    for fmt, loc in lf:
-        blk += f"  <localfile>\n    <log_format>{fmt}</log_format>\n    <location>{loc}</location>\n  </localfile>\n"
+    for fmt, loc, only in lf:
+        rst = f'    <restrict type="PCRE2">{only}</restrict>\n' if only else ""
+        blk += f"  <localfile>\n    <log_format>{fmt}</log_format>\n    <location>{loc}</location>\n{rst}  </localfile>\n"
     blk += "  <!-- vexor:sensors:end -->\n"
     s = s.replace("</ossec_config>", blk + "</ossec_config>", 1)
 if s != o:
@@ -2766,14 +2784,21 @@ redef Log::default_rotation_interval = 1 hr;
 EOF
   fi
   write_tool_rules
-  TOOLS_MASTER_CHANGED=0
+  TOOLS_MASTER_CHANGED=0 N8N_BLOCKS_CHANGED=0
   soc_wazuh && [ "$(sync_master_localfiles)" = changed ] && TOOLS_MASTER_CHANGED=1
+  [ "$(n8n_sync_blocks)" = changed ] && N8N_BLOCKS_CHANGED=1
   sync_profiles; render_override; render_nginx
 }
-tools_post() {                 # after `docker compose up`: master reload, users, rules, nginx
-  if [ "${TOOLS_MASTER_CHANGED:-0}" = 1 ] && is_running wazuh.master; then
-    say "recreating the master to load the sensor log sources (agents reconnect by themselves)"
-    dc_restart wazuh.master >/dev/null 2>&1
+tools_post() {                 # after `docker compose up`: manager reload, users, rules, nginx
+  local again=""
+  N8N_INSTALLED=""
+  soc_wazuh && [ -n "$(n8n_hook)" ] && n8n_install_script
+  if [ "${N8N_BLOCKS_CHANGED:-0}" = 1 ]; then again="$(enabled_managers)"
+  else again="$N8N_INSTALLED"; [ "${TOOLS_MASTER_CHANGED:-0}" = 1 ] && again="$again wazuh.master"; fi
+  again="$(tr ' ' '\n' <<<"$again" | grep -v '^$' | sort -u | while read -r m; do is_running "$m" && echo "$m"; done | tr '\n' ' ')"
+  if [ -n "${again// /}" ]; then
+    say "recreating $again- they load the sensor log sources / n8n integration (agents reconnect by themselves)"
+    dc_restart $again >/dev/null 2>&1
   fi
   if tool_on grafana; then
     { grafana_user_exists && grafana_user_ok && ! grep -q wazuhctl_grafana "$INTERNAL_USERS"; } || grafana_indexer_user add
@@ -2799,7 +2824,7 @@ tools_status() {
   done
   tool_on grafana && say "grafana login: admin / GRAFANA_ADMIN_PASSWORD (vexor config get GRAFANA_ADMIN_PASSWORD) - dashboard: Wazuh / Wazuh alerts overview"
   tool_on portainer && say "portainer login: admin / PORTAINER_ADMIN_PASSWORD (only applied on its first start)"
-  tool_on n8n && say "n8n: the FIRST person who opens it creates the owner account - open it right after enabling"
+  tool_on n8n && say "n8n: the FIRST person who opens it creates the owner account - open it right after enabling; then: vexor n8n connect && vexor n8n workflow"
   return 0
 }
 tools_maintenance() {          # daily: rotate sensor logs, prune old ones, refresh Suricata rules
@@ -2922,6 +2947,8 @@ services:
       LS_JAVA_OPTS: "-Xms${LOGSTASH_HEAP:-512m} -Xmx${LOGSTASH_HEAP:-512m}"
       VEXOR_ES_USER: vexor_logstash
       VEXOR_ES_PASSWORD: ${LOGSTASH_ES_PASSWORD:-}
+      VEXOR_N8N_URL: ${N8N_HOOK_URL:-}
+      VEXOR_N8N_TOKEN: ${N8N_HOOK_TOKEN:-}
     ports:
       - "${LOGSTASH_BEATS_PORT:-55044}:5044"
     volumes:
@@ -2954,9 +2981,11 @@ EOF
   [ "$(soc)" = both ] && wz=1
   tool_on suricata && su=1
   tool_on zeek && ze=1
-  python3 -I - "$ELK_DIR/logstash/pipeline/vexor.conf.tmp" "$wz" "$su" "$ze" "$(env_def ZEEK_WAZUH_LOGS notice,weird,dns,http,ssl,ssh)" <<'PY'
+  local nf=0; [ "$(soc)" = elk ] && [ -n "$(n8n_hook)" ] && nf=1
+  python3 -I - "$ELK_DIR/logstash/pipeline/vexor.conf.tmp" "$wz" "$su" "$ze" "$(env_def ZEEK_WAZUH_LOGS notice,weird,dns,http,ssl,ssh)" "$nf" "$(n8n_level)" <<'PY'
 import sys
 out, wz, su, ze, zl = sys.argv[1], sys.argv[2] == "1", sys.argv[3] == "1", sys.argv[4] == "1", sys.argv[5]
+n8n, lvl = sys.argv[6] == "1", int(sys.argv[7])
 zfiles = ", ".join(f'"/vexor-sensors/zeek/logs/{n.strip()}.log"' for n in zl.split(",") if n.strip())
 i = ["input {", '  beats { port => 5044 tags => ["beats"] }']
 if wz:
@@ -2976,15 +3005,28 @@ f = ["filter {",
      '  if "zeek" in [tags] {',
      '    date { match => ["ts", "UNIX"] target => "@timestamp" }',
      '    grok { match => { "[log][file][path]" => "/(?<[zeek][log]>[a-z_]+)\\.log$" } tag_on_failure => [] }',
-     "  }",
-     "}"]
+     "  }"]
+if n8n:                       # SOC=elk: no Wazuh in between - Logstash hands alerts to n8n itself
+    sev = [str(k) for k, v in {1: 12, 2: 7, 3: 4}.items() if v >= lvl]
+    if su and sev:
+        f += ['  if "suricata" in [tags] and [event_type] == "alert" and [alert][severity] in [%s] {' % ", ".join(sev),
+              '    mutate { add_tag => ["n8n"] }', "  }"]
+    if ze and lvl <= 6:
+        f += ['  if "zeek" in [tags] and [zeek][log] == "notice" { mutate { add_tag => ["n8n"] } }']
+f.append("}")
 es = '    elasticsearch { hosts => ["http://elasticsearch:9200"] user => "${VEXOR_ES_USER}" password => "${VEXOR_ES_PASSWORD}" index => "%s-%%{+YYYY.MM.dd}" }'
 o = ["output {",
      '  if "wazuh" in [tags] {', es % "vexor-wazuh-alerts",
      '  } else if "suricata" in [tags] {', es % "vexor-suricata",
      '  } else if "zeek" in [tags] {', es % "vexor-zeek",
      "  } else {", es % "vexor-beats",
-     "  }", "}"]
+     "  }"]
+if n8n:
+    o += ['  if "n8n" in [tags] {',
+          '    http { url => "${VEXOR_N8N_URL}" http_method => "post" format => "json"'
+          ' headers => { "X-Vexor-Token" => "${VEXOR_N8N_TOKEN}" "X-Vexor-Source" => "logstash" } }',
+          "  }"]
+o.append("}")
 open(out, "w").write("# GENERATED by vexor - follows SOC and SURICATA/ZEEK in .env\n" + "\n".join(i + [""] + f + [""] + o) + "\n")
 PY
   local f; for f in "$ELK_DIR/logstash/logstash.yml" "$ELK_DIR/logstash/pipeline/vexor.conf"; do
@@ -3159,7 +3201,8 @@ apply_all() {                  # the one reconcile path: render everything, pull
 }
 cmd_elk() {
   case "${1:-status}" in
-    status) soc_elk || die "ELK is off (SOC=$(soc)) - enable it: vexor soc both|elk"; elk_status_lines ;;
+    status) soc_elk || die "ELK is off (SOC=$(soc)) - enable it: vexor soc both|elk"; hdr "ELK (Elastic $(elk_version))"; elk_status_lines
+            say "Beats / Elastic Agent -> $(public_host):$(env_def LOGSTASH_BEATS_PORT 55044)   (vexor elk beats-config)" ;;
     explain) es_curl GET /_cluster/allocation/explain?pretty ;;
     reset-password)
       soc_elk || die "ELK is off"
@@ -3172,7 +3215,16 @@ cmd_elk() {
         es_curl POST /_security/user/elastic/_password -d "{\"password\":\"$np\"}" >/dev/null && env_set ELASTIC_PASSWORD "$np"
         ok "elastic password reset and stored in .env"; elk_post
       else bad "reset failed - vexor logs elasticsearch"; fi ;;
-    *) die "usage: vexor elk [status] | explain | reset-password" ;;
+    indices) es_curl GET '/_cat/indices/vexor-*?v&s=index&h=health,index,docs.count,store.size&expand_wildcards=open' ;;
+    search) shift; soc_elk || die "ELK is off"; elk_search "$@" ;;
+    data-views) soc_elk || die "ELK is off"; elk_data_views ;;
+    retention) soc_elk || die "ELK is off"; elk_retention_apply ;;
+    beats-config|filebeat) soc_elk || die "ELK is off"; elk_beats_config ;;
+    es) shift; soc_elk || die "ELK is off"; local m="${1:?usage: vexor elk es <METHOD> <path> [json]}" pth="${2:?path}"; shift 2
+        if [ $# -gt 0 ]; then es_curl "$m" "$pth" -d "$1"; else es_curl "$m" "$pth"; fi; echo ;;
+    logs) shift; cmd_logs "${@:-elasticsearch}" ;;
+    *) die "usage: vexor elk [status] | indices | search [query] [-n N] [--index P] | data-views | retention
+                | beats-config | es <METHOD> <path> [json] | explain | reset-password | logs [svc]" ;;
   esac
 }
 
@@ -3261,7 +3313,7 @@ cmd_autoheal() {               # timer: doctor --fix, re-check, record result, r
 }
 mask_secrets() {
   sed -E 's/^([A-Z_]*(PASSWORD|SECRET|TOKEN|APIKEY|ENCRYPTION_KEY)[A-Z_]*=)[^[:space:]#]+/\1***/;
-          s/(password|hash|"key"|<key>)([":[:space:]=]*)[^<",[:space:]]+/\1\2***/Ig;
+          s/(password|hash|"key"|<key>|<api_key>)([":[:space:]=]*)[^<",[:space:]]+/\1\2***/Ig;
           s/ey[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_.-]+/***jwt***/g;
           s/webhook_[0-9a-fA-F-]{8,}/webhook_***/g'
 }
@@ -3299,14 +3351,15 @@ $flow
 - SOC=$(soc) (wazuh | elk | both); ELK $(soc_elk && echo "on: Elastic $(elk_version), Kibana via nginx :$(env_def KIBANA_PORT 55601), Logstash beats :$(env_def LOGSTASH_BEATS_PORT 55044)$( [ "$(soc)" = both ] && echo ', Wazuh alerts copied to vexor-wazuh-alerts-*')" || echo off)
 - Optional tools enabled: $(enabled_tools | tr '\n' ' ')(web tools via nginx on their 5XXXX ports; Suricata/Zeek sniff $(sniff_iface), logs read by the master)
 - Wazuh API published on host port $(api_port); indexer API on $(env_def INDEXER_BIND 127.0.0.1):$(indexer_port)
-- Shuffle SOAR: $( [ -n "$(env_get SHUFFLE_HOOK_URL)" ] && echo "alerts level >= $(env_def SHUFFLE_ALERT_LEVEL 3) sent to a Shuffle webhook by every manager" || echo "not connected" ); Shuffle API user: $(env_def SHUFFLE_API_USER none)
+- n8n automation: $( [ -n "$(n8n_hook)" ] && echo "alerts level >= $(n8n_level) posted to $(n8n_hook) ($(soc_wazuh && echo 'Wazuh integration custom-n8n on every manager')$( [ "$(soc)" = elk ] && echo 'Logstash http output: Suricata alerts + Zeek notices'))" || echo "not connected" ); Wazuh API user for n8n: $( [ -n "$(env_get WAZUH_N8N_PASSWORD)" ] && env_def WAZUH_N8N_USER vexor-n8n || echo none )
 - Dashboard certificate mode: $(cert_mode); internal TLS between all components from config/wazuh_indexer_ssl_certs
 - Automation: watchdog every 5 min, health check (doctor --fix) every $(env_def HEALTH_INTERVAL 1h), daily backup $(env_def BACKUP_TIME 01:30), maintenance $(env_def MAINT_TIME 02:15) - installed: $(systemctl is-enabled "$UNIT-health.timer" 2>/dev/null || echo no)
 
 ## Management CLI (vexor)
 status | doctor [--fix] | logs <svc> [-n N] | logs ossec|cluster|api <node> | logs errors --since 1h |
 restart <svc> | indexer GET <path> | api GET <path> | node-type status|single|multi [--dry-run] | indexers status|1|3 |
-scale <1-3> | backup | update | cert status | passwd | agents list | shuffle status | reminders | ai-context
+scale <1-3> | backup | update | cert status | passwd | agents list | reminders | ai-context |
+wazuh alerts | elk status|search | n8n status|test | suricata status|alerts|test | zeek status|show <log>|top
 Service names: wazuh.master wazuh.worker wazuh2.worker wazuh3.worker wazuh1.indexer wazuh2.indexer wazuh3.indexer wazuh.dashboard nginx
 (in node type single only wazuh.master, wazuh1.indexer and wazuh.dashboard exist)
 
@@ -3390,145 +3443,702 @@ cmd_ai_context() {
   say "Or straight to your terminal: vexor ai-context --print"
 }
 
-# ============================================================== Shuffle SOAR
-# Wazuh -> Shuffle: built-in "shuffle" integration on EVERY manager (agents are balanced
-#                   over master + workers, so alerts are produced on all of them).
-# Shuffle -> Wazuh: dedicated API user with a "soar" role (read + agent actions + active response).
-shuffle_files() { echo "$CLUSTER_DIR/wazuh_manager.conf"; ls "$CLUSTER_DIR"/wazuh_worker*.conf 2>/dev/null; }
-shuffle_write_block() {        # shuffle_write_block <url|""> <level> <groups>
-  python3 -I - "$1" "$2" "$3" $(shuffle_files) <<'PY'
+# ============================================================== n8n automation (SOAR)
+# Alerts -> n8n : SOC wazuh|both - Wazuh integration "custom-n8n" on EVERY manager (agents are balanced
+#                 over master + workers) posts each alert with level >= N8N_ALERT_LEVEL as JSON to an n8n
+#                 webhook, with the header X-Vexor-Token: N8N_HOOK_TOKEN.
+#                 SOC elk - Logstash posts Suricata alerts and Zeek notices to the same webhook.
+# n8n -> stacks : vexor n8n credentials - least-privilege users for n8n workflows (Wazuh API: agents +
+#                 active response; Elasticsearch: read vexor-*), reached on the internal Docker network.
+N8N_SCRIPT_NAME="custom-n8n"
+n8n_hook() { env_get N8N_HOOK_URL; }
+n8n_level() { env_def N8N_ALERT_LEVEL 7; }
+n8n_conf_files() { echo "$CLUSTER_DIR/wazuh_manager.conf"; ls "$CLUSTER_DIR"/wazuh_worker*.conf 2>/dev/null; }
+n8n_hook_url() {               # <path | url> -> URL the managers / Logstash use (n8n of this stack = internal address)
+  python3 -I - "$1" "$(public_host)" "$(tool_port n8n)" <<'PY'
+import sys
+from urllib.parse import urlsplit
+v, host, port = sys.argv[1].strip(), sys.argv[2], sys.argv[3]
+if "://" not in v:
+    v = v.strip("/")
+    if not v.startswith(("webhook/", "webhook-test/")):
+        v = "webhook/" + v
+    print("http://n8n:5678/" + v)
+    sys.exit()
+u = urlsplit(v)
+ours = u.hostname == "n8n" or (u.hostname in (host, "localhost", "127.0.0.1") and str(u.port) == port)
+print("http://n8n:5678" + u.path + ("?" + u.query if u.query else "") if ours else v)
+PY
+}
+n8n_write_script() {           # the integration script installed into every manager
+  mkdir -p "$TOOLS_DIR/wazuh"
+  cat > "$TOOLS_DIR/wazuh/$N8N_SCRIPT_NAME.py" <<'EOF'
+# GENERATED by vexor - Wazuh -> n8n (custom integration "custom-n8n"). Do not edit: vexor n8n connect rewrites it.
+# wazuh-integratord calls: custom-n8n <alert_file> <api_key> <hook_url> [debug]
+# The whole alert is posted as JSON; <api_key> is sent as X-Vexor-Token so the workflow can reject other callers.
+import json
+import sys
+import time
+
+import requests
+
+LOG = "/var/ossec/logs/integrations.log"
+
+
+def log(msg):
+    try:
+        with open(LOG, "a") as f:
+            f.write(time.strftime("%Y/%m/%d %H:%M:%S") + " custom-n8n: " + msg + "\n")
+    except OSError:
+        pass
+
+
+def main(argv):
+    if len(argv) < 4:
+        log("bad arguments: %s" % argv[1:])
+        sys.exit(2)
+    alert_file, token, url = argv[1], argv[2], argv[3]
+    try:
+        with open(alert_file) as f:
+            alert = json.load(f)
+    except (OSError, ValueError) as e:
+        log("cannot read the alert: %s" % e)
+        sys.exit(6)
+    headers = {"X-Vexor-Token": token, "X-Vexor-Source": "wazuh"}
+    requests.packages.urllib3.disable_warnings()
+    for attempt in (1, 2, 3):
+        try:
+            r = requests.post(url, json=alert, headers=headers, timeout=10, verify=False)
+            if r.status_code < 300:
+                return
+            log("HTTP %s from %s: %s" % (r.status_code, url, r.text[:200].replace("\n", " ")))
+            if r.status_code == 404:          # workflow not published / wrong path: retrying cannot help
+                break
+        except requests.RequestException as e:
+            log("attempt %d to %s: %s" % (attempt, url, e))
+        time.sleep(attempt)
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
+EOF
+  chmod 644 "$TOOLS_DIR/wazuh/$N8N_SCRIPT_NAME.py"
+}
+n8n_script_current() {         # n8n_script_current <manager>: installed and identical to the generated one
+  local want got; want="$(md5sum < "$TOOLS_DIR/wazuh/$N8N_SCRIPT_NAME.py" 2>/dev/null | cut -d' ' -f1)"
+  got="$(dc exec -T "$1" sh -c "test -x /var/ossec/integrations/$N8N_SCRIPT_NAME && md5sum < /var/ossec/integrations/$N8N_SCRIPT_NAME.py" 2>/dev/null | cut -d' ' -f1)"
+  [ -n "$want" ] && [ "$want" = "$got" ]
+}
+n8n_install_script() {         # Wazuh python launcher (same as slack) + our script into each running manager's integrations volume
+  n8n_write_script
+  local m rc=0
+  for m in $(enabled_managers); do
+    is_running "$m" || continue
+    n8n_script_current "$m" && continue
+    if dc exec -T "$m" sh -c "d=/var/ossec/integrations; cp \$d/slack \$d/$N8N_SCRIPT_NAME && cat > \$d/$N8N_SCRIPT_NAME.py \
+         && chown root:wazuh \$d/$N8N_SCRIPT_NAME \$d/$N8N_SCRIPT_NAME.py && chmod 750 \$d/$N8N_SCRIPT_NAME \$d/$N8N_SCRIPT_NAME.py" \
+         < "$TOOLS_DIR/wazuh/$N8N_SCRIPT_NAME.py"; then
+      say "$m: integration script $N8N_SCRIPT_NAME installed"; N8N_INSTALLED="${N8N_INSTALLED:-} $m"
+    else bad "$m: could not install $N8N_SCRIPT_NAME"; rc=1; fi
+  done
+  return "$rc"
+}
+n8n_sync_blocks() {            # <integration> block in master + worker configs (also drops old Shuffle blocks);
+  local url="" lvl grp tok         # prints "changed" when a file was edited
+  soc_wazuh && url="$(n8n_hook)"
+  lvl="$(n8n_level)"; grp="$(env_get N8N_ALERT_GROUPS)"; tok="$(env_get N8N_HOOK_TOKEN)"
+  python3 -I - "$url" "$lvl" "$grp" "$tok" $(n8n_conf_files) <<'PY'
 import re, sys
 from xml.sax.saxutils import escape
-url, level, groups, files = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+url, level, groups, token, files = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
 grp = f"    <group>{escape(groups)}</group>\n" if groups else ""
-block = ("  <!-- vexor:shuffle:begin (managed by: vexor shuffle) -->\n"
+block = ("  <!-- vexor:n8n:begin (managed by: vexor n8n) -->\n"
          "  <integration>\n"
-         "    <name>shuffle</name>\n"
+         "    <name>custom-n8n</name>\n"
          f"    <hook_url>{escape(url)}</hook_url>\n"
+         f"    <api_key>{escape(token)}</api_key>\n"
          f"    <level>{level}</level>\n{grp}"
          "    <alert_format>json</alert_format>\n"
          "  </integration>\n"
-         "  <!-- vexor:shuffle:end -->\n")
+         "  <!-- vexor:n8n:end -->\n")
+changed = False
 for f in files:
-    s = open(f).read()
-    s = re.sub(r"[ \t]*<!-- (?:vexor|wazuhctl):shuffle:begin.*?<!-- (?:vexor|wazuhctl):shuffle:end -->\n?", "", s, flags=re.S)
+    s = open(f).read(); o = s
+    s = re.sub(r"[ \t]*<!-- (?:vexor|wazuhctl):(?:n8n|shuffle):begin.*?<!-- (?:vexor|wazuhctl):(?:n8n|shuffle):end -->\n?", "", s, flags=re.S)
     if url:
         s = s.replace("</ossec_config>", block + "</ossec_config>", 1)
-    open(f, "w").write(s)          # in-place write keeps the bind-mounted inode
+    if s != o:
+        open(f, "w").write(s)          # in-place write keeps the bind-mounted inode
+        changed = True
+print("changed" if changed else "")
 PY
 }
-shuffle_fix_url() {            # Shuffle shows its internal BASE_URL host; managers need the host IP
-  python3 -I - "$1" "$(public_host)" <<'PY'
-import sys
-from urllib.parse import urlsplit, urlunsplit
-url, host = sys.argv[1:3]
-u = urlsplit(url)
-if u.hostname in ("shuffle-backend", "localhost", "127.0.0.1", "0.0.0.0", "backend"):
-    u = u._replace(netloc=f"{host}:{u.port or 5001}")
-print(urlunsplit(u))
+n8n_probe() {                  # webhook state seen from the managers' network: registered | inactive | down
+  local body svc=wazuh.master
+  soc_wazuh || svc=logstash
+  is_running "$svc" || { echo down; return 0; }
+  body="$(dc exec -T "$svc" curl -sk --max-time 8 "$(n8n_hook)" 2>/dev/null)"
+  case "$body" in
+    *"not registered for GET"*|*"not registered for the GET"*) echo registered ;;
+    *"is not registered"*|*"not registered"*) echo inactive ;;
+    "") echo down ;;
+    *) echo registered ;;
+  esac
+}
+n8n_owner_set() { [ "$(curl -sk --max-time 8 "https://127.0.0.1:$(tool_port n8n)/rest/settings" 2>/dev/null | pj 'print(d["data"]["userManagement"]["showSetupOnFirstLoad"])' 2>/dev/null)" = False ]; }
+n8n_apply() {                  # after connect/disconnect/level change: configs, script, reload what reads them
+  if soc_wazuh; then
+    local ch restart; ch="$(n8n_sync_blocks)"
+    N8N_INSTALLED=""
+    [ -n "$(n8n_hook)" ] && n8n_install_script
+    if [ "$ch" = changed ]; then restart="$(enabled_managers)"; else restart="$N8N_INSTALLED"; fi
+    if [ -n "${restart// /}" ]; then
+      say "recreating $(echo $restart | tr '
+' ' ')to load the integration (agents reconnect by themselves) ..."
+      dc_restart $restart >/dev/null 2>&1
+      local m; for m in $restart; do
+        [ -n "$(n8n_hook)" ] || continue
+        if wait_daemon "$m" wazuh-integratord 150; then ok "$m: integratord running - alerts level >= $(n8n_level) go to n8n"
+        else bad "$m: integratord not running after 150s - vexor logs ossec $m"; fi
+      done
+    fi
+  fi
+  if soc_elk; then
+    write_logstash_config
+    is_running logstash && { dc up -d --no-deps logstash >/dev/null 2>&1; ok "Logstash pipeline updated"; }
+  fi
+  return 0
+}
+n8n_doctor() {                 # alerts -> n8n path: config blocks, script per manager, webhook registered
+  hdr "n8n alert forwarding"
+  if soc_wazuh; then
+    local f m
+    for f in $(n8n_conf_files); do
+      grep -q 'vexor:n8n:begin' "$f" || { d_fail "$(basename "$f") has no n8n integration" "vexor n8n connect"; d_fix "write the integration blocks" && n8n_apply; break; }
+    done
+    for m in $(enabled_managers); do
+      is_running "$m" || continue
+      if n8n_script_current "$m"; then d_pass "$m: custom-n8n script installed"
+      else d_fail "$m: custom-n8n script missing/outdated (alerts are not delivered)" "vexor doctor --fix"
+           d_fix "install the script + recreate $m" && { N8N_INSTALLED=""; n8n_install_script && dc_restart "$m" >/dev/null 2>&1; }; fi
+    done
+  fi
+  case "$(n8n_probe)" in
+    registered) d_pass "n8n webhook registered ($(n8n_hook))" ;;
+    inactive) d_warn "n8n webhook not registered - the workflow is not published" "vexor n8n workflow   (or publish your workflow in n8n)" ;;
+    *) d_fail "n8n not reachable from the stack ($(n8n_hook))" "vexor n8n status   (N8N enabled? URL right?)" ;;
+  esac
+}
+n8n_workflow_json() {          # starter workflow: webhook -> check token + normalise (Wazuh/Suricata/Zeek) -> route by severity
+  python3 -I - "$(env_get N8N_HOOK_TOKEN)" "$(n8n_hook | sed -E 's#^.*/(webhook(-test)?/)##')" <<'PY'
+import json, sys
+token, path = sys.argv[1], sys.argv[2] or "vexor-alerts"
+code = r"""// Vexor: accept only calls that carry the token, then give every source the same shape.
+const TOKEN = '%s';
+const out = [];
+for (const item of $input.all()) {
+  const h = item.json.headers || {};
+  if (h['x-vexor-token'] !== TOKEN) continue;             // not from Vexor: drop it
+  const a = item.json.body || {};
+  let source = 'other', level = 0, title = '', where = '';
+  if (a.rule) {                                          // Wazuh alert (also Suricata/Zeek seen by Wazuh)
+    source = 'wazuh'; level = Number(a.rule.level || 0); title = a.rule.description || '';
+    where = (a.agent || {}).name || '';
+  } else if (a.event_type === 'alert' && a.alert) {      // Suricata eve alert (SOC=elk, via Logstash)
+    source = 'suricata'; level = ({1: 12, 2: 7, 3: 4})[a.alert.severity] || 3;
+    title = a.alert.signature || ''; where = `${a.src_ip}:${a.src_port} -> ${a.dest_ip}:${a.dest_port}`;
+  } else if (a.note) {                                   // Zeek notice (SOC=elk, via Logstash)
+    source = 'zeek'; level = 6; title = `${a.note}: ${a.msg || ''}`; where = a['id.orig_h'] || a.src || '';
+  }
+  const severity = level >= 12 ? 'critical' : level >= 7 ? 'high' : level >= 4 ? 'medium' : 'low';
+  out.push({ json: { source, severity, level, title, where,
+                     time: a.timestamp || a['@timestamp'] || new Date().toISOString(), alert: a } });
+}
+return out;""" % token
+def rule(value):
+    return {"conditions": {"options": {"caseSensitive": True, "leftValue": "", "typeValidation": "strict", "version": 2},
+                           "conditions": [{"id": value, "leftValue": "={{ $json.severity }}", "rightValue": value,
+                                           "operator": {"type": "string", "operation": "equals"}}],
+                           "combinator": "and"},
+            "renameOutput": True, "outputKey": value}
+sev = ["critical", "high", "medium", "low"]
+nodes = [
+    {"parameters": {"httpMethod": "POST", "path": path, "responseMode": "onReceived", "options": {}},
+     "id": "6c1f2b1e-0001-4a10-9d70-7665786f7201", "name": "Alerts from Vexor", "type": "n8n-nodes-base.webhook",
+     "typeVersion": 2, "position": [0, 200], "webhookId": "6c1f2b1e-0001-4a10-9d70-7665786f7299"},
+    {"parameters": {"jsCode": code}, "id": "6c1f2b1e-0002-4a10-9d70-7665786f7202", "name": "Check token + normalise",
+     "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [260, 200]},
+    {"parameters": {"rules": {"values": [rule(s) for s in sev]}, "options": {}},
+     "id": "6c1f2b1e-0003-4a10-9d70-7665786f7203", "name": "Route by severity", "type": "n8n-nodes-base.switch",
+     "typeVersion": 3.2, "position": [520, 200]},
+]
+for i, s in enumerate(sev):
+    nodes.append({"parameters": {}, "id": f"6c1f2b1e-001{i}-4a10-9d70-7665786f72{10 + i}",
+                  "name": f"{s.capitalize()} - add your actions", "type": "n8n-nodes-base.noOp",
+                  "typeVersion": 1, "position": [800, 20 + i * 130]})
+nodes.append({"parameters": {"content": "## Vexor SOC alerts\nWazuh posts alerts (level >= N8N_ALERT_LEVEL) here; with SOC=elk, Logstash posts Suricata alerts and Zeek notices.\n\nReplace the four *add your actions* nodes: Slack / e-mail / ticket, or call back into the stack with the credentials from `vexor n8n credentials` (Wazuh API: https://wazuh.master:55000, Elasticsearch: http://elasticsearch:9200).\n\nTest: `vexor n8n test`",
+                         "height": 300, "width": 420},
+              "id": "6c1f2b1e-0020-4a10-9d70-7665786f7220", "name": "About", "type": "n8n-nodes-base.stickyNote",
+              "typeVersion": 1, "position": [-40, -200]})
+conn = {"Alerts from Vexor": {"main": [[{"node": "Check token + normalise", "type": "main", "index": 0}]]},
+        "Check token + normalise": {"main": [[{"node": "Route by severity", "type": "main", "index": 0}]]},
+        "Route by severity": {"main": [[{"node": f"{s.capitalize()} - add your actions", "type": "main", "index": 0}] for s in sev]}}
+print(json.dumps([{"id": "vexorSocAlerts01", "name": "Vexor - SOC alerts", "nodes": nodes, "connections": conn,
+                   "settings": {"executionOrder": "v1"}, "active": False}], indent=1))
 PY
 }
-cmd_shuffle() {
+n8n_workflow_import() {
+  tool_on n8n && is_running n8n || die "n8n is not running - vexor tools enable n8n"
+  [ -n "$(env_get N8N_HOOK_TOKEN)" ] || gen_secret N8N_HOOK_TOKEN hex
+  mkdir -p "$TOOLS_DIR/n8n"; n8n_workflow_json > "$TOOLS_DIR/n8n/vexor-soc-alerts.workflow.json"
+  dc cp "$TOOLS_DIR/n8n/vexor-soc-alerts.workflow.json" n8n:/tmp/vexor-soc-alerts.workflow.json >/dev/null 2>&1 || die "could not copy the workflow into n8n"
+  dc exec -T n8n n8n import:workflow --input=/tmp/vexor-soc-alerts.workflow.json >"$RUN_TMP/n8n-import" 2>&1 \
+    || { tail -n 5 "$RUN_TMP/n8n-import"; die "n8n import failed"; }
+  dc exec -T n8n n8n publish:workflow --id=vexorSocAlerts01 >"$RUN_TMP/n8n-publish" 2>&1 \
+    || { tail -n 5 "$RUN_TMP/n8n-publish"; warn "imported, but publishing failed - open it in n8n and click Publish"; }
+  dc restart n8n >/dev/null 2>&1        # a running n8n only picks up CLI changes after a restart
+  local i; for i in $(seq 1 30); do [ "$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:$(tool_port n8n)/healthz")" = 200 ] && break; sleep 2; done
+  ok "workflow 'Vexor - SOC alerts' imported and published (webhook path: $(n8n_hook | sed -E 's#^.*/webhook/##'))"
+  n8n_owner_set || warn "n8n has no owner account yet: open https://$(public_host):$(tool_port n8n) now - the first visitor becomes the owner"
+  say "file: $TOOLS_DIR/n8n/vexor-soc-alerts.workflow.json  (re-import after editing it, or edit the workflow in n8n)"
+}
+n8n_credentials() {            # least-privilege users n8n workflows use to act on / read the stacks
+  take_lock
+  if soc_wazuh; then
+    api_login || die "Wazuh API not reachable"
+    local user pw rid uid pol ro
+    user="$(env_def WAZUH_N8N_USER vexor-n8n)"; pw="$(gen_pw)"
+    [[ "$user" =~ ^[A-Za-z0-9._@-]{4,64}$ ]] || die "WAZUH_N8N_USER=$user - Wazuh user names are 4-64 letters, digits or . _ @ -"
+    pol="$(api GET "/security/policies?limit=500" | pj '
+want = {"agents_read_agents", "agents_all_agents", "agents_commands_agents", "syscheck_all_syscheck"}
+print(",".join(str(p["id"]) for p in d["data"]["affected_items"] if p["name"] in want))')"
+    [ -n "$pol" ] || die "could not read the Wazuh RBAC policies"
+    rid="$(api GET "/security/roles?limit=500" | pj 'print(next((r["id"] for r in d["data"]["affected_items"] if r["name"] == "vexor_n8n"), ""))')"
+    [ -n "$rid" ] || rid="$(api POST /security/roles -d '{"name":"vexor_n8n"}' | pj 'print(d["data"]["affected_items"][0]["id"])')" || die "could not create the role vexor_n8n"
+    api POST "/security/roles/$rid/policies?policy_ids=$pol" >/dev/null
+    uid="$(api GET "/security/users?limit=500" | pj 'print(next((u["id"] for u in d["data"]["affected_items"] if u["username"] == sys.argv[1]), ""))' "$user")"
+    if [ -n "$uid" ]; then api PUT "/security/users/$uid" -d "{\"password\":\"$pw\"}" | has '"error": *0' || die "could not reset the password of '$user'"
+    else
+      api POST /security/users -d "{\"username\":\"$user\",\"password\":\"$pw\"}" > "$RUN_TMP/n8n-user.json"
+      uid="$(pj 'print(d["data"]["affected_items"][0]["id"])' < "$RUN_TMP/n8n-user.json" 2>/dev/null)"         || die "could not create the Wazuh API user '$user': $(head -c 300 "$RUN_TMP/n8n-user.json")"
+    fi
+    ro="$(api GET "/security/roles?limit=500" | pj 'print(next((r["id"] for r in d["data"]["affected_items"] if r["name"] == "readonly"), ""))')"
+    api POST "/security/users/$uid/roles?role_ids=${ro:+$ro,}$rid" >/dev/null
+    env_set WAZUH_N8N_USER "$user"; env_set WAZUH_N8N_PASSWORD "$pw"; chmod 600 "$ENV_FILE"
+    local c; c="$(curl -sk -o /dev/null -w '%{http_code}' -X POST -u "$user:$pw" "https://127.0.0.1:$(api_port)/security/user/authenticate?raw=true")"
+    [ "$c" = 200 ] || die "Wazuh API user created but its login fails (HTTP $c)"
+    hdr "n8n credential: Wazuh API (agents, active response, syscheck)"
+    say "1. HTTP Request node -> POST https://wazuh.master:55000/security/user/authenticate?raw=true"
+    say "   Authentication: Basic auth  user $user  password $pw   |  Settings: Ignore SSL issues = on"
+    say "2. use the returned token as header  Authorization: Bearer <token>  for e.g."
+    say "   PUT https://wazuh.master:55000/active-response?agents_list=<id>   GET https://wazuh.master:55000/agents?status=active"
+  fi
+  if soc_elk; then
+    gen_secret ES_N8N_PASSWORD
+    es_curl PUT /_security/role/vexor_n8n_read -d '{"cluster":["monitor"],"indices":[{"names":["vexor-*"],"privileges":["read","view_index_metadata"]}]}' >/dev/null
+    es_curl PUT /_security/user/vexor_n8n -d "{\"password\":\"$(env_get ES_N8N_PASSWORD)\",\"roles\":[\"vexor_n8n_read\"],\"full_name\":\"Vexor n8n reader\"}" \
+      | has '"created"' || die "could not create the Elasticsearch user vexor_n8n"
+    hdr "n8n credential: Elasticsearch (read vexor-*)"
+    say "Elasticsearch node or HTTP Request: http://elasticsearch:9200   user vexor_n8n   password $(env_get ES_N8N_PASSWORD)"
+  fi
+  hint "passwords are stored in .env (WAZUH_N8N_PASSWORD, ES_N8N_PASSWORD); re-running this rotates the Wazuh one"
+}
+n8n_status() {
+  hdr "n8n (automation / SOAR)"
+  if tool_on n8n; then
+    is_running n8n && ok "running: https://$(public_host):$(tool_port n8n)" || bad "N8N=true but the container is not running - vexor logs n8n"
+    if is_running n8n; then
+      n8n_owner_set && ok "owner account created" || warn "no owner account yet - open n8n now: the FIRST visitor becomes the owner"
+      local wf; wf="$(dc exec -T n8n n8n list:workflow 2>/dev/null | grep -v '^$' | wc -l)"
+      say "workflows: ${wf:-0}  (vexor n8n workflow imports the 'Vexor - SOC alerts' starter)"
+    fi
+  else
+    say "N8N=false (a separate n8n can still receive alerts: vexor n8n connect <full webhook URL>)"
+  fi
+  hdr "Alerts -> n8n"
+  local url; url="$(n8n_hook)"
+  if [ -z "$url" ]; then warn "not connected - vexor n8n connect [webhook-path]   (default path: vexor-alerts)"; return 0; fi
+  say "webhook : $url   level >= $(n8n_level)   groups: $(env_def N8N_ALERT_GROUPS '(all)')"
+  if soc_wazuh; then
+    local f m; for f in $(n8n_conf_files); do
+      grep -q 'vexor:n8n:begin' "$f" && ok "$(basename "$f") has the integration" || bad "$(basename "$f") is missing it - vexor n8n connect"
+    done
+    for m in $(enabled_managers); do
+      is_running "$m" || continue
+      n8n_script_current "$m" && ok "$m: script installed" || bad "$m: integration script missing/outdated - vexor doctor --fix"
+      daemon_list "$m" | has '^wazuh-integratord is running' && ok "$m: integratord running" || bad "$m: integratord NOT running - vexor logs ossec $m"
+    done
+  fi
+  if [ "$(soc)" = elk ]; then
+    grep -q '"n8n" in \[tags\]' "$ELK_DIR/logstash/pipeline/vexor.conf" 2>/dev/null \
+      && ok "Logstash forwards Suricata alerts + Zeek notices" || bad "Logstash pipeline has no n8n output - vexor n8n connect"
+  fi
+  case "$(n8n_probe)" in
+    registered) ok "webhook is registered (workflow published)" ;;
+    inactive) warn "webhook not registered: publish the workflow in n8n (or: vexor n8n workflow)" ;;
+    *) bad "n8n not reachable from the stack at $url" ;;
+  esac
+  if soc_wazuh && is_running wazuh.master; then
+    local e; e="$(dc exec -T wazuh.master sh -c 'c="$(date -u -d "-15 min" "+%Y/%m/%d %H:%M:%S")"; grep custom-n8n /var/ossec/logs/integrations.log 2>/dev/null | awk -v c="$c" "substr(\$0,1,19) >= c" | tail -n 3' 2>/dev/null)"
+    if [ -n "$e" ]; then say "delivery errors in the last 15 min (master):"; cut -c1-220 <<<"$e" | sed 's/^/    /'
+    else ok "no delivery errors in the last 15 min"; fi
+  fi
+  hdr "n8n -> stacks (credentials)"
+  soc_wazuh && { [ -n "$(env_get WAZUH_N8N_PASSWORD)" ] && ok "Wazuh API user $(env_def WAZUH_N8N_USER vexor-n8n)" || say "Wazuh API user: not created - vexor n8n credentials"; }
+  soc_elk && { [ -n "$(env_get ES_N8N_PASSWORD)" ] && [ "$(env_get ES_N8N_PASSWORD)" != CHANGE_ME ] && ok "Elasticsearch user vexor_n8n" || say "Elasticsearch user: not created - vexor n8n credentials"; }
+  return 0
+}
+n8n_test() {
+  local url; url="$(n8n_hook)"; [ -n "$url" ] || die "not connected - vexor n8n connect"
+  local now; now="$(date -u +%Y-%m-%dT%H:%M:%S.000+0000)"
+  if soc_wazuh; then
+    is_running wazuh.master || die "wazuh.master is not running"
+    say "running the real integration script inside wazuh.master with a test alert ..."
+    printf '{"timestamp":"%s","rule":{"level":%s,"id":"100000","description":"Vexor test alert","groups":["vexor","test"]},"agent":{"id":"000","name":"wazuh.master"},"manager":{"name":"wazuh.master"},"id":"vexor-test","full_log":"vexor n8n test","location":"vexor"}' \
+      "$now" "$(n8n_level)" | dc exec -T wazuh.master sh -c "cat > /tmp/vexor-test-alert.json && /var/ossec/integrations/$N8N_SCRIPT_NAME /tmp/vexor-test-alert.json '$(env_get N8N_HOOK_TOKEN)' '$url'; rc=\$?; rm -f /tmp/vexor-test-alert.json; exit \$rc" \
+      && ok "n8n accepted the test alert - see Executions in n8n ('Vexor test alert')" \
+      || { bad "delivery failed:"; dc exec -T wazuh.master tail -n 3 /var/ossec/logs/integrations.log 2>/dev/null | sed 's/^/    /'; hint "404 = workflow not published / wrong path (vexor n8n status)"; return 1; }
+  else
+    is_running logstash || die "logstash is not running"
+    local c; c="$(dc exec -T logstash curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST -H 'Content-Type: application/json' \
+      -H "X-Vexor-Token: $(env_get N8N_HOOK_TOKEN)" -H 'X-Vexor-Source: logstash' \
+      -d "{\"@timestamp\":\"$now\",\"event_type\":\"alert\",\"src_ip\":\"192.0.2.1\",\"src_port\":1234,\"dest_ip\":\"192.0.2.2\",\"dest_port\":80,\"alert\":{\"severity\":2,\"signature\":\"Vexor test alert\",\"signature_id\":1}}" "$url" 2>/dev/null)"
+    [ "$c" -lt 300 ] 2>/dev/null && ok "n8n accepted the test event (HTTP $c)" || { bad "n8n answered HTTP ${c:-000}"; return 1; }
+  fi
+}
+n8n_backup() {                 # workflows + credentials (encrypted with N8N_ENCRYPTION_KEY - keep .env with it)
+  is_running n8n || die "n8n is not running"
+  local out; out="${1:-$(backup_dir)/n8n-$(date +%Y%m%d-%H%M%S)}"; mkdir -p "$out"
+  dc exec -T n8n sh -c 'rm -rf /tmp/vexor-n8n && mkdir -p /tmp/vexor-n8n && n8n export:workflow --all --separate --output=/tmp/vexor-n8n/workflows >/dev/null 2>&1; n8n export:credentials --all --separate --output=/tmp/vexor-n8n/credentials >/dev/null 2>&1; true'
+  dc cp n8n:/tmp/vexor-n8n/. "$out" >/dev/null 2>&1 || die "copy out of the container failed"
+  chmod -R go-rwx "$out"
+  ok "n8n backup: $out ($(find "$out" -name '*.json' | wc -l) files; credentials stay encrypted with N8N_ENCRYPTION_KEY)"
+}
+cmd_n8n() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
-    status)
-      local url; url="$(env_get SHUFFLE_HOOK_URL)"
-      hdr "Wazuh -> Shuffle (alerts)"
-      if [ -n "$url" ]; then
-        say "hook  : $url"
-        say "level : >= $(env_def SHUFFLE_ALERT_LEVEL 3)   groups: $(env_def SHUFFLE_ALERT_GROUPS '(all)')"
-        local f; for f in $(shuffle_files); do
-          grep -qE '(vexor|wazuhctl):shuffle:begin' "$f" && ok "$(basename "$f") has the integration" || bad "$(basename "$f") missing it (vexor shuffle connect again)"
-        done
-        local svc; for svc in $(enabled_managers); do
-          is_running "$svc" || continue
-          daemon_list "$svc" | has '^wazuh-integratord is running' \
-            && ok "$svc integratord running" || bad "$svc integratord NOT running (vexor logs ossec $svc)"
-        done
-        local code; code="$(dc exec -T wazuh.master curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${url%%/api/*}/api/v1/health" 2>/dev/null)"
-        [ "$code" = 200 ] && ok "Shuffle backend reachable from the managers" || bad "Shuffle backend not reachable from wazuh.master (HTTP ${code:-000})"
-        say "recent integration messages (master):"
-        dc exec -T wazuh.master grep -i integrat /var/ossec/logs/ossec.log 2>/dev/null | tail -n 5 | sed 's/^/    /'
-      else
-        warn "not connected - vexor shuffle connect <webhook-url>"
-      fi
-      hdr "Shuffle -> Wazuh (API for playbook actions)"
-      if [ -n "$(env_get SHUFFLE_API_USER)" ]; then
-        local c; c="$(curl -sk -o /dev/null -w '%{http_code}' -X POST -u "$(env_get SHUFFLE_API_USER):$(env_get SHUFFLE_API_PASSWORD)" \
-              "https://127.0.0.1:$(api_port)/security/user/authenticate?raw=true")"
-        [ "$c" = 200 ] && ok "API user '$(env_get SHUFFLE_API_USER)' can log in" || bad "API user '$(env_get SHUFFLE_API_USER)' login failed (HTTP $c) - vexor shuffle api-user"
-        say "Shuffle Wazuh app: URL https://$(public_host):$(api_port)  user $(env_get SHUFFLE_API_USER)  (password: vexor config show --show-secrets)"
-      else
-        warn "no API user yet - vexor shuffle api-user"
-      fi ;;
+    status) n8n_status ;;
+    enable|disable|on|off) cmd_tools "$sub" n8n ;;
     connect)
-      local url="${1:-}" level groups; shift || true
-      level="$(env_def SHUFFLE_ALERT_LEVEL 3)"; groups="$(env_get SHUFFLE_ALERT_GROUPS)"
-      while [ $# -gt 0 ]; do case "$1" in --level) level="${2:?}"; shift ;; --groups) groups="${2:?}"; shift ;; esac; shift; done
-      [ -n "$url" ] || die "usage: vexor shuffle connect <webhook-url> [--level 3] [--groups 'authentication_failed,sca']
-    Get the URL in Shuffle: Workflows -> New -> drag in a 'Webhook' trigger -> copy its URL -> Start it."
-      [[ "$level" =~ ^([0-9]|1[0-5])$ ]] || die "--level must be 0-15"
-      local fixed; fixed="$(shuffle_fix_url "$url")"
-      [ "$fixed" != "$url" ] && say "Using $fixed (the managers cannot resolve $(python3 -I -c 'import sys;from urllib.parse import urlsplit;print(urlsplit(sys.argv[1]).hostname)' "$url"))"
-      [[ "$fixed" =~ /api/v1/hooks/webhook_[0-9a-fA-F-]+$ ]] || warn "URL does not look like a Shuffle webhook (.../api/v1/hooks/webhook_<id>)"
+      local target="vexor-alerts" lvl grp
+      [ $# -gt 0 ] && [[ "$1" != --* ]] && { target="$1"; shift; }
+      lvl="$(n8n_level)"; grp="$(env_get N8N_ALERT_GROUPS)"
+      while [ $# -gt 0 ]; do case "$1" in --level) lvl="${2:?}"; shift ;; --groups) grp="${2:-}"; shift ;; esac; shift; done
+      [[ "$lvl" =~ ^([0-9]|1[0-5])$ ]] || die "--level must be 0-15"
+      [[ "$target" == *://* ]] || tool_on n8n || die "N8N is not enabled: vexor n8n enable   (or give the full webhook URL of another n8n)"
+      local url; url="$(n8n_hook_url "$target")"
       take_lock
-      local code; code="$(dc exec -T wazuh.master curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${fixed%%/api/*}/api/v1/health" 2>/dev/null)"
-      [ "$code" = 200 ] || confirm "Shuffle not reachable from wazuh.master (HTTP ${code:-000}). Save anyway?" || die "Aborted"
-      shuffle_write_block "$fixed" "$level" "$groups"
-      env_set SHUFFLE_HOOK_URL "$fixed"; env_set SHUFFLE_ALERT_LEVEL "$level"; env_set SHUFFLE_ALERT_GROUPS "$groups"
-      ok "integration added to master + all worker configs (level >= $level${groups:+, groups $groups})"
-      say "Recreating the managers to load it (data is kept in volumes)..."
-      dc_restart $(enabled_managers) >/dev/null 2>&1
-      local m; for m in $(enabled_managers); do
-        if wait_daemon "$m" wazuh-integratord 150; then ok "$m integratord running - alerts level >= $level go to Shuffle"
-        else bad "$m integratord not running after 150s - vexor logs ossec $m"; fi
-      done ;;
+      gen_secret N8N_HOOK_TOKEN hex
+      env_set N8N_HOOK_URL "$url"; env_set N8N_ALERT_LEVEL "$lvl"; env_set N8N_ALERT_GROUPS "$grp"
+      ok "alerts -> $url  (level >= $lvl${grp:+, groups $grp}; header X-Vexor-Token)"
+      n8n_apply
+      [ "$(n8n_probe)" = registered ] || hint "no workflow listens on that path yet: vexor n8n workflow   (imports + publishes a starter)" ;;
     disconnect)
       take_lock
-      shuffle_write_block "" 0 ""
-      env_set SHUFFLE_HOOK_URL ""
-      dc_restart $(enabled_managers) >/dev/null && ok "Wazuh no longer sends alerts to Shuffle" ;;
-    test)
-      local url; url="$(env_get SHUFFLE_HOOK_URL)"; [ -n "$url" ] || die "not connected - vexor shuffle connect <url>"
-      local now; now="$(date -u +%Y-%m-%dT%H:%M:%S.000+0000)"
-      local body; body="{\"timestamp\":\"$now\",\"rule\":{\"level\":5,\"id\":\"100000\",\"description\":\"vexor test alert\",\"groups\":[\"vexor\",\"test\"]},\"agent\":{\"id\":\"000\",\"name\":\"wazuh.master\"},\"manager\":{\"name\":\"wazuh.master\"},\"id\":\"vexor-test\",\"full_log\":\"vexor shuffle test\",\"location\":\"vexor\"}"
-      say "POST test alert -> $url  (sent from inside wazuh.master, same path as real alerts)"
-      dc exec -T wazuh.master curl -s --max-time 15 -X POST -H 'Content-Type: application/json' -d "$body" "$url"; echo
-      say "Check Shuffle: Workflow -> Executions (should show a run with 'vexor test alert')" ;;
-    api-user)
-      take_lock
-      api_login || die "Wazuh API not reachable"
-      local user pw rid uid pol
-      user="$(env_def SHUFFLE_API_USER shuffle)"; pw="$(gen_pw)"
-      pol="$(api GET "/security/policies?limit=500" | pj '
-want = {"agents_read_agents", "agents_all_agents", "agents_commands_agents", "syscheck_all_syscheck"}
-ids = [str(p["id"]) for p in d["data"]["affected_items"] if p["name"] in want]
-print(",".join(ids))')"
-      [ -n "$pol" ] || die "could not read RBAC policies"
-      rid="$(api GET "/security/roles?limit=500" | pj 'print(next((r["id"] for r in d["data"]["affected_items"] if r["name"] == "soar"), ""))')"
-      if [ -z "$rid" ]; then
-        rid="$(api POST /security/roles -d '{"name":"soar"}' | pj 'print(d["data"]["affected_items"][0]["id"])')" || die "could not create role 'soar'"
-      fi
-      api POST "/security/roles/$rid/policies?policy_ids=$pol" >/dev/null
-      uid="$(api GET "/security/users?limit=500" | pj 'print(next((u["id"] for u in d["data"]["affected_items"] if u["username"] == sys.argv[1]), ""))' "$user")"
-      if [ -n "$uid" ]; then
-        api PUT "/security/users/$uid" -d "{\"password\":\"$pw\"}" | has '"error": *0' || die "could not reset the password of '$user'"
-      else
-        uid="$(api POST /security/users -d "{\"username\":\"$user\",\"password\":\"$pw\"}" | pj 'print(d["data"]["affected_items"][0]["id"])')" || die "could not create user '$user'"
-      fi
-      local ro; ro="$(api GET "/security/roles?limit=500" | pj 'print(next((r["id"] for r in d["data"]["affected_items"] if r["name"] == "readonly"), ""))')"
-      api POST "/security/users/$uid/roles?role_ids=${ro:+$ro,}$rid" >/dev/null
-      env_set SHUFFLE_API_USER "$user"; env_set SHUFFLE_API_PASSWORD "$pw"; chmod 600 "$ENV_FILE"
-      local c; c="$(curl -sk -o /dev/null -w '%{http_code}' -X POST -u "$user:$pw" "https://127.0.0.1:$(api_port)/security/user/authenticate?raw=true")"
-      [ "$c" = 200 ] && ok "Wazuh API user '$user' ready (roles: readonly + soar = agent restart/upgrade, active response, syscheck)" \
-                     || die "user created but login fails (HTTP $c)"
-      hdr "In Shuffle -> Apps -> 'Wazuh' -> Authenticate"
-      say "url       : https://$(public_host):$(api_port)"
-      say "username  : $user"
-      say "password  : $pw      (also in .env as SHUFFLE_API_PASSWORD)"
-      say "ssl_verify: false    (the Wazuh API uses a self-signed certificate)" ;;
-    *) die "usage: vexor shuffle status | connect <webhook-url> [--level N] [--groups G] | disconnect | test | api-user" ;;
+      env_set N8N_HOOK_URL ""; n8n_apply; ok "the stack no longer sends alerts to n8n" ;;
+    test) n8n_test ;;
+    workflow)
+      case "${1:-import}" in
+        import) take_lock; [ -n "$(n8n_hook)" ] || die "connect first: vexor n8n connect"; n8n_workflow_import ;;
+        file|export) mkdir -p "$TOOLS_DIR/n8n"; n8n_workflow_json > "$TOOLS_DIR/n8n/vexor-soc-alerts.workflow.json"
+                     ok "$TOOLS_DIR/n8n/vexor-soc-alerts.workflow.json  (n8n: Workflows -> Import from file)" ;;
+        *) die "usage: vexor n8n workflow [import] | file" ;;
+      esac ;;
+    credentials|creds|api-user) n8n_credentials ;;
+    backup) n8n_backup "$@" ;;
+    reset-owner)
+      is_running n8n || die "n8n is not running"
+      confirm "Remove ALL n8n user accounts? Workflows and credentials are kept; the next visitor creates the owner again." || die "Aborted"
+      dc exec -T n8n n8n user-management:reset >/dev/null 2>&1 && dc restart n8n >/dev/null 2>&1 \
+        && ok "n8n users reset - open https://$(public_host):$(tool_port n8n) and create the owner now" ;;
+    logs) cmd_logs n8n "$@" ;;
+    *) die "usage: vexor n8n [status] | enable | disable | connect [path|url] [--level N] [--groups G] | disconnect | test
+                | workflow [import|file] | credentials | backup [dir] | reset-owner | logs [-f]" ;;
   esac
+}
+
+# ============================================================== Suricata (network IDS)
+suricata_eve() { echo "$TOOLS_DATA/suricata/log/eve.json"; }
+suricata_alert_lines() { grep -h '"event_type":"alert"' "$(suricata_eve)" 2>/dev/null || true; }
+suricata_status() {
+  hdr "Suricata (network IDS)"
+  tool_on suricata || { warn "SURICATA=false - enable: vexor suricata enable"; return 0; }
+  is_running suricata && ok "running, sniffing $(sniff_iface)" || bad "not running - vexor logs suricata"
+  local n; n="$(suricata_sig_count)"
+  [ "$n" -gt 0 ] && ok "$n signatures loaded (ET Open, refreshed daily)" || warn "0 signatures - vexor suricata update-rules"
+  local eve; eve="$(suricata_eve)"
+  if [ -f "$eve" ]; then
+    file_fresh "$eve" 15 && ok "eve.json: $(du -h "$eve" | cut -f1), written in the last 15 min" || warn "eve.json not written for 15 min (no traffic on $(sniff_iface)?)"
+  else warn "no eve.json yet"; fi
+  suricata_alert_lines | python3 -I -c '
+import collections, datetime, json, sys
+now = datetime.datetime.now(datetime.timezone.utc); sev = collections.Counter(); sig = collections.Counter()
+for line in sys.stdin:
+    try:
+        e = json.loads(line); t = datetime.datetime.strptime(e["timestamp"], "%Y-%m-%dT%H:%M:%S.%f%z")
+    except (KeyError, ValueError):
+        continue
+    if now - t > datetime.timedelta(hours=24):
+        continue
+    sev[e["alert"]["severity"]] += 1; sig[e["alert"]["signature"]] += 1
+print("  alerts in the last 24 h: %d  (high %d, medium %d, low %d)" % (sum(sev.values()), sev[1], sev[2], sev[3]))
+for s, c in sig.most_common(5):
+    print("    %6d  %s" % (c, s))'
+  say "alerts go to: $(soc_wazuh && printf 'Wazuh (rules 100720/100721) ')$(soc_elk && printf 'Elasticsearch (vexor-suricata-*) ')$( [ -n "$(n8n_hook)" ] && printf 'n8n')"
+}
+suricata_alerts() {            # [-n N] [--since 1h|30m|2d]
+  local n=20 since=""
+  while [ $# -gt 0 ]; do case "$1" in -n) n="${2:?}"; shift ;; --since) since="${2:?}"; shift ;; esac; shift; done
+  suricata_alert_lines | python3 -I -c '
+import datetime, json, re, sys
+n, since = int(sys.argv[1]), sys.argv[2]
+cut = None
+m = re.fullmatch(r"(\d+)([mhd])", since)
+if m:
+    unit = {"m": "minutes", "h": "hours", "d": "days"}[m.group(2)]
+    cut = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(**{unit: int(m.group(1))})
+rows = []
+for line in sys.stdin:
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    if cut:
+        try:
+            if datetime.datetime.strptime(e["timestamp"], "%Y-%m-%dT%H:%M:%S.%f%z") < cut:
+                continue
+        except (KeyError, ValueError):
+            pass
+    a = e["alert"]
+    try:
+        ts = datetime.datetime.strptime(e["timestamp"], "%Y-%m-%dT%H:%M:%S.%f%z").astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except (KeyError, ValueError):
+        ts = e.get("timestamp", "")[:19]
+    rows.append("%s  sev %s  %-5s %21s -> %-21s %s (sid %s)" % (ts, a.get("severity"), e.get("proto", ""),
+                "%s:%s" % (e.get("src_ip"), e.get("src_port", "")), "%s:%s" % (e.get("dest_ip"), e.get("dest_port", "")), a.get("signature"), a.get("signature_id")))
+print("\n".join(rows[-n:]) if rows else "  no alerts")' "$n" "$since"
+}
+# plain-HTTP pages whose body is "uid=0(root)..." - real traffic that matches sid 2100498 (GPL ATTACK_RESPONSE id check returned root)
+TEST_URLS="http://httpbin.org/base64/dWlkPTAocm9vdCkgZ2lkPTAocm9vdCkgZ3JvdXBzPTAocm9vdCk= http://testmynids.org/uid/index.html"
+test_request() {               # first test URL that answers; prints its host
+  local u; for u in $TEST_URLS; do
+    curl -s --max-time 10 -o /dev/null "$u" && { echo "$u" | sed -E 's#^https?://([^/]+)/.*#\1#'; return 0; }
+  done
+  return 1
+}
+suricata_test() {              # real traffic that matches GPL ATTACK_RESPONSE id check returned root (sid 2100498)
+  is_running suricata || die "suricata is not running"
+  local before; before="$(suricata_alert_lines | grep -c '"signature_id":2100498')"
+  say "requesting a page whose body is 'uid=0(root)...' - matches sid 2100498"
+  test_request >/dev/null || die "no test URL reachable (internet access?) - tried: $TEST_URLS"
+  local i; for i in $(seq 1 15); do
+    [ "$(suricata_alert_lines | grep -c '"signature_id":2100498')" -gt "$before" ] && { ok "Suricata raised the alert (sid 2100498)"; break; }
+    sleep 2
+  done
+  [ "$i" = 15 ] && { bad "no Suricata alert after 30 s - vexor suricata status   (is $(sniff_iface) the interface this traffic uses?)"; return 1; }
+  if soc_wazuh && is_running wazuh.master; then
+    for i in $(seq 1 15); do
+      dc exec -T wazuh.master sh -c 'tail -n 500 /var/ossec/logs/alerts/alerts.json | grep -q "\"signature_id\":\"2100498\""' 2>/dev/null \
+        && { ok "Wazuh turned it into an alert (rule 100721, level 7)"; break; }
+      sleep 2
+    done
+    [ "$i" = 15 ] && warn "not in Wazuh alerts yet - vexor wazuh alerts -n 20"
+  fi
+  if soc_elk; then
+    sleep 5
+    local c; c="$(es_curl GET '/vexor-suricata-*/_count?allow_no_indices=true' -d '{"query":{"bool":{"filter":[{"term":{"alert.signature_id":2100498}},{"range":{"@timestamp":{"gte":"now-5m"}}}]}}}' 2>/dev/null | pj 'print(d.get("count", 0))' 2>/dev/null)"
+    [ "${c:-0}" -gt 0 ] && ok "stored in Elasticsearch (vexor-suricata-*)" || warn "not in Elasticsearch yet (Logstash reads every few seconds) - vexor elk search 'alert.signature_id:2100498'"
+  fi
+  return 0
+}
+cmd_suricata() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    status) suricata_status ;;
+    enable|disable|on|off) cmd_tools "$sub" suricata ;;
+    alerts) suricata_alerts "$@" ;;
+    test) suricata_test ;;
+    update-rules|rules) cmd_tools update-rules ;;
+    logs) cmd_logs suricata "$@" ;;
+    *) die "usage: vexor suricata [status] | alerts [-n N] [--since 1h] | test | update-rules | enable | disable | logs [-f]" ;;
+  esac
+}
+
+# ============================================================== Zeek (network logs)
+zeek_dir() { echo "$TOOLS_DATA/zeek/logs"; }
+zeek_status() {
+  hdr "Zeek (network logs)"
+  tool_on zeek || { warn "ZEEK=false - enable: vexor zeek enable"; return 0; }
+  is_running zeek && ok "running, sniffing $(sniff_iface)" || bad "not running - vexor logs zeek"
+  local f n=0 sent; sent=",$(env_def ZEEK_WAZUH_LOGS notice,weird,dns,http,ssl,ssh),"
+  printf '  %-14s %8s  %-10s %s\n' LOG SIZE UPDATED "READ BY"
+  for f in "$(zeek_dir)"/*.log; do
+    [ -f "$f" ] || continue
+    local b; b="$(basename "$f" .log)"
+    [[ "$b" =~ ^[a-z0-9_]+$ ]] || continue            # skip hourly copies (name.YYYY-MM-DD-HH-MM-SS.log)
+    n=$((n + 1))
+    printf '  %-14s %8s  %-12s %s\n' "$b" "$(du -h "$f" | cut -f1)" "$(( ($(date +%s) - $(stat -c %Y "$f")) / 60 )) min ago" \
+      "$( [[ "$sent" == *",$b,"* ]] && { soc_wazuh && printf 'Wazuh '; soc_elk && printf 'ELK'; } )"
+  done
+  [ "$n" -gt 0 ] || warn "no logs yet (they appear with the first traffic on $(sniff_iface))"
+  say "hourly copies: $(find "$(zeek_dir)" -maxdepth 1 -name '*.*-*.log' | wc -l) files, $(du -sh "$(zeek_dir)" | cut -f1) in total (kept $(env_def TOOLS_LOG_RETENTION_DAYS 7) days)"
+  hint "change what Wazuh/ELK read with ZEEK_WAZUH_LOGS in .env (conn is large - add it on purpose), then: vexor tools apply"
+}
+zeek_show() {                  # zeek_show <log> [-n N]: readable lines of one Zeek log
+  local name="${1:-}" n=20; shift || true
+  [ -n "$name" ] || die "usage: vexor zeek show <log> [-n N]   logs: $(ls "$(zeek_dir)" 2>/dev/null | grep -E '^[a-z_]+\.log$' | sed 's/\.log$//' | tr '\n' ' ')"
+  while [ $# -gt 0 ]; do case "$1" in -n) n="${2:?}"; shift ;; esac; shift; done
+  local f; f="$(zeek_dir)/$name.log"; [ -f "$f" ] || die "no $name.log in $(zeek_dir)"
+  tail -n "$n" "$f" | python3 -I -c '
+import datetime, json, sys
+name = sys.argv[1]
+def g(e, *k): return " ".join(str(e.get(x, "-")) for x in k)
+for line in sys.stdin:
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    t = datetime.datetime.fromtimestamp(float(e.get("ts", 0))).strftime("%Y-%m-%d %H:%M:%S")
+    hp = "%s:%s -> %s:%s" % (e.get("id.orig_h"), e.get("id.orig_p"), e.get("id.resp_h"), e.get("id.resp_p"))
+    if name == "conn": s = "%s %s %s %s bytes %s/%s" % (hp, e.get("proto"), e.get("service", "-"), e.get("conn_state"), e.get("orig_bytes", 0), e.get("resp_bytes", 0))
+    elif name == "dns": s = "%s %s %s -> %s" % (e.get("id.orig_h"), e.get("qtype_name", "-"), e.get("query", "-"), ",".join(map(str, e.get("answers", []))) or e.get("rcode_name", "-"))
+    elif name == "http": s = "%s %s %s%s -> %s" % (hp, e.get("method"), e.get("host", ""), e.get("uri", ""), e.get("status_code", "-"))
+    elif name == "ssl": s = "%s %s %s" % (hp, e.get("version", "-"), e.get("server_name", "-"))
+    elif name == "ssh": s = "%s auth_success=%s %s" % (hp, e.get("auth_success", "-"), e.get("client", ""))
+    elif name == "notice": s = "%s %s %s" % (e.get("note"), e.get("msg"), e.get("src", ""))
+    elif name == "weird": s = "%s %s" % (hp, e.get("name"))
+    else: s = json.dumps({k: v for k, v in e.items() if k not in ("ts", "uid")})[:220]
+    print(t, s)' "$name"
+}
+zeek_top() {                   # top talkers / ports / DNS names from the current hour of logs
+  local what="${1:-hosts}" d; d="$(zeek_dir)"
+  case "$what" in
+    hosts|ports) [ -f "$d/conn.log" ] || die "no conn.log yet" ;;
+    dns) [ -f "$d/dns.log" ] || die "no dns.log yet" ;;
+    *) die "usage: vexor zeek top [hosts|ports|dns]" ;;
+  esac
+  python3 -I - "$d" "$what" <<'PY'
+import collections, json, sys
+d, what = sys.argv[1:3]
+c = collections.Counter()
+f = d + ("/dns.log" if what == "dns" else "/conn.log")
+for line in open(f, errors="replace"):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    if what == "hosts": c["%s -> %s" % (e.get("id.orig_h"), e.get("id.resp_h"))] += int(e.get("orig_bytes") or 0) + int(e.get("resp_bytes") or 0)
+    elif what == "ports": c["%s/%s" % (e.get("id.resp_p"), e.get("proto"))] += 1
+    else: c[e.get("query", "-")] += 1
+unit = {"hosts": "bytes", "ports": "connections", "dns": "queries"}[what]
+print("  top %s (current log, by %s)" % (what, unit))
+for k, v in c.most_common(15):
+    print("  %12d  %s" % (v, k))
+PY
+}
+zeek_test() {
+  is_running zeek || die "zeek is not running"
+  local f; f="$(zeek_dir)/http.log"
+  local before host; before="$(grep -c '/base64/\|/uid/index.html' "$f" 2>/dev/null || true)"
+  say "requesting a test page over plain HTTP - Zeek should log it in http.log"
+  host="$(test_request)" || die "no test URL reachable (internet access?) - tried: $TEST_URLS"
+  local i; for i in $(seq 1 30); do
+    [ "$(grep -c '/base64/\|/uid/index.html' "$f" 2>/dev/null || true)" -gt "${before:-0}" ] && { ok "Zeek logged the request to $host (http.log)"; return 0; }
+    sleep 2
+  done
+  bad "not in http.log after 60 s - vexor zeek status   (is $(sniff_iface) the interface this traffic uses?)"; return 1
+}
+cmd_zeek() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    status) zeek_status ;;
+    enable|disable|on|off) cmd_tools "$sub" zeek ;;
+    show|tail) zeek_show "$@" ;;
+    notices) zeek_show notice "$@" ;;
+    top) zeek_top "$@" ;;
+    test) zeek_test ;;
+    logs) cmd_logs zeek "$@" ;;
+    *) die "usage: vexor zeek [status] | show <log> [-n N] | notices [-n N] | top [hosts|ports|dns] | test | enable | disable | logs [-f]" ;;
+  esac
+}
+
+# ============================================================== Wazuh (SIEM / XDR)
+wazuh_alerts() {               # [-n N] [--level N] [--grep TEXT]: newest alerts of every manager
+  local n=20 lvl=0 grep_="" m
+  while [ $# -gt 0 ]; do case "$1" in -n) n="${2:?}"; shift ;; --level) lvl="${2:?}"; shift ;; --grep) grep_="${2:?}"; shift ;; esac; shift; done
+  soc_wazuh || die "Wazuh is off (SOC=$(soc))"
+  for m in $(enabled_managers); do
+    is_running "$m" || continue
+    dc exec -T "$m" tail -n 3000 /var/ossec/logs/alerts/alerts.json 2>/dev/null
+  done | python3 -I -c '
+import datetime, json, sys
+n, lvl, needle = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].lower()
+rows = []
+for line in sys.stdin:
+    if needle and needle not in line.lower():
+        continue
+    try:
+        a = json.loads(line)
+    except ValueError:
+        continue
+    r = a.get("rule", {})
+    if int(r.get("level", 0)) < lvl:
+        continue
+    try:
+        t = datetime.datetime.strptime(a["timestamp"], "%Y-%m-%dT%H:%M:%S.%f%z").astimezone()
+    except (KeyError, ValueError):
+        continue
+    rows.append((t, "%s  lvl %-2s  rule %-6s %-16s %s" % (t.strftime("%Y-%m-%d %H:%M:%S"), r.get("level"), r.get("id"),
+                 (a.get("agent") or {}).get("name", "-")[:16], r.get("description", ""))))
+rows.sort()
+print("\n".join(r for _, r in rows[-n:]) if rows else "  no matching alerts")' "$n" "$lvl" "$grep_"
+}
+cmd_wazuh() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    status) soc_wazuh || die "Wazuh is off (SOC=$(soc)) - vexor soc wazuh|both"; cmd_health ;;
+    alerts) wazuh_alerts "$@" ;;
+    logtest) is_running wazuh.master || die "wazuh.master is not running"
+             say "paste a log line, see which decoder/rule matches (Ctrl+C to quit)"; dc exec wazuh.master /var/ossec/bin/wazuh-logtest ;;
+    rules) is_running wazuh.master || die "wazuh.master is not running"
+           dc exec -T wazuh.master sh -c 'ls -l /var/ossec/etc/rules/; echo; grep -c "<rule " /var/ossec/etc/rules/*.xml' ;;
+    agents) cmd_agents "$@" ;;
+    cluster) cmd_cluster ;;
+    *) die "usage: vexor wazuh [status] | alerts [-n N] [--level N] [--grep TEXT] | logtest | rules | agents ... | cluster" ;;
+  esac
+}
+
+# ============================================================== ELK extras
+elk_search() {                 # elk search [query] [-n N] [--index P]
+  local q="*" n=20 idx="vexor-*"
+  [ $# -gt 0 ] && [[ "$1" != -* ]] && { q="$1"; shift; }
+  while [ $# -gt 0 ]; do case "$1" in -n) n="${2:?}"; shift ;; --index) idx="${2:?}"; shift ;; esac; shift; done
+  es_curl GET "/$idx/_search?allow_no_indices=true" -d "$(python3 -I -c 'import json,sys; print(json.dumps({"size": int(sys.argv[2]), "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}], "query": {"query_string": {"query": sys.argv[1]}}}))' "$q" "$n")" \
+    | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+if "error" in d:
+    print("  error:", d["error"].get("reason", d["error"])); sys.exit(1)
+hits = d["hits"]["hits"]
+print("  %s matches (newest %d shown)" % (d["hits"]["total"]["value"], len(hits)))
+for h in reversed(hits):
+    s = h["_source"]
+    if "rule" in s: txt = "lvl %s %s" % (s["rule"].get("level"), s["rule"].get("description"))
+    elif "alert" in s: txt = "sev %s %s" % (s["alert"].get("severity"), s["alert"].get("signature"))
+    elif s.get("event_type"): txt = "%s %s -> %s" % (s["event_type"], s.get("src_ip"), s.get("dest_ip"))
+    else: txt = json.dumps({k: v for k, v in s.items() if not k.startswith(("@", "event", "log", "host", "tags"))})[:160]
+    print("  %s  %-24s %s" % (s.get("@timestamp", "")[:19].replace("T", " "), h["_index"][:24], txt))'
+}
+elk_beats_config() {
+  hdr "Ship logs from another machine into ELK (Filebeat / Elastic Agent -> Logstash)"
+  cat <<EOF
+  # filebeat.yml on the sending machine
+  output.logstash:
+    hosts: ["$(public_host):$(env_def LOGSTASH_BEATS_PORT 55044)"]
+  # events land in vexor-beats-* (Kibana data view "Vexor - Beats / Elastic Agent")
+EOF
+  hint "the Beats input has no TLS: use it on a trusted network, or put a VPN/firewall rule in front"
 }
 cmd_cluster() {
   is_running wazuh.master || die "wazuh.master is not running"
@@ -4097,7 +4707,7 @@ _vexor() {
   local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}" words
   local svcs="master worker worker2 worker3 indexer1 indexer2 indexer3 dashboard nginx managers indexers"
   if [ "$COMP_CWORD" -eq 1 ]; then
-    words="install info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster shuffle tools soc elk indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
+    words="install info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
   else
     case "$cmd" in
       start|stop|restart|shell|exec) words="$svcs" ;;
@@ -4107,10 +4717,13 @@ _vexor() {
       cert)    words="status create export-ca serve-ca import letsencrypt renew use-default internal-regen --force --email --staging --dns" ;;
       passwd)  words="admin kibanaserver api --generate" ;;
       agents)  words="list summary outdated remove enroll-cmd password linux rpm windows macos on off show --name --group" ;;
-      shuffle) words="status connect disconnect test api-user --level --groups" ;;
+      wazuh)   words="status alerts logtest rules agents cluster -n --level --grep" ;;
+      n8n)     words="status enable disable connect disconnect test workflow credentials backup reset-owner logs --level --groups import file" ;;
+      suricata) words="status enable disable alerts test update-rules logs -n --since" ;;
+      zeek)    words="status enable disable show notices top test logs hosts ports dns conn dns http ssl ssh notice weird -n" ;;
       tools)   words="status apply enable disable update-rules n8n grafana portainer suricata zeek" ;;
       soc)     words="status wazuh elk both" ;;
-      elk)     words="status explain reset-password" ;;
+      elk)     words="status indices search data-views retention beats-config es explain reset-password logs -n --index" ;;
       indexers) words="status 1 3 abort cleanup --dry-run --no-backup" ;;
       node-type) words="status single multi --dry-run --no-backup --indexers" ;;
       reminders) words="list done" ;;
@@ -4140,7 +4753,7 @@ cmd_completion() {
 # ============================================================== help / main
 cmd_help() {
   cat <<EOF
-${C_BD}vexor${C_0} $VEXOR_VERSION - Vexor SOC stack manager: Wazuh | ELK | both     ($ROOT)
+${C_BD}vexor${C_0} $VEXOR_VERSION - Vexor SOC stack manager: Wazuh, ELK, n8n, Suricata, Zeek     ($ROOT)
 Layout: $(layout_desc)
 
 ${C_BD}Setup${C_0}
@@ -4148,7 +4761,7 @@ ${C_BD}Setup${C_0}
   info [--show-secrets]          dashboard URL, login, agent ports, certificate mode
   config show|get|set|edit|validate|apply     view / change .env settings, apply them
 
-${C_BD}Run${C_0}
+${C_BD}Run${C_0} (everything SOC and the tool flags in .env enable)
   start [svc..]                  start the stack (or services) and wait until it is ready
   stop [svc..]                   stop containers (the watchdog leaves a stopped stack alone)
   restart [svc..]                restart everything or the given services
@@ -4160,13 +4773,46 @@ ${C_BD}SOC stack${C_0} (SOC in .env: wazuh | elk | both)
   soc [status]                   which stacks run, Kibana / Beats endpoints
   soc wazuh | elk | both         switch: wazuh = Wazuh only, elk = Elasticsearch + Logstash + Kibana,
                                  both = Wazuh + ELK with every Wazuh alert copied into Elasticsearch
-  elk [status] | explain | reset-password    Elasticsearch health, allocation explain, reset "elastic"
 
-${C_BD}Optional tools${C_0} (N8N / GRAFANA / PORTAINER / SURICATA / ZEEK = true|false in .env)
+${C_BD}Wazuh${C_0} (SOC=wazuh|both)
+  wazuh [status]                 indexer / manager cluster / API details
+  wazuh alerts [-n N] [--level N] [--grep TEXT]   newest alerts of every manager
+  wazuh logtest | rules          test a log line against the rules | list rule files
+
+${C_BD}ELK${C_0} (SOC=elk|both)
+  elk [status]                   Elasticsearch health, Kibana, events in the last hour
+  elk indices | search [query] [-n N] [--index P]   vexor-* indices | Lucene search, newest first
+  elk data-views | retention     re-create Kibana data views | re-apply ILM retention (ELK_RETENTION_DAYS)
+  elk beats-config               filebeat.yml snippet to ship logs from other machines
+  elk es <METHOD> <path> [json]  raw Elasticsearch API      e.g. vexor elk es GET /_cat/health?v
+  elk explain | reset-password   shard allocation explain | new "elastic" password (+ .env)
+
+${C_BD}n8n${C_0} (automation / SOAR - N8N=true)
+  n8n [status]                   n8n, owner account, alert forwarding, webhook, credentials
+  n8n enable | disable           start / remove n8n (data kept in its volume)
+  n8n connect [path|url] [--level N] [--groups G]
+                                 send alerts (level >= N, default 7) to an n8n webhook: Wazuh on every
+                                 manager, or Logstash (Suricata/Zeek) with SOC=elk. Default path vexor-alerts
+  n8n workflow [import|file]     import + publish the "Vexor - SOC alerts" starter (routes by severity)
+  n8n credentials                Wazuh API user (agents, active response) + Elasticsearch read user for n8n
+  n8n test | disconnect | backup [dir] | reset-owner | logs
+
+${C_BD}Suricata${C_0} (network IDS - SURICATA=true)
+  suricata [status]              signatures, eve.json, alerts in 24 h, top signatures, where alerts go
+  suricata alerts [-n N] [--since 1h]   newest alerts
+  suricata test                  real test traffic (sid 2100498) -> Suricata -> Wazuh / Elasticsearch
+  suricata update-rules | enable | disable | logs
+
+${C_BD}Zeek${C_0} (network logs - ZEEK=true)
+  zeek [status]                  log files, size, freshness, which go to Wazuh / ELK
+  zeek show <log> [-n N] | notices   readable conn/dns/http/ssl/ssh/notice/weird lines
+  zeek top [hosts|ports|dns]     top talkers, ports, DNS names in the current log
+  zeek test | enable | disable | logs
+
+${C_BD}Other tools${C_0} (N8N / GRAFANA / PORTAINER / SURICATA / ZEEK = true|false in .env)
   tools [status]                 enabled, state, URL of every tool
   tools apply                    start enabled / remove disabled tools, wire them in (also done by start, config apply)
   tools enable|disable <tool>    set the flag in .env and apply
-  tools update-rules             download + reload Suricata rules (also daily in maintenance)
                                  web tools: https://PUBLIC_HOST:<NAME>_PORT through nginx; sensors sniff SNIFF_INTERFACE
 
 ${C_BD}Node type${C_0} (NODE_TYPE in .env: multi | single)
@@ -4181,7 +4827,7 @@ ${C_BD}Node type${C_0} (NODE_TYPE in .env: multi | single)
   health                         detailed indexer / manager / API state
 
 ${C_BD}Troubleshoot${C_0}
-  doctor [--fix]                 ~40 checks with hints; --fix repairs what is safe to repair
+  doctor [--fix]                 ~60 checks (Wazuh, ELK, tools, n8n) with hints; --fix repairs what is safe
   logs [svc..] [-f] [-n N] [--since 10m]       container logs
   logs ossec|api|cluster|alerts [node] [-f]    Wazuh log files inside a manager (default master)
   logs errors [--since 1h]       recent error lines of every container
@@ -4213,16 +4859,11 @@ ${C_BD}Security${C_0}
   passwd admin|kibanaserver|api [--generate]  change a password on the running stack (+ .env)
   agents password on [pw]|off|show            require a password for agent enrollment
 
-${C_BD}Agents${C_0}
+${C_BD}Wazuh agents${C_0}
   agents list|summary|outdated
   agents enroll-cmd [linux|rpm|windows|macos] [--name N] [--group G]   copy-paste install commands
   agents remove <id[,id..]>
   cluster                        manager cluster nodes
-
-${C_BD}Shuffle SOAR${C_0}
-  shuffle connect <webhook-url> [--level N] [--groups G]   send alerts (level >= N) from every manager to Shuffle
-  shuffle api-user               dedicated Wazuh API user for Shuffle's Wazuh app (read + active response)
-  shuffle status | test | disconnect
 
 ${C_BD}Indexer cluster${C_0}
   indexers status                show node count, shards per node, leftovers
@@ -4286,9 +4927,9 @@ main() {
   esac
   RUN_TMP="$(mktemp -d /tmp/vexor.XXXXXX)"; trap 'rm -rf "$RUN_TMP"' EXIT
   if [ -f "$ENV_FILE" ] && [ "$(id -u)" -eq 0 ] && [[ "$cmd" != help && "$cmd" != completion ]]; then
-    ensure_env_defaults >/dev/null; migrate_layout
+    ensure_env_defaults >/dev/null; env_drop_legacy >/dev/null; migrate_layout
     case "$cmd" in   # action history (feeds ai-context); read-only commands are not logged
-      help|version|--version|-v|completion|status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check) ;;
+      help|version|--version|-v|completion|status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check|wazuh|suricata|zeek) ;;
       doctor|troubleshoot|check) [ "${args[0]:-}" = --fix ] && echo "$(ts) doctor --fix" >> "$HISTORY_FILE" ;;
       *) mkdir -p "$STATE_DIR"; echo "$(ts) $cmd ${args[0]:-} ${args[1]:-}" | mask_secrets >> "$HISTORY_FILE" ;;
     esac
@@ -4321,7 +4962,11 @@ main() {
     passwd|password)       cmd_passwd "${args[@]}" ;;
     agents|agent)          cmd_agents "${args[@]}" ;;
     cluster)               cmd_cluster ;;
-    shuffle|soar)          cmd_shuffle "${args[@]}" ;;
+    wazuh)                 cmd_wazuh "${args[@]}" ;;
+    n8n|soar)              cmd_n8n "${args[@]}" ;;
+    suricata|ids)          cmd_suricata "${args[@]}" ;;
+    zeek)                  cmd_zeek "${args[@]}" ;;
+    shuffle)               die "Shuffle was replaced by n8n in vexor 1.2.0 - see: vexor n8n" ;;
     tools|tool)            cmd_tools "${args[@]}" ;;
     soc)                   cmd_soc "${args[@]}" ;;
     elk)                   cmd_elk "${args[@]}" ;;

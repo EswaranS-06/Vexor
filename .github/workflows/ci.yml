@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cli:
+    name: CLI checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Bash syntax
+        run: bash -n vexor
+
+      - name: ShellCheck (errors)
+        run: shellcheck --severity=error --shell=bash vexor
+
+      - name: Help and version run without a stack
+        run: |
+          ./vexor --no-color help > help.txt
+          for section in Wazuh ELK n8n Suricata Zeek; do
+            grep -q "^$section " help.txt || { echo "help is missing the $section section"; exit 1; }
+          done
+          ./vexor --no-color version
+
+      - name: Generated compose files match the committed ones
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          src = open("vexor").read()
+          bad = 0
+          for fn, path in (("ensure_tools_compose", "docker-compose.tools.yml"),
+                           ("ensure_elk_compose", "docker-compose.elk.yml")):
+              body = src[src.index(fn + "() {"):]
+              gen = re.search(r"<<'EOF'\n(.*?)\nEOF\n", body, re.S).group(1) + "\n"
+              if gen != open(path).read():
+                  print(f"{path} differs from what vexor generates ({fn}) - run vexor start and commit the file")
+                  bad = 1
+          sys.exit(bad)
+          EOF
+
+  compose:
+    name: Compose (SOC=${{ matrix.soc }}, ${{ matrix.node }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        soc: [wazuh, elk, both]
+        node: [single, multi]
+        exclude:
+          - soc: elk
+            node: multi
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate the compose model
+        run: |
+          cp .env.example .env
+          sed -i -e "s/^SOC=.*/SOC=${{ matrix.soc }}/" -e "s/^NODE_TYPE=.*/NODE_TYPE=${{ matrix.node }}/" \
+                 -e "s/^PUBLIC_HOST=.*/PUBLIC_HOST=ci.example.org/" .env
+          profiles="n8n,grafana,portainer,suricata,zeek"
+          case "${{ matrix.soc }}" in
+            wazuh) profiles="wazuh,$profiles" ;;
+            elk)   profiles="elk,$profiles" ;;
+            both)  profiles="wazuh,elk,$profiles" ;;
+          esac
+          [ "${{ matrix.node }}" = multi ] && profiles="$profiles,multi,w2,w3,ix3"
+          export COMPOSE_PROFILES="$profiles"
+          docker compose -f docker-compose.yml -f docker-compose.tools.yml -f docker-compose.elk.yml config --quiet
+          echo "services:"; docker compose -f docker-compose.yml -f docker-compose.tools.yml -f docker-compose.elk.yml config --services | sort | sed 's/^/  /'
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: gitleaks (whole history, .gitleaks.toml)
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.28.0 \
+            git /repo --no-banner --redact --config /repo/.gitleaks.toml

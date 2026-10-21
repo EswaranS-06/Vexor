@@ -1,8 +1,17 @@
 # Vexor
 
-Vexor runs a Security Operations Center stack on one Docker host — **Wazuh**, the **Elastic Stack (ELK)**, or **both** — and keeps it healthy with a single command-line tool, `vexor`.
+[![CI](https://github.com/EswaranS-06/Vexor/actions/workflows/ci.yml/badge.svg)](https://github.com/EswaranS-06/Vexor/actions/workflows/ci.yml)
+[![Pages](https://github.com/EswaranS-06/Vexor/actions/workflows/pages.yml/badge.svg)](https://eswarans-06.github.io/Vexor/)
 
-You choose what runs in `.env`, and `vexor` wires it up: certificates, passwords, an nginx reverse proxy, retention, backups, a self-healing watchdog, and optional network sensors and tools. When something breaks, `vexor doctor` tells you what and why, and repairs the problems it knows how to fix.
+Vexor runs a complete Security Operations Center on one Docker host and manages it with a single command-line tool, `vexor`:
+
+- **Wazuh** for SIEM and endpoint detection
+- the **Elastic Stack (ELK)** for search and dashboards
+- **n8n** for automated response
+- **Suricata** for network intrusion detection
+- **Zeek** for network logs
+
+You choose what runs in `.env`, and `vexor` wires everything together: certificates, passwords, an nginx reverse proxy, alert forwarding between the stacks, retention, backups and a self-healing watchdog. When something breaks, `vexor doctor` says what and why, and repairs the problems it knows.
 
 **Landing page:** <https://eswarans-06.github.io/Vexor/> · **CLI reference:** [VEXOR.md](VEXOR.md)
 
@@ -14,13 +23,13 @@ You choose what runs in `.env`, and `vexor` wires it up: certificates, passwords
 2. [Requirements](#requirements)
 3. [Quick start](#quick-start)
 4. [Choosing what runs](#choosing-what-runs)
-5. [Architecture](#architecture)
-6. [Optional tools](#optional-tools)
+5. [How the pieces connect](#how-the-pieces-connect)
+6. [The components](#the-components): [Wazuh](#wazuh) · [ELK](#elk) · [n8n](#n8n) · [Suricata](#suricata) · [Zeek](#zeek) · [Grafana and Portainer](#grafana-and-portainer)
 7. [Change management](#change-management)
-8. [Operations](#operations)
-9. [Data, retention and backups](#data-retention-and-backups)
-10. [Self-healing and troubleshooting](#self-healing-and-troubleshooting)
-11. [Security](#security)
+8. [Data, retention and backups](#data-retention-and-backups)
+9. [Self-healing and troubleshooting](#self-healing-and-troubleshooting)
+10. [Security](#security)
+11. [CI/CD and the landing page](#cicd-and-the-landing-page)
 12. [Repository layout](#repository-layout)
 13. [Limitations](#limitations)
 
@@ -28,17 +37,16 @@ You choose what runs in `.env`, and `vexor` wires it up: certificates, passwords
 
 ## What you get
 
-| | |
-|---|---|
-| **Wazuh SIEM** | Wazuh 4.14 managers, indexers and dashboard. Agents enroll on `1515` and send events on `1514`; nginx balances them across the managers. |
-| **Elastic Stack** | Elasticsearch, Logstash and Kibana 9.5. Kibana is served over HTTPS through nginx; Beats and Elastic Agent send to Logstash. |
-| **Both together** | With `SOC=both`, Logstash copies every Wazuh alert into Elasticsearch, so you can search the same alerts in the Wazuh dashboard and in Kibana. |
-| **Single or multi node** | `NODE_TYPE=single` (1 manager, 1 indexer, about 8 GB RAM) or `multi` (master plus 1–3 workers, 3 indexers, about 16 GB). Switch any time; agents and alerts stay. |
-| **Sensors** | Suricata IDS and Zeek network logs, fed into Wazuh and into Elasticsearch, with severity mapping and Zeek rules included. |
-| **Tools** | Grafana (with a ready-made Wazuh alerts dashboard), Portainer and n8n, each on its own HTTPS port. |
-| **Operations** | Certificates (local CA, your own, or Let's Encrypt), password changes on a running stack, upgrades with rollback, backups and restore, index retention. |
-| **Self-healing** | A 5-minute watchdog, an hourly health check that runs about 60 checks and repairs known problems, reminders, and a status summary when you log in over SSH. |
-| **AI-ready diagnostics** | `vexor ai-context` writes one Markdown report (architecture, settings, state, errors, secrets masked) to paste into any AI assistant. |
+| Component | Version | Role in the SOC | Main commands |
+|---|---|---|---|
+| **Wazuh** | 4.14 | Agents on your endpoints, detection rules, alerts, active response. Single node or a master with 1–3 workers and 3 indexers. | `vexor wazuh`, `vexor agents` |
+| **ELK** | Elastic 9.5 | Elasticsearch stores and searches everything; Kibana shows it; Logstash takes in Beats, Elastic Agent, sensor logs and (with `SOC=both`) every Wazuh alert. | `vexor elk` |
+| **n8n** | 2.40 | Receives alerts above a level you choose and runs your playbooks: notify, open a ticket, isolate a host through the Wazuh API, query Elasticsearch. | `vexor n8n` |
+| **Suricata** | 8.0 | Inspects traffic on a network interface with the ET Open rules (53,000+). Alerts go to Wazuh, Elasticsearch and n8n. | `vexor suricata` |
+| **Zeek** | 8.2 | Writes connection, DNS, HTTP, TLS and SSH logs. Notices and failed SSH logins become Wazuh alerts; logs are searchable in Elasticsearch. | `vexor zeek` |
+| Grafana, Portainer | 13.0, 2.45 | A ready-made Wazuh alerts dashboard; container management. | `vexor tools` |
+
+Around these, `vexor` handles certificates (local CA, your own, or Let's Encrypt), password changes on a running stack, upgrades with rollback, backups and restore, index retention, a 5-minute watchdog, an hourly health check with automatic repairs, and an AI-ready diagnostic report (`vexor ai-context`).
 
 ---
 
@@ -47,11 +55,11 @@ You choose what runs in `.env`, and `vexor` wires it up: certificates, passwords
 | Resource | Needed |
 |---|---|
 | OS | Linux with systemd (tested on Ubuntu 24.04) |
-| Docker | Docker Engine 24 or later, with the Compose v2 plugin |
-| RAM | `SOC=wazuh`: 8 GB (single) or 16 GB (multi). Add about 4 GB for ELK (`SOC=both`). `SOC=elk` alone: about 6 GB. |
+| Docker | Docker Engine 24 or later with the Compose v2 plugin |
+| RAM | `SOC=wazuh`: 8 GB (single) or 16 GB (multi). `SOC=both`: add about 4 GB. `SOC=elk`: about 6 GB. Each tool: 0.3–1 GB. |
 | Disk | 100 GB or more for the Docker data root |
-| Tools | `python3`, `openssl`, `curl`, `ss`, `flock` (`apt install python3 openssl curl iproute2 util-linux`) |
-| Network | Free host ports: 8080, 1514, 1515, 514/udp and 55000 for Wazuh; the 5XXXX ports for ELK and tools |
+| Packages | `python3`, `openssl`, `curl`, `ss`, `flock` (`apt install python3 openssl curl iproute2 util-linux`) |
+| Ports | Wazuh: 8080, 1514, 1515, 514/udp, 55000. ELK and tools: their 5XXXX ports from `.env`. |
 
 `vexor install` sets the kernel setting the indexers need (`vm.max_map_count=262144`).
 
@@ -62,138 +70,201 @@ You choose what runs in `.env`, and `vexor` wires it up: certificates, passwords
 ```bash
 git clone https://github.com/EswaranS-06/Vexor.git
 cd Vexor
-sudo ./vexor install          # creates .env from .env.example, generates passwords and certificates, starts the stack
-sudo ./vexor daemon install   # `vexor` on PATH, start at boot, watchdog, health checks, backups
-vexor info --show-secrets     # dashboard URL and login
+sudo ./vexor install          # creates .env, generates passwords and certificates, starts the stack
+sudo ./vexor daemon install   # vexor on PATH, start at boot, watchdog, health checks, backups
+vexor info --show-secrets     # URLs and logins
 ```
 
 Open the Wazuh dashboard at `https://<host>:8080` and log in as `admin`. The first start takes 1–2 minutes.
 
-To remove the browser certificate warning:
+Add the rest of the SOC:
 
 ```bash
-vexor cert create        # a certificate from a local CA, covering this host's IPs and names
-vexor cert export-ca     # how to trust the CA on Windows, macOS, Linux, Firefox and Active Directory
+vexor suricata enable          # network IDS on the default-route interface
+vexor zeek enable              # network logs
+vexor soc both                 # Elasticsearch + Logstash + Kibana next to Wazuh
+vexor n8n enable               # then open https://<host>:55678 and create the owner account
+vexor n8n connect              # alerts of level 7+ go to n8n
+vexor n8n workflow             # import + publish the "Vexor - SOC alerts" starter workflow
+vexor n8n test                 # send a test alert through the real path
 ```
 
-To enroll a first agent:
+Enroll an agent and remove the browser certificate warning:
 
 ```bash
 vexor agents enroll-cmd windows --name pc-01     # also: linux, rpm, macos
+vexor cert create && vexor cert export-ca        # local CA certificate + how to trust it
 ```
 
 ---
 
 ## Choosing what runs
 
-Three settings in `.env` decide the layout. Change them with a command; each one moves the data safely and keeps your agents.
+Everything is decided in `.env`. Each setting has a command that changes it safely; your agents and data stay.
 
-| Setting | Values | Switch with |
+| Setting | Values | Change with |
 |---|---|---|
 | `SOC` | `wazuh` · `elk` · `both` | `vexor soc both` |
 | `NODE_TYPE` | `single` · `multi` | `vexor node-type multi` |
-| `WORKER_COUNT` | `1`–`3` (multi only) | `vexor scale 2` |
+| `WORKER_COUNT` | `1`–`3` (multi) | `vexor scale 2` |
+| `N8N`, `SURICATA`, `ZEEK`, `GRAFANA`, `PORTAINER` | `true` · `false` | `vexor <tool> enable` or `vexor tools enable <tool>` |
 
-**`SOC=wazuh`** runs Wazuh only. This is the default.
-
-**`SOC=elk`** runs Elasticsearch, Logstash and Kibana only. Suricata, Zeek and any Beats or Elastic Agent you point at `LOGSTASH_BEATS_PORT` feed Logstash. Wazuh is stopped: agents cannot report until you switch back, but their keys and every alert stay in the Wazuh volumes.
-
-**`SOC=both`** runs the two side by side. Logstash reads the managers' `alerts.json` and writes `vexor-wazuh-alerts-*` indices in Elasticsearch.
-
-**`NODE_TYPE=single`** runs one manager and one indexer. **`multi`** runs a master plus `WORKER_COUNT` workers and three indexers. Switching from multi to single first moves every shard onto the remaining indexer, then removes the others. Nothing is lost, and `--dry-run` shows the plan without changing anything.
+- **`SOC=wazuh`** (default): Wazuh only.
+- **`SOC=elk`**: Elasticsearch, Logstash and Kibana only. Suricata, Zeek, Beats and Elastic Agent feed Logstash. Wazuh is stopped, but its agent keys and alerts stay in their volumes.
+- **`SOC=both`**: both stacks. Logstash copies every Wazuh alert into `vexor-wazuh-alerts-*`.
+- **`NODE_TYPE=single`** runs one manager and one indexer. **`multi`** runs a master, `WORKER_COUNT` workers and three indexers. Switching moves every shard first. `--dry-run` shows the plan.
 
 ---
 
-## Architecture
+## How the pieces connect
 
 ```
-            Agents ── 1514 events ──►┐            ┌──────────── one Docker host ────────────────────────┐
-            Agents ── 1515 enroll ──►┼───────────►│ nginx ── stream ──► wazuh.master (+ workers)        │
-            Browser ── 8080 HTTPS ──►┤            │   │                    │ filebeat (TLS)             │
-            Browser ── 5XXXX HTTPS ─►┘            │   │                    ▼                            │
-                                                   │   ├── 8080 ──► wazuh.dashboard ──► wazuh indexer(s) │
-                                                   │   ├── 55601 ─► kibana ──────────► elasticsearch     │
-                                                   │   └── 53000 / 59443 / 55678 ─► grafana, portainer,  │
-                                                   │                                  n8n                │
-            Beats / Elastic Agent ── 55044 ──────►│ logstash ◄── alerts.json, suricata, zeek            │
-                                                   │ suricata, zeek (host network, SNIFF_INTERFACE)      │
-                                                   └─────────────────────────────────────────────────────┘
+ Endpoints (Wazuh agents) ─ 1514/1515 ─┐        ┌───────────────────── one Docker host ─────────────────────┐
+ Browsers ── 8080 / 5XXXX HTTPS ───────┼──────► │ nginx ─┬─► wazuh.master (+ workers) ── alerts ──┐            │
+ Beats / Elastic Agent ── 55044 ───────┘        │        ├─► wazuh.dashboard ──► wazuh indexer(s) ◄┘            │
+                                                │        ├─► kibana ──► elasticsearch ◄── logstash ◄─┐          │
+                                                │        └─► n8n, grafana, portainer                 │          │
+                                                │                                                    │          │
+                                                │ suricata, zeek ── tools-data/ ──► wazuh.master + logstash     │
+                                                │ every manager ── alerts ≥ N8N_ALERT_LEVEL ──► n8n webhook      │
+                                                │ n8n ──► Wazuh API (vexor-n8n user) / Elasticsearch (read-only) │
+                                                └────────────────────────────────────────────────────────────────┘
 ```
 
-| Service | Role | Runs when |
-|---|---|---|
-| `wazuh.master` | Enrollment, Wazuh API, rules and agent keys; analyses events | `SOC` = wazuh or both |
-| `wazuh.worker`, `wazuh2.worker`, `wazuh3.worker` | Analyse events, ship alerts; sync from the master | `NODE_TYPE=multi` |
-| `wazuh1.indexer` (+ 2, 3) | Wazuh alert store (OpenSearch) | wazuh or both (three in multi) |
-| `wazuh.dashboard` | Wazuh UI | wazuh or both |
-| `elasticsearch`, `logstash`, `kibana` | Elastic Stack | `SOC` = elk or both |
-| `nginx` | HTTPS for every UI; balances agent traffic across managers | always |
-| `suricata`, `zeek` | Network sensors on `SNIFF_INTERFACE` | `SURICATA=true`, `ZEEK=true` |
-| `grafana`, `portainer`, `n8n` | Optional tools | `GRAFANA=true` and so on |
+| Flow | Path |
+|---|---|
+| Endpoint events | Agent → nginx (1514) → a manager → rules → alert → filebeat → Wazuh indexer |
+| Network alerts | Suricata `eve.json` → master (alert and anomaly records only) → rules 100720/100721 → alert |
+| Network logs | Zeek JSON logs → master (`ZEEK_WAZUH_LOGS`) → rules 100700–100703; all logs → Logstash |
+| Wazuh to ELK | `SOC=both`: Logstash reads each manager's `alerts.json` → `vexor-wazuh-alerts-*` |
+| Alerts to n8n | Every manager's `custom-n8n` integration posts the alert JSON to `http://n8n:5678/webhook/…` with an `X-Vexor-Token` header. With `SOC=elk`, Logstash posts Suricata alerts and Zeek notices instead. |
+| n8n back into the stack | HTTP Request nodes call the Wazuh API (`https://wazuh.master:55000`) and Elasticsearch (`http://elasticsearch:9200`) with users from `vexor n8n credentials` |
 
-Compose files: `docker-compose.yml` (Wazuh and nginx), `docker-compose.elk.yml`, `docker-compose.tools.yml`, plus `docker-compose.override.yml`, which `vexor` generates. `COMPOSE_FILE` and `COMPOSE_PROFILES` in `.env` select what starts, so always use `vexor` rather than plain `docker compose up`.
+Compose files: `docker-compose.yml` (Wazuh and nginx), `docker-compose.elk.yml`, `docker-compose.tools.yml` and the generated `docker-compose.override.yml`. `COMPOSE_FILE` and `COMPOSE_PROFILES` in `.env` select what starts, so always use `vexor`, not plain `docker compose up`.
 
 ---
 
-## Optional tools
+## The components
 
-Turn a tool on with `vexor tools enable <name>`, or set `<NAME>=true` in `.env` and run `vexor tools apply`.
+### Wazuh
 
-| Tool | Port (`.env`) | What `vexor` wires up |
-|---|---|---|
-| Suricata | — | Sniffs `SNIFF_INTERFACE`; downloads the ET Open rules (53,000+); `eve.json` goes to Wazuh, where high-severity alerts are raised to level 10 and medium to level 7, and to Elasticsearch when ELK runs. Logs are rotated daily. |
-| Zeek | — | Network logs in JSON format, rotated hourly. Wazuh reads `ZEEK_WAZUH_LOGS`: notices become level 6, failed SSH logins level 5. |
-| Grafana | `GRAFANA_PORT` 53000 | A read-only indexer user limited to the Wazuh indices, an OpenSearch datasource, and a "Wazuh alerts overview" dashboard |
-| Portainer | `PORTAINER_PORT` 59443 | The admin password is set on first start (`PORTAINER_ADMIN_PASSWORD`) |
-| n8n | `N8N_PORT` 55678 | HTTPS URLs and an encryption key. The first person to open it creates the owner account, so open it right after enabling. |
+`vexor install` generates the passwords, the cluster key and every internal certificate. It also removes the OpenSearch demo users, whose passwords are public, before the first start. The dashboard is served at `PROXY_PORT` (8080) through nginx, which also balances agent traffic over the managers.
 
-Every web tool is served only through nginx, over HTTPS, with the same certificate as the dashboard.
+```bash
+vexor wazuh                      # indexer and manager cluster, API
+vexor wazuh alerts --level 10    # newest alerts of every manager
+vexor wazuh logtest              # test a log line against the rules
+vexor agents list                # agents, status, node, version
+vexor node-type multi            # grow to master + workers + 3 indexers
+```
+
+### ELK
+
+`vexor soc both` (or `elk`) does the following:
+
+- generates the Elastic passwords
+- creates `vexor_logstash`, a user that can only write `vexor-*`
+- applies ILM retention (`ELK_RETENTION_DAYS`) with 0 replicas
+- adds Kibana data views for Wazuh alerts, Suricata, Zeek and Beats
+
+Kibana is served at `KIBANA_PORT` (55601) through nginx. Elasticsearch listens on `127.0.0.1:ES_PORT` only.
+
+```bash
+vexor elk                                     # health, Kibana, events in the last hour
+vexor elk search 'rule.level:>=10' -n 20      # Lucene search across vexor-*
+vexor elk indices                             # index sizes
+vexor elk beats-config                        # filebeat.yml for other machines
+vexor elk es GET /_cat/health?v               # raw API
+```
+
+### n8n
+
+n8n is the response engine. `vexor n8n connect [path]` sets up alert delivery to an n8n webhook (default path `vexor-alerts`). Only alerts at or above `N8N_ALERT_LEVEL` (default 7) are sent, optionally limited to `N8N_ALERT_GROUPS`.
+
+- **`SOC=wazuh` or `both`:** vexor installs a `custom-n8n` integration on every manager. Agents are balanced across managers, so each manager must send its own alerts.
+- **`SOC=elk`:** Logstash forwards Suricata alerts and Zeek notices instead.
+
+Every call carries `X-Vexor-Token` (`N8N_HOOK_TOKEN`), so the workflow can reject anything else.
+
+`vexor n8n workflow` imports and publishes a starter workflow, **Vexor - SOC alerts**:
+
+1. A webhook receives the alert.
+2. A code step checks the token and gives Wazuh, Suricata and Zeek events the same fields: `source`, `severity`, `level`, `title`, `where`, `alert`.
+3. A switch routes by severity to four placeholders: critical (12+), high (7–11), medium (4–6) and low.
+
+Replace the placeholders with your actions.
+
+`vexor n8n credentials` creates least-privilege accounts for those actions:
+
+- **Wazuh API user `vexor-n8n`:** can read and run agent commands, active response and syscheck.
+- **Elasticsearch user `vexor_n8n`:** can read `vexor-*`.
+
+```bash
+vexor n8n                        # owner account, forwarding per manager, webhook registered, errors
+vexor n8n connect --level 10     # change the threshold
+vexor n8n test                   # runs the real integration script with a test alert
+vexor n8n backup                 # export workflows + credentials (credentials stay encrypted)
+```
+
+n8n has no account until someone opens it: the first visitor becomes the owner, so open it right after enabling it.
+
+### Suricata
+
+Suricata runs on the host network and sniffs `SNIFF_INTERFACE` (default: the interface of the default route). vexor downloads the ET Open rules and fixes their ownership so Suricata can read them. It refreshes the rules daily without a restart.
+
+Wazuh reads only alert and anomaly records. Stats and flow records have hundreds of fields that Wazuh's JSON decoder rejects. High-severity alerts become level 10, medium level 7.
+
+```bash
+vexor suricata                   # signatures, eve.json, alerts in 24 h, top signatures
+vexor suricata alerts --since 1h
+vexor suricata test              # real test traffic -> Suricata -> Wazuh -> Elasticsearch
+vexor suricata update-rules
+```
+
+### Zeek
+
+Zeek writes JSON logs and rotates them hourly into `tools-data/zeek/logs`; copies are kept for `TOOLS_LOG_RETENTION_DAYS`.
+
+- **Wazuh** reads the logs listed in `ZEEK_WAZUH_LOGS` (default: notice, weird, dns, http, ssl, ssh; `conn` is large, so add it on purpose). Notices become level 6, failed SSH logins level 5.
+- **Logstash** sends them to `vexor-zeek-*`.
+
+```bash
+vexor zeek                       # current logs, size, freshness, who reads them
+vexor zeek show dns -n 20        # readable lines of one log
+vexor zeek top hosts             # top talkers (also: ports, dns)
+vexor zeek test
+```
+
+### Grafana and Portainer
+
+Grafana gets an OpenSearch datasource with the read-only indexer user `grafana` and a **Wazuh alerts overview** dashboard. Portainer's admin password comes from `PORTAINER_ADMIN_PASSWORD`. Both are served only through nginx, on `GRAFANA_PORT` (53000) and `PORTAINER_PORT` (59443).
 
 ---
 
 ## Change management
 
-After editing `.env`, validate the file and apply it. **Never use `down -v` or `reset` to apply settings**: they delete the volumes that hold every alert, agent key and rule.
+After editing `.env`, validate and apply. **Never use `down -v` or `reset` to apply settings**: they delete the volumes that hold every alert, agent key, rule and workflow.
 
 ```bash
-vexor config validate
-vexor config apply      # re-renders nginx and the override, recreates only what changed
-vexor doctor
+vexor config validate && vexor config apply && vexor doctor
 ```
 
 | You changed | Apply with |
 |---|---|
-| Ports, heap sizes, log rotation, images, plain values | `vexor config apply` |
-| `SOC`, `NODE_TYPE`, `WORKER_COUNT` | `vexor soc …`, `vexor node-type …`, `vexor scale …` (or `config apply`, which asks first) |
-| A tool flag (`GRAFANA=true` …) | `vexor tools apply` |
-| Any password | `vexor passwd admin\|kibanaserver\|api`; editing `.env` alone breaks logins |
+| Ports, heap sizes, log rotation, images | `vexor config apply` |
+| `SOC`, `NODE_TYPE`, `WORKER_COUNT` | `vexor soc …`, `vexor node-type …`, `vexor scale …` |
+| A tool flag, `SNIFF_INTERFACE`, `ZEEK_WAZUH_LOGS` | `vexor tools apply` |
+| `N8N_ALERT_LEVEL`, `N8N_ALERT_GROUPS`, webhook path | `vexor n8n connect [path] --level N --groups G` |
+| Any password | `vexor passwd admin\|kibanaserver\|api`, `vexor elk reset-password`; editing `.env` alone breaks logins |
 | `WAZUH_VERSION` | `vexor update apply <version>` |
 | `PUBLIC_HOST`, certificate names | `vexor cert create` |
 | `BACKUP_TIME`, `MAINT_TIME`, `HEALTH_INTERVAL` | `vexor daemon install` |
-| `config/wazuh_cluster/*.conf` (`ossec.conf`) | Edit **every** manager file, then `vexor restart managers` |
-| `config/nginx/nginx.conf.tpl` | `vexor config apply` (do not edit `nginx.conf`; it is generated) |
-| `config/wazuh_indexer/*.yml` | `vexor restart indexer1`, waiting for green before the next indexer |
+| `config/wazuh_cluster/*.conf` | Edit **every** manager file, then `vexor restart managers` |
+| `config/nginx/nginx.conf.tpl` | `vexor config apply` (`nginx.conf` is generated) |
 
-`vexor restart` **recreates** manager containers rather than restarting them. The Wazuh manager image copies the mounted `ossec.conf` only into a fresh container; a plain `docker restart` keeps the old config. Recreating is safe because the data lives in volumes.
+`vexor restart` **recreates** manager containers: the Wazuh image applies the mounted `ossec.conf` only to a fresh container. The data lives in volumes, so this is safe.
 
-One `.env` rule matters: never put a comment on the same line as an **empty** value. Docker Compose reads `KEY=   # comment` as the value `# comment`. Put comments on their own line; `vexor doctor --fix` repairs such lines.
-
----
-
-## Operations
-
-```bash
-vexor status                       # containers, clusters, agents, ELK, disk, reminders
-vexor logs master -f               # container logs;  vexor logs ossec worker  for Wazuh's own log files
-vexor update                       # newer Wazuh 4.x? `update apply` pulls, backs up, switches, verifies
-vexor passwd admin                 # change a password on the running stack
-vexor agents list                  # agents, status, node, version, OS
-vexor agents password on           # require a password for enrollment
-vexor backup && vexor backup list
-vexor stop | start                 # data stays; the watchdog leaves a stopped stack alone
-```
-
-The full command list is in [VEXOR.md](VEXOR.md).
+Never put a comment on the same line as an **empty** value in `.env`: Docker Compose reads `KEY=   # comment` as the value `# comment`. `vexor doctor --fix` repairs such lines.
 
 ---
 
@@ -201,73 +272,91 @@ The full command list is in [VEXOR.md](VEXOR.md).
 
 | Data | Where | Retention |
 |---|---|---|
-| Wazuh alerts and archives | `wazuh-alerts-*` in the Wazuh indexer | `INDEX_RETENTION_DAYS` (ISM policy) |
-| Alerts, sensors and Beats in ELK | `vexor-*` indices in Elasticsearch | `ELK_RETENTION_DAYS` (ILM policy, 0 replicas) |
+| Wazuh alerts | `wazuh-alerts-*` in the Wazuh indexer | `INDEX_RETENTION_DAYS` (ISM) |
+| ELK events | `vexor-wazuh-alerts-*`, `vexor-suricata-*`, `vexor-zeek-*`, `vexor-beats-*` | `ELK_RETENTION_DAYS` (ILM) |
+| Suricata and Zeek logs | `tools-data/` | `TOOLS_LOG_RETENTION_DAYS` |
+| n8n workflows and credentials | `n8n-data` volume | kept; `vexor n8n backup` exports them |
 | Manager logs | `/var/ossec/logs` (volume) | `MANAGER_LOG_RETENTION_DAYS` |
-| Sensor logs | `tools-data/` | `TOOLS_LOG_RETENTION_DAYS` |
 | Container logs | Docker `json-file` | `LOG_MAX_SIZE` × `LOG_MAX_FILE` |
 
-`vexor backup` saves an indexer snapshot, the master's state (agent keys, rules, groups, API users), the tool data volumes and the configuration. It runs daily when the daemon is installed. Restore with `vexor backup restore-snapshot | restore-manager | restore-config`. Elasticsearch data is not part of the backup yet; copy the `elk-es-data` volume with `vexor volumes backup <volume> --stop`.
+`vexor backup` (daily with the daemon) saves an indexer snapshot, the master's state, the n8n, Grafana and Portainer volumes, and the configuration. Restore with `vexor backup restore-snapshot | restore-manager | restore-config`. Keep `.env`: it holds `N8N_ENCRYPTION_KEY`, without which n8n credentials cannot be decrypted. Elasticsearch data is not in the backup yet; use `vexor volumes backup elk-es-data --stop`.
 
 ---
 
 ## Self-healing and troubleshooting
 
-`vexor daemon install` sets up:
+`vexor daemon install` sets up `vexor.service` (start at boot) and four timers:
 
-| Unit | When | What it does |
-|---|---|---|
-| `vexor.service` | boot | Starts the stack |
-| `vexor-watchdog.timer` | every 5 min | Starts enabled containers that are down; clears read-only index blocks when the disk has room |
-| `vexor-health.timer` | `HEALTH_INTERVAL` (1 h) | `doctor --fix`, then a re-check. If problems remain, it writes an AI-ready report and adds a reminder. |
-| `vexor-backup.timer` | `BACKUP_TIME` | `vexor backup` |
-| `vexor-maintenance.timer` | `MAINT_TIME` | Prunes logs, applies retention, renews certificates, updates Suricata rules, rotates sensor logs |
+- **Watchdog**, every 5 minutes: starts enabled containers that are down and clears read-only index blocks.
+- **Health check**, every hour (`HEALTH_INTERVAL`): runs `doctor --fix` and re-checks. Anything still broken produces an AI-ready report and a reminder.
+- **Backup**, daily (`BACKUP_TIME`).
+- **Maintenance**, daily (`MAINT_TIME`): prunes logs, applies retention, renews certificates, updates the Suricata rules and rotates the sensor logs.
 
 ### Problems Vexor detects and repairs
 
-These come from real failures seen while building and running the stack:
+Each of these came from a real failure while building and running the stack:
 
 | Problem | Repair |
 |---|---|
-| Demo indexer users with public default passwords (`readall`/`readall` …) | Removes them (doctor fails until they are gone) |
-| A manager runs an older `ossec.conf` than the one in `config/` | Recreates that manager |
-| An empty `.env` value followed by a comment | Moves the comment onto its own line |
-| A key defined twice in `.env` | Comments out the earlier definition (Compose uses the last one) |
-| An image download fails on a network or TLS error | Retries each missing image four times with back-off |
-| Another `vexor` run holds the lock (watchdog or health check) | Waits up to 3 minutes instead of failing |
-| Suricata runs with 0 signatures (the rules folder was unreadable) | Downloads the rules, fixes ownership, reloads |
-| An integration (webhook) target is down | Warns, with the count of failed deliveries |
-| Elasticsearch yellow on one node, or a read-only block | Sets replicas to 0; clears the block |
-| Kibana `kibana_system` login fails; Logstash writer cannot log in | Resets the user or role |
-| A worker missing from the cluster; filebeat cannot reach the indexer | Restarts the affected node |
-| http:// on the dashboard port gives 400; nginx config out of date | Re-renders and reloads nginx |
-
-Anything else is reported with a hint. For a full picture:
+| Demo indexer users with public default passwords (`readall`/`readall` …) | Removes them |
+| Suricata stats records flooding Wazuh with *Too many fields for JSON decoder* | Lets Wazuh read only alert and anomaly records |
+| Suricata runs with 0 signatures | Downloads the rules, fixes ownership, reloads |
+| The n8n integration script missing on a manager (new worker, reset volume) | Installs it, recreates the manager |
+| n8n webhook not registered (workflow not published) | Warns; `vexor n8n workflow` |
+| An integration target down | Warns with the count of failed deliveries |
+| A manager runs an older `ossec.conf` than `config/` | Recreates it |
+| An empty `.env` value followed by a comment; a key defined twice | Moves the comment; comments out the earlier key |
+| An image download fails on a network or TLS error | Retries with back-off |
+| Elasticsearch yellow on one node, read-only blocks, ILM missing | Replicas 0, clears the block, applies ILM |
+| `kibana_system` or the Logstash writer cannot log in | Resets the user or role |
+| nginx out of date, http:// on an HTTPS port | Re-renders and reloads nginx |
 
 ```bash
-vexor doctor              # ~60 checks, each problem with a hint
+vexor doctor              # about 60 checks, each problem with a hint
 vexor doctor --fix        # repair what can be repaired
-vexor ai-context --print  # paste into any AI assistant
+vexor ai-context --print  # one report to paste into any AI assistant (secrets masked)
 ```
 
 | Symptom | What to check |
 |---|---|
-| Agent stays *never connected* | Normal for about a minute. Otherwise `1514/tcp` is not reachable from the endpoint; check the agent's `ossec.log`. |
-| Browser warns about the certificate | `vexor cert create`, then trust `ca.crt` on the client (`vexor cert export-ca`) |
-| Kibana returns 502 | It is still starting (2–3 min on the first run); `vexor doctor` explains |
-| No alerts in Elasticsearch | `vexor doctor` checks the Logstash pipeline and its Elasticsearch user |
-| Grafana "Test connection" shows *Index not found* | A known quirk of the OpenSearch plugin's health check; dashboard queries work. `vexor doctor` tests the datasource with a real query. |
+| Agent stays *never connected* | Normal for about a minute. Otherwise 1514/tcp is not reachable from the endpoint. |
+| Browser warns about the certificate | `vexor cert create`, then trust the CA (`vexor cert export-ca`) |
+| n8n shows no executions | `vexor n8n`: is the webhook registered and is the level threshold right? Then `vexor n8n test`. |
+| Suricata has no alerts | `vexor suricata test`; is `SNIFF_INTERFACE` the interface the traffic uses? |
+| Kibana returns 502 | Still starting (2–3 min on the first run) |
+| Grafana "Test connection" shows *Index not found* | A quirk of the plugin's health check; dashboard queries work |
 
 ---
 
 ## Security
 
-- `.env`, `config/wazuh_indexer_ssl_certs/`, `config/nginx/certs/` and `backups/` hold secrets. `vexor` keeps them root-only, and `.gitignore` keeps them out of git.
-- Every UI is reachable only through nginx (TLS 1.2/1.3). The Wazuh indexer and Elasticsearch APIs bind to `127.0.0.1`.
-- Generated users get the least they need: Grafana gets read-only access to the Wazuh indices, Logstash can write `vexor-*` only, and the optional Shuffle user has read access plus active response.
+- `.env`, the certificate folders and `backups/` hold secrets. `vexor` keeps them root-only and `.gitignore` keeps them out of git.
+- Every UI is served only through nginx (TLS 1.2/1.3). The Wazuh indexer and Elasticsearch APIs bind to `127.0.0.1`. n8n is reached by the stack on the internal Docker network.
+- Generated accounts get only what they need:
+  - Grafana: read the Wazuh indices.
+  - Logstash: write `vexor-*`.
+  - `vexor-n8n`: agent actions and active response.
+  - `vexor_n8n`: read `vexor-*`.
+- Alerts sent to n8n carry a secret token (`N8N_HOOK_TOKEN`); the starter workflow drops calls without it.
 - Agent enrollment is open by default. Protect it with `vexor agents password on`.
-- Firewall: allow `1514`, `1515`/tcp and `514`/udp from endpoints; `8080` and the tool ports from administrators; keep `55000` and `55044` restricted.
-- Reports from `vexor ai-context` and `vexor support-bundle` mask passwords, hashes, tokens and webhook IDs. Review them anyway before sharing.
+- Firewall:
+  - Allow 1514 and 1515/tcp, and 514/udp, from endpoints.
+  - Allow 8080 and the tool ports from administrators.
+  - Keep 55000 and 55044 restricted.
+- `vexor ai-context` and `vexor support-bundle` mask passwords, hashes, tokens and keys. Review them anyway before sharing.
+
+---
+
+## CI/CD and the landing page
+
+Two GitHub Actions workflows live in `.github/workflows/`:
+
+| Workflow | Runs on | What it does |
+|---|---|---|
+| `ci.yml` | every push and pull request | Checks `vexor` with `bash -n` and ShellCheck. Validates the compose files for each SOC mode with `.env.example`. Checks that the committed tool and ELK compose files match what `vexor` generates. Scans for leaked secrets with gitleaks. |
+| `pages.yml` | pushes to `main` that touch `docs/` (or a manual run) | Publishes `docs/` to GitHub Pages: <https://eswarans-06.github.io/Vexor/> |
+
+To enable Pages on a fork, set **Settings → Pages → Source** to **GitHub Actions**.
 
 ---
 
@@ -279,29 +368,32 @@ Vexor/
 ├── .env.example                  # every setting; copied to .env by `vexor install`
 ├── docker-compose.yml            # Wazuh services + nginx (profiles select the layout)
 ├── docker-compose.elk.yml        # Elasticsearch, Logstash, Kibana (generated by vexor)
-├── docker-compose.tools.yml      # Suricata, Zeek, Grafana, Portainer, n8n (generated by vexor)
+├── docker-compose.tools.yml      # n8n, Suricata, Zeek, Grafana, Portainer (generated by vexor)
 ├── generate-indexer-certs.yml    # one-shot internal certificate generator
 ├── config/
 │   ├── certs.yml                 # nodes the internal certificates are issued for
 │   ├── wazuh_cluster/            # ossec.conf for the master and each worker
 │   ├── wazuh_indexer/            # opensearch.yml per node + internal users
 │   ├── wazuh_dashboard/          # dashboard config + Wazuh API connection
-│   └── nginx/nginx.conf.tpl      # the template vexor renders nginx.conf from
+│   └── nginx/nginx.conf.tpl      # the template nginx.conf is rendered from
 ├── docs/index.html               # landing page (GitHub Pages)
-├── README.md · VEXOR.md · LICENSE
+├── .github/workflows/            # ci.yml, pages.yml
+├── .gitleaks.toml                # secret-scan settings used by CI
+└── README.md · VEXOR.md · LICENSE
 ```
 
-Created at run time and ignored by git: `.env`, `.state/`, `backups/`, `reports/`, `tools-data/`, certificates, `config/tools/`, `config/elk/`, `docker-compose.override.yml` and `nginx.conf`.
+Created at run time and ignored by git: `.env`, `.state/`, `backups/`, `reports/`, `tools-data/`, certificates, `config/tools/` (n8n workflow file, integration script, Grafana provisioning, Zeek script, tool rules), `config/elk/`, `docker-compose.override.yml` and `nginx.conf`.
 
 ---
 
 ## Limitations
 
 - Everything runs on one host. The clusters protect against a failed container, not a failed host.
-- Up to three workers are predefined. More workers need another compose service and certificate.
+- Up to three workers are predefined.
 - Wazuh 5.x uses a different deployment layout and is not covered by `vexor update apply`.
-- Elasticsearch runs as a single node and is not yet included in `vexor backup`.
+- Elasticsearch runs as a single node and is not yet in `vexor backup`.
+- The Logstash Beats input has no TLS; use it on a trusted network.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Wazuh, Elasticsearch, Logstash, Kibana, Suricata, Zeek, Grafana, Portainer and n8n are the work of their respective authors, under their own licenses; Vexor contains deployment configuration and tooling around their official images.
+MIT. See [LICENSE](LICENSE). Wazuh, Elasticsearch, Logstash, Kibana, n8n, Suricata, Zeek, Grafana and Portainer belong to their authors and keep their own licenses. Vexor contains deployment configuration and tooling around their official images.

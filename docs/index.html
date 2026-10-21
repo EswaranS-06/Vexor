@@ -216,20 +216,22 @@
         <li><span class="prob">A manager ignores your edited ossec.conf</span><span class="rep">Recreated, because the image only applies mounted config to a fresh container</span></li>
         <li><span class="prob">An empty .env value followed by a comment</span><span class="rep">Comment moved to its own line, since Compose would use it as the value</span></li>
         <li><span class="prob">Suricata runs with 0 signatures</span><span class="rep">Rules downloaded, ownership fixed, hot-reloaded</span></li>
+        <li><span class="prob">Suricata stats records flood Wazuh with decoder errors</span><span class="rep">Wazuh reads only alert and anomaly records</span></li>
+        <li><span class="prob">A new worker has no n8n integration script</span><span class="rep">Script installed, the manager recreated</span></li>
         <li><span class="prob">An image download fails on a TLS error</span><span class="rep">Each missing image retried with back-off</span></li>
         <li><span class="prob">Elasticsearch stays yellow on one node</span><span class="rep">Replicas set to 0 and the index template corrected</span></li>
       </ul>
     </section>
 
     <section id="tools">
-      <h2>Add sensors and tools with one flag.</h2>
-      <p class="intro">Set a tool to <code>true</code> in <code>.env</code>. Vexor wires it in and serves every web tool over HTTPS through nginx, with the dashboard's certificate.</p>
+      <h2>Add sensors and response with one command.</h2>
+      <p class="intro">Each one has its own commands for status, tests and day-to-day work. Vexor wires it into Wazuh and ELK, and serves every web tool over HTTPS through nginx with the dashboard's certificate.</p>
       <div class="tools">
-        <div class="tool"><h3>Suricata</h3><p>IDS on your interface. High-severity alerts reach Wazuh at level 10.</p><code>SURICATA=true</code></div>
-        <div class="tool"><h3>Zeek</h3><p>DNS, HTTP, TLS and SSH logs, with notices raised as alerts.</p><code>ZEEK=true</code></div>
+        <div class="tool"><h3>Suricata</h3><p>IDS on your interface with the ET Open rules. High-severity alerts reach Wazuh at level 10; <code>suricata test</code> proves every hop.</p><code>vexor suricata enable</code></div>
+        <div class="tool"><h3>Zeek</h3><p>DNS, HTTP, TLS and SSH logs, notices raised as alerts, top talkers on demand.</p><code>vexor zeek enable</code></div>
         <div class="tool"><h3>Grafana</h3><p>A Wazuh alerts dashboard on a read-only indexer user.</p><code>:53000</code></div>
         <div class="tool"><h3>Portainer</h3><p>Every container on the host, with the admin password preset.</p><code>:59443</code></div>
-        <div class="tool"><h3>n8n</h3><p>Workflows for enrichment and notifications.</p><code>:55678</code></div>
+        <div class="tool"><h3>n8n</h3><p>Alerts arrive from every manager by webhook; a starter workflow routes them by severity, and a scoped API user lets it act.</p><code>vexor n8n connect</code></div>
       </div>
     </section>
 

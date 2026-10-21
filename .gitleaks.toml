@@ -1,0 +1,12 @@
+# gitleaks config for Vexor (used by CI). The default rules stay on, with one narrow exception:
+# vexor passes credentials to curl from .env at run time - `-u "user:$(env_get SOME_PASSWORD)"` -
+# which the curl-auth-user rule would otherwise report as a hard-coded password.
+title = "Vexor"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "curl -u with the password taken from .env via $(env_get ...)"
+regexTarget = "match"
+regexes = ['''\$\(env_get [A-Z0-9_]+\)''']

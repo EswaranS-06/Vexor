@@ -62,6 +62,8 @@ services:
       LS_JAVA_OPTS: "-Xms${LOGSTASH_HEAP:-512m} -Xmx${LOGSTASH_HEAP:-512m}"
       VEXOR_ES_USER: vexor_logstash
       VEXOR_ES_PASSWORD: ${LOGSTASH_ES_PASSWORD:-}
+      VEXOR_N8N_URL: ${N8N_HOOK_URL:-}
+      VEXOR_N8N_TOKEN: ${N8N_HOOK_TOKEN:-}
     ports:
       - "${LOGSTASH_BEATS_PORT:-55044}:5044"
     volumes:
