@@ -27,6 +27,21 @@
     </form>
   </main>
 
+  <!-- first sign-in: the generated password must be replaced -->
+  <main class="login" data-pw hidden>
+    <form class="login__box" data-pw-form>
+      <p class="brand"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M7 8l9 16 9-16"/></svg> vexor console</p>
+      <h1>Choose a new password</h1>
+      <p class="login__hint">The generated password is only for the first sign-in. Pick your own: at least 12 characters, different from the current one.</p>
+      <label><span>Current password</span><input name="current" type="password" autocomplete="current-password" required></label>
+      <label><span>New password</span><input name="new" type="password" autocomplete="new-password" minlength="12" required></label>
+      <label><span>Repeat new password</span><input name="repeat" type="password" autocomplete="new-password" minlength="12" required></label>
+      <p class="login__err" data-pw-err role="alert"></p>
+      <button class="btn btn--primary" type="submit">Change password</button>
+      <button class="link-btn" type="button" data-pw-logout>Sign out</button>
+    </form>
+  </main>
+
   <!-- app -->
   <div class="app" data-app hidden>
     <aside class="side">
@@ -42,6 +57,7 @@
         <a href="#settings">Settings</a>
         <a href="#terminal">Terminal</a>
         <a href="#activity">Activity</a>
+        <a href="#reset">Reset</a>
       </nav>
       <div class="side__foot">
         <p data-whoami></p>

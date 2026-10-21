@@ -76,7 +76,14 @@ jobs:
           grep -q "answers on" console.txt
           PW=$(sudo grep -E '^CONSOLE_PASSWORD=' .env | tail -1 | cut -d= -f2 | awk '{print $1}')
           curl -sk -c cj -X POST https://127.0.0.1:50443/api/login -H 'Content-Type: application/json' \
-               -d "{\"user\":\"admin\",\"password\":\"$PW\"}" | grep -q csrf
+               -d "{\"user\":\"admin\",\"password\":\"$PW\"}" > login.json
+          grep -q csrf login.json
+          CSRF=$(python3 -c 'import json; print(json.load(open("login.json"))["csrf"])')
+          # fresh install: the generated password must be changed before the API answers
+          test "$(curl -sk -b cj -o /dev/null -w '%{http_code}' https://127.0.0.1:50443/api/state)" = 403
+          NEW="ci-$(openssl rand -hex 12)"
+          curl -sk -b cj -X POST https://127.0.0.1:50443/api/password -H 'Content-Type: application/json' -H "X-Vexor-CSRF: $CSRF" \
+               -d "{\"current\":\"$PW\",\"new\":\"$NEW\",\"repeat\":\"$NEW\"}" | grep -q '"ok"'
           curl -sk -b cj https://127.0.0.1:50443/api/state | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["soc"]=="wazuh" and "wazuh.master" in d["services"], d'
           curl -sk -b cj https://127.0.0.1:50443/api/logins | python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(r["id"]=="dashboard" for r in d) and all("password" not in r for r in d), d'
           test "$(curl -sk -o /dev/null -w '%{http_code}' -b cj -X POST https://127.0.0.1:50443/api/run -H 'Content-Type: application/json' -d '{"args":["shell"]}')" = 403

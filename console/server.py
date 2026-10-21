@@ -85,7 +85,7 @@ CATALOG = {
     "indexers": "danger", "update": "danger", "config": "change", "daemon": "change", "prune-logs": "change",
     "maintenance": "change", "watchdog": "change", "support-bundle": "change", "ai-context": "read",
     "indexer": "read", "api": "read", "passwd": "danger", "reset": "danger", "console": "change", "plan": "read",
-    "notify": "change", "login": "change",
+    "notify": "change", "login": "change", "disk": "read", "uninstall": "danger", "images": "danger",
 }
 READ_SUBS = {
     "tools": {"status", "ls", ""}, "soc": {"status", ""}, "elk": {"status", "indices", "search", "explain", ""},
@@ -98,6 +98,12 @@ READ_SUBS = {
 DANGER_SUBS = {
     "volumes": {"rm", "prune", "restore"}, "backup": {"restore-snapshot", "restore-manager", "restore-config"},
     "cert": {"internal-regen"}, "agents": {"remove"}, "soc": {"wazuh", "elk", "both"},
+}
+# Reset page: these commands run only with exactly these arguments.
+DANGER_EXACT = {
+    "uninstall": [["uninstall", "--keep-data", "--yes"], ["uninstall", "--yes"]],
+    "images": [["images", "prune", "--yes"]],
+    "volumes": [["volumes", "prune", "--yes"], ["volumes", "prune"]],
 }
 BLOCKED = {"shell", "exec", "install", "reset purge", "config edit", "wazuh logtest", "completion", "motd"}
 ARG_RE = re.compile(r"^[^\x00-\x1f\x7f]{0,300}$")
@@ -124,6 +130,10 @@ def classify(args):
         return None, f"only GET requests through '{cmd}' in the console"
     if cmd == "logs" and ("-f" in args or "--follow" in args):
         return "read", None  # streamed until the browser closes it
+    if cmd in ("uninstall", "images") or (cmd == "volumes" and sub == "prune"):
+        if args not in DANGER_EXACT[cmd]:
+            return None, f"'{' '.join(args)}' is not one of the Reset commands - use the Reset page or the terminal"
+        return "danger", None
     if cmd in DANGER_SUBS and sub in DANGER_SUBS[cmd]:
         return "danger", None
     if cmd in READ_SUBS and sub in READ_SUBS[cmd]:
@@ -250,6 +260,44 @@ def containers():
     for r in rows:
         r.update(stats.get(r["name"], {}))
     return sorted(rows, key=lambda r: r["service"] or "")
+
+
+def df_row(path, roles):
+    out = run_quick(["df", "-P", "-B1", str(path)], timeout=10).strip().splitlines()
+    if len(out) < 2:
+        return None
+    f = out[-1].split()
+    try:
+        size, used, avail, pct = int(f[1]), int(f[2]), int(f[3]), int(f[4].rstrip("%"))
+    except (ValueError, IndexError):
+        return None
+    return {"mount": f[5] if len(f) > 5 else str(path), "size": size, "used": used, "avail": avail, "pct": pct, "roles": roles}
+
+
+def disk_fallback():
+    rows = {}
+    root = run_quick(["docker", "info", "--format", "{{.DockerRootDir}}"], timeout=10).strip() or "/var/lib/docker"
+    for path, role in ((root, "docker-root"), (ROOT, "checkout")):
+        r = df_row(path, [role])
+        if r:
+            if r["mount"] in rows:
+                rows[r["mount"]]["roles"] += r["roles"]
+            else:
+                rows[r["mount"]] = r
+    return {"filesystems": list(rows.values()), "source": "df"}
+
+
+def disk():
+    """Per-filesystem usage from `vexor disk --json`; plain df when that command is missing or fails."""
+    out = run_quick([str(VEXOR), "--no-color", "disk", "--json"], timeout=40)
+    try:
+        d = json.loads(out.strip().splitlines()[-1])
+        fs = [f for f in d["filesystems"] if isinstance(f, dict) and "mount" in f]
+        if fs:
+            return {"filesystems": fs, "source": "vexor"}
+    except (ValueError, IndexError, KeyError, TypeError):
+        pass
+    return disk_fallback()
 
 
 def volumes():
@@ -382,6 +430,48 @@ def console_creds():
     return env.get("CONSOLE_USER", "admin"), env.get("CONSOLE_PASSWORD", "")
 
 
+PW_FILE = STATE / "console-password-set"   # scrypt of the password the user chose in the console
+PW_MIN = 12
+PW_CHARS = re.compile(r"[A-Za-z0-9._@%+=:,/!^*()~-]+")   # what .env holds unquoted and compose reads back as is
+PW_FAILS = {}
+_pw_seen = {}
+
+
+def pw_digest(pw, salt):
+    return hashlib.scrypt(pw.encode(), salt=salt, n=2 ** 14, r=8, p=1).hex()
+
+
+def password_temp():
+    """True while CONSOLE_PASSWORD is not one the user chose here (still the generated one)."""
+    pw = console_creds()[1]
+    if not pw:
+        return False
+    if pw in _pw_seen:
+        return _pw_seen[pw]
+    try:
+        salt_hex, want = PW_FILE.read_text().split()
+        temp = not hmac.compare_digest(pw_digest(pw, bytes.fromhex(salt_hex)), want)
+    except (OSError, ValueError):
+        temp = True
+    _pw_seen.clear()
+    _pw_seen[pw] = temp
+    return temp
+
+
+def write_env_value(key, value):
+    lines = ENV_FILE.read_text().split("\n")
+    hits = [i for i, ln in enumerate(lines) if ln.startswith(key + "=")]
+    if hits:
+        m = re.match(r"^[^=]*=[^#]*?(\s+#.*)?$", lines[hits[-1]])
+        lines[hits[-1]] = f"{key}={value}" + (m.group(1) if m and m.group(1) else "")
+    else:
+        lines.insert(len(lines) - 1 if lines and lines[-1] == "" else len(lines), f"{key}={value}")
+    tmp = ENV_FILE.with_name(ENV_FILE.name + ".tmp")
+    tmp.write_text("\n".join(lines))
+    os.chmod(tmp, ENV_FILE.stat().st_mode & 0o777)
+    os.replace(tmp, ENV_FILE)
+
+
 def audit(user, msg):
     try:
         STATE.mkdir(exist_ok=True)
@@ -487,15 +577,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.static(p)
         if p == "/api/session":
             s = self.session()
-            return self.send_json({"user": s["user"], "csrf": s["csrf"]} if s else {"user": None})
+            return self.send_json({"user": s["user"], "csrf": s["csrf"], "mustChange": password_temp()} if s else {"user": None})
         s = self.require()
         if not s:
             return
+        if password_temp():
+            return self.must_change()
         q = urllib.parse.parse_qs(u.query)
         if p == "/api/state":
             return self.send_json(cached("state", 10, state))
         if p == "/api/containers":
             return self.send_json(cached("containers", 5, containers))
+        if p == "/api/disk":
+            return self.send_json(cached("disk", 30, disk))
         if p == "/api/volumes":
             return self.send_json(cached("volumes", 60, volumes) if "fresh" not in q else volumes())
         if p == "/api/ports":
@@ -523,6 +617,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 lines = []
             return self.send_json(lines[::-1])
         self.send_json({"error": "not found"}, 404)
+
+    def must_change(self):
+        self.send_json({"error": "choose a new console password first", "code": "password_change_required"}, 403)
 
     def stream(self, jid, start):
         job = JOBS.get(jid)
@@ -572,6 +669,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         data = self.body_json()
         if data is None:
             return self.send_json({"error": "bad JSON"}, 400)
+        if p == "/api/password":
+            return self.change_password(s, data)
+        if password_temp():
+            return self.must_change()
         if p == "/api/run":
             args = data.get("args")
             if isinstance(args, str):
@@ -617,6 +718,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
             audit(s["user"], f"revealed the password of '{row['name']}' ({row['user'] or row['key']})")
             return self.send_json({"id": lid, "password": row.get("password", "")})
         self.send_json({"error": "not found"}, 404)
+
+    def change_password(self, s, data):
+        ip = self.client_address[0]
+        now = time.time()
+        fails = [t for t in PW_FAILS.get(ip, []) if now - t < 300]
+        PW_FAILS[ip] = fails
+        if len(fails) >= 5:
+            audit(s["user"], "password change refused: too many wrong attempts")
+            return self.send_json({"error": "too many wrong passwords - wait 5 minutes"}, 429)
+        cur, new, again = (data.get(k) for k in ("current", "new", "repeat"))
+        if not all(isinstance(x, str) for x in (cur, new, again)):
+            return self.send_json({"error": "current, new and repeat are required"}, 400)
+        old = console_creds()[1]
+        if not old or not hmac.compare_digest(hashlib.sha256(cur.encode()).digest(), hashlib.sha256(old.encode()).digest()):
+            fails.append(now)
+            audit(s["user"], "password change failed: wrong current password")
+            time.sleep(1)
+            return self.send_json({"error": "the current password is wrong"}, 403)
+        err = None
+        if new != again:
+            err = "the two new passwords differ"
+        elif len(new) < PW_MIN:
+            err = f"the new password needs at least {PW_MIN} characters"
+        elif not PW_CHARS.fullmatch(new):
+            err = "use letters, digits and . _ @ % + = : , / ! ^ * ( ) ~ - only (no spaces, quotes, # or $)"
+        elif new == old:
+            err = "the new password must differ from the current one"
+        if err:
+            audit(s["user"], f"password change refused: {err}")
+            return self.send_json({"error": err}, 400)
+        try:
+            write_env_value("CONSOLE_PASSWORD", new)
+            STATE.mkdir(exist_ok=True)
+            salt = secrets.token_bytes(16)
+            PW_FILE.write_text(f"{salt.hex()} {pw_digest(new, salt)}\n")
+            os.chmod(PW_FILE, 0o600)
+        except OSError as e:
+            audit(s["user"], f"password change failed: {e}")
+            return self.send_json({"error": f"could not write .env: {e}"}, 500)
+        PW_FAILS.pop(ip, None)
+        _pw_seen.clear()
+        for tok in [t for t, v in SESSIONS.items() if v is not s]:
+            SESSIONS.pop(tok, None)      # every other session must sign in again
+        audit(s["user"], "console password changed")
+        return self.send_json({"ok": True})
 
     def apply_settings(self, s, data):
         changes = {str(k): str(v) for k, v in (data.get("changes") or {}).items()}

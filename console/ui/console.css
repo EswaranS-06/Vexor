@@ -171,3 +171,10 @@ body.has-out .app { grid-template-columns: 14rem minmax(0, 1fr) minmax(0, 32rem)
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; } }
 
 .secret { display: inline-block; min-width: 7rem; margin-right: var(--space-2); overflow-wrap: anywhere; }
+
+/* disk bars and the Reset page */
+.bar--warn i { background: var(--color-warn); } .bar--bad i { background: var(--color-bad); }
+.resets { display: grid; gap: var(--space-4); grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
+.reset { display: grid; gap: var(--space-3); align-content: start; border: var(--rule-w) solid var(--color-rule); border-top: 3px solid var(--color-bad); border-radius: var(--radius-lg); padding: var(--space-5); background: var(--color-paper); }
+.reset h2 { font-size: 1.05rem; }
+.reset p { margin: 0; }

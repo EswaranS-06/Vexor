@@ -248,11 +248,11 @@ Grafana gets an OpenSearch datasource with the read-only indexer user `grafana` 
 
 ### Vexor Console
 
-A web UI for the whole stack at `https://<host>:CONSOLE_PORT` (50443), on by default (`CONSOLE=true`). It runs on the host as the `vexor-console` service, uses the dashboard certificate, and signs in with `CONSOLE_USER` / `CONSOLE_PASSWORD` (`vexor console password`).
+A web UI for the whole stack at `https://<host>:CONSOLE_PORT` (50443), on by default (`CONSOLE=true`). It runs on the host as the `vexor-console` service, uses the dashboard certificate, and signs in with `CONSOLE_USER` / `CONSOLE_PASSWORD` (`vexor console password`). The generated password works for the first sign-in only: the console asks for a new one (12 characters or more) before it shows anything else.
 
 | Page | What you can do |
 |---|---|
-| Overview | Stack, containers running, last health check, disk, links to every UI, reminders, quick actions |
+| Overview | Stack, containers running, last health check, disk usage per drive (amber from 85%, red from 95%), links to every UI, reminders, quick actions |
 | Containers | State, CPU, memory, ports, image; logs and live log follow; start, stop, restart |
 | Ports | Every port from `.env` with what uses it and whether it listens; edit, check (range, duplicates, in use), apply |
 | Volumes | Every volume with its size and users; back up one or all, full backup, remove unused |
@@ -262,6 +262,7 @@ A web UI for the whole stack at `https://<host>:CONSOLE_PORT` (50443), on by def
 | Settings | Every `.env` value (secrets hidden), edit and apply; rotate passwords |
 | Terminal | Any `vexor` command, with suggestions and history |
 | Activity | Every command run from the console, and the audit log |
+| Reset | `uninstall --keep-data` (keeps volumes and generated files), `uninstall` (removes project volumes and generated files), remove unused volumes, remove unused images. Neither uninstall removes images. Each asks you to type its name |
 
 Every action is a `vexor` command, run without a shell from an allowlist, so the console and the CLI behave the same. Reading runs at once, changes ask for confirmation, and anything that deletes data or switches layout asks you to type the command name. Commands that need a terminal (`shell`, `exec`, `wazuh logtest`, `config edit`) stay in SSH. All actions go to `.state/console-audit.log`.
 
