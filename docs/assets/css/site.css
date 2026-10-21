@@ -91,6 +91,15 @@ kbd {
 .kbd-btn:hover { border-color: var(--color-accent); color: var(--color-ink-2); }
 .kbd-btn:active { transform: translateY(1px); }
 
+/* ---------- nav: current page; keep page links on small screens ---------- */
+.nav__links a[aria-current="page"] { color: var(--color-ink); background-size: 100% 1px; }
+@media (max-width: 920px) {
+  .nav__links { display: flex; gap: var(--space-4); margin-right: auto; }
+  .nav__links a:not([data-page]) { display: none; }
+}
+@media (max-width: 520px) { .nav__links a[data-page="roadmap.html"] { display: none; } }
+@media (max-width: 380px) { .nav__links { display: none; } }
+
 /* ---------- buttons ---------- */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; white-space: nowrap;
@@ -457,7 +466,6 @@ mark { background: var(--color-accent-soft); color: var(--color-ink); border-rad
   .hero { grid-template-columns: minmax(0, 1fr); padding-top: var(--space-8); gap: var(--space-7); }
   .hero__title { max-width: 14ch; }
   .changes__grid, .steps { grid-template-columns: minmax(0, 1fr); }
-  .nav__links { display: none; }
   .nav__inner { justify-content: space-between; }
 }
 @media (max-width: 640px) {

@@ -7,7 +7,7 @@ const TTL = 10 * 60 * 1000;
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
 
-async function fetchCached(url, as = "json") {
+export async function fetchCached(url, as = "json") {
   const key = `vexor:${url}`;
   try {
     const hit = JSON.parse(sessionStorage.getItem(key) || "null");
@@ -145,7 +145,9 @@ export function parseCommands(md) {
 }
 
 export async function loadCommands() {
-  const md = await fetchCached(`${RAW}/VEXOR.md`, "text");
+  let md;
+  try { md = await fetchCached("VEXOR.md", "text"); }              // copy published with the site (same commit)
+  catch { md = await fetchCached(`${RAW}/VEXOR.md`, "text"); }      // local preview / older deploys
   const groups = parseCommands(md);
   if (!groups.length) throw new Error("no command tables found");
   return groups;

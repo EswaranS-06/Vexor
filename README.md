@@ -13,7 +13,7 @@ Vexor runs a complete Security Operations Center on one Docker host and manages 
 
 You choose what runs in `.env`, and `vexor` wires everything together: certificates, passwords, an nginx reverse proxy, alert forwarding between the stacks, retention, backups and a self-healing watchdog. When something breaks, `vexor doctor` says what and why, and repairs the problems it knows.
 
-**Landing page:** <https://eswarans-06.github.io/Vexor/> · **CLI reference:** [VEXOR.md](VEXOR.md)
+**Landing page:** <https://eswarans-06.github.io/Vexor/> · **Guide:** <https://eswarans-06.github.io/Vexor/guide.html> · **CLI reference:** [VEXOR.md](VEXOR.md) · **V2 roadmap:** [ROADMAP.md](ROADMAP.md)
 
 ---
 
@@ -379,7 +379,7 @@ Vexor/
 ├── docs/                         # landing page: index.html + assets/ (GitHub Pages, no build step)
 ├── .github/workflows/            # ci.yml, pages.yml
 ├── .gitleaks.toml                # secret-scan settings used by CI
-└── README.md · VEXOR.md · LICENSE
+└── README.md · VEXOR.md · ROADMAP.md · LICENSE
 ```
 
 Created at run time and ignored by git: `.env`, `.state/`, `backups/`, `reports/`, `tools-data/`, certificates, `config/tools/` (n8n workflow file, integration script, Grafana provisioning, Zeek script, tool rules), `config/elk/`, `docker-compose.override.yml` and `nginx.conf`.
@@ -393,6 +393,8 @@ Created at run time and ignored by git: `.env`, `.state/`, `backups/`, `reports/
 - Wazuh 5.x uses a different deployment layout and is not covered by `vexor update apply`.
 - Elasticsearch runs as a single node and is not yet in `vexor backup`.
 - The Logstash Beats input has no TLS; use it on a trusted network.
+
+V2 plans an answer to each of these: see [ROADMAP.md](ROADMAP.md) or the [roadmap page](https://eswarans-06.github.io/Vexor/roadmap.html).
 
 ## License
 

@@ -10,9 +10,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="assets/css/tokens.css">
-  <link rel="stylesheet" href="assets/css/site.css">
-  <script type="module" src="assets/js/main.js"></script>
+  <link rel="stylesheet" href="assets/css/tokens.css?v=1.2.1">
+  <link rel="stylesheet" href="assets/css/site.css?v=1.2.3">
+  <script type="module" src="assets/js/main.js?v=1.2.1"></script>
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
@@ -26,7 +26,8 @@
       <nav class="nav__links" aria-label="Sections">
         <a href="#simulator">Simulator</a>
         <a href="#commands">Commands</a>
-        <a href="#changes">What's new</a>
+        <a href="guide.html" data-page="guide.html">Guide</a>
+        <a href="roadmap.html" data-page="roadmap.html">Roadmap</a>
         <a href="https://github.com/EswaranS-06/Vexor">GitHub</a>
       </nav>
       <div class="nav__right">
@@ -60,7 +61,7 @@
         </div>
         <div class="hero__actions">
           <a class="link-arrow" href="#simulator">Build a stack in the simulator</a>
-          <a class="link-plain" href="https://github.com/EswaranS-06/Vexor#readme">Read the README</a>
+          <a class="link-plain" href="guide.html">Read the guide</a>
         </div>
 
         <ul class="hero__facts" aria-label="What runs">
@@ -89,7 +90,7 @@
     <section class="changes" id="changes" aria-labelledby="changes-title">
       <div class="section-head">
         <h2 id="changes-title">What changed in each release</h2>
-        <p>Read live from the repository's tags and commit messages, so this list is never older than the code.</p>
+        <p>Read live from the repository's tags and commit messages, so this list is never older than the code. Next up: the <a href="roadmap.html">V2 roadmap</a>.</p>
       </div>
       <div class="changes__grid" data-changes>
         <div class="changes__loading" role="status">Loading releases from GitHub…</div>
@@ -240,7 +241,7 @@ vexor n8n enable &amp;&amp; vexor n8n connect &amp;&amp; vexor n8n workflow</cod
   </main>
 
   <footer class="foot">
-    <p><span class="wordmark wordmark--sm">vexor</span> · MIT · <a href="https://github.com/EswaranS-06/Vexor">github.com/EswaranS-06/Vexor</a> · <span data-foot-version>v1.2</span></p>
+    <p><span class="wordmark wordmark--sm">vexor</span> · <a href="guide.html">Guide</a> · <a href="roadmap.html">V2 roadmap</a> · MIT · <a href="https://github.com/EswaranS-06/Vexor">github.com/EswaranS-06/Vexor</a> · <span data-foot-version>v1.2</span></p>
   </footer>
 
   <!-- command palette -->

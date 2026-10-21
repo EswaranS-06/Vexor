@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vexor guide · how it works</title>
+  <meta name="description" content="How Vexor works: what it runs, how alerts flow between Wazuh, ELK, n8n, Suricata and Zeek, how to change settings safely, and how it heals itself.">
+  <meta name="theme-color" content="#f7f9fc">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23234bd6'/%3E%3Cpath d='M8 9l8 15 8-15' stroke='white' stroke-width='3.2' fill='none' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/tokens.css?v=1.2.1">
+  <link rel="stylesheet" href="assets/css/site.css?v=1.2.3">
+  <link rel="stylesheet" href="assets/css/guide.css?v=1.2.3">
+  <script type="module" src="assets/js/guide.js?v=1.2.1"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="nav">
+    <div class="nav__inner">
+      <a class="wordmark" href="./" aria-label="Vexor home">
+        <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M7 8l9 16 9-16"/></svg>
+        <span>vexor</span>
+      </a>
+      <nav class="nav__links" aria-label="Pages">
+        <a href="./#simulator">Simulator</a>
+        <a href="./#commands">Commands</a>
+        <a href="guide.html" data-page="guide.html">Guide</a>
+        <a href="roadmap.html" data-page="roadmap.html">Roadmap</a>
+        <a href="https://github.com/EswaranS-06/Vexor">GitHub</a>
+      </nav>
+      <div class="nav__right">
+        <button class="kbd-btn" type="button" data-open-palette aria-label="Open the command palette">
+          <span class="kbd-btn__label">Search</span>
+          <kbd><span data-mod>Ctrl</span> K</kbd>
+        </button>
+        <a class="btn btn--primary btn--sm" href="#quick-start">Install</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="doc">
+    <aside class="toc" aria-label="On this page">
+      <p class="toc__title">Guide</p>
+      <ol class="toc__list" data-toc>
+        <li><a href="#what">What you get</a></li>
+        <li><a href="#requirements">Requirements</a></li>
+        <li><a href="#quick-start">Quick start</a></li>
+        <li><a href="#layout">Choosing what runs</a></li>
+        <li><a href="#flows">How the pieces connect</a></li>
+        <li><a href="#components">The components</a></li>
+        <li><a href="#changes">Change management</a></li>
+        <li><a href="#data">Data and retention</a></li>
+        <li><a href="#healing">Self-healing</a></li>
+        <li><a href="#security">Security</a></li>
+        <li><a href="#cicd">CI/CD</a></li>
+        <li><a href="#repo">Repository layout</a></li>
+        <li><a href="#limits">Limits and V2</a></li>
+      </ol>
+      <div class="toc__progress" aria-hidden="true"><span data-toc-progress></span></div>
+    </aside>
+
+    <main id="main" class="doc__main">
+      <header class="doc__head">
+        <h1>How Vexor works</h1>
+        <p class="doc__lede">One host, one CLI, five security tools wired into each other. This guide follows the README section by section, with the moving parts drawn out. Every visual below is interactive.</p>
+      </header>
+
+      <!-- 1 -->
+      <section id="what" class="g-sec" aria-labelledby="what-t">
+        <h2 id="what-t">What you get</h2>
+        <p>Vexor runs each tool from its official image and does the wiring between them: certificates, users with the least access they need, alert forwarding, retention and health checks. Pick a component to see its role and its commands.</p>
+        <div class="explorer" data-explorer>
+          <div class="explorer__list" role="tablist" aria-label="Components" data-explorer-list></div>
+          <div class="explorer__pane" role="tabpanel" data-explorer-pane aria-live="polite"></div>
+        </div>
+      </section>
+
+      <!-- 2 -->
+      <section id="requirements" class="g-sec" aria-labelledby="req-t">
+        <h2 id="req-t">Requirements</h2>
+        <p>Linux with systemd, Docker Engine 24+ with Compose v2, and <code>python3 openssl curl ss flock</code>. RAM and ports depend on what you run; pick it below.</p>
+        <div class="calc" data-calc>
+          <form class="calc__controls" data-calc-form aria-label="What will run">
+            <fieldset class="seg seg--light"><legend>SOC</legend>
+              <div class="seg__opts">
+                <label><input type="radio" name="soc" value="wazuh" checked><span>wazuh</span></label>
+                <label><input type="radio" name="soc" value="elk"><span>elk</span></label>
+                <label><input type="radio" name="soc" value="both"><span>both</span></label>
+              </div>
+            </fieldset>
+            <fieldset class="seg seg--light" data-needs-wazuh><legend>NODE_TYPE</legend>
+              <div class="seg__opts">
+                <label><input type="radio" name="node" value="single" checked><span>single</span></label>
+                <label><input type="radio" name="node" value="multi"><span>multi</span></label>
+              </div>
+            </fieldset>
+            <fieldset class="toggles toggles--light"><legend>Tools</legend>
+              <label class="tog"><input type="checkbox" name="n8n" checked><span>N8N</span></label>
+              <label class="tog"><input type="checkbox" name="suricata" checked><span>SURICATA</span></label>
+              <label class="tog"><input type="checkbox" name="zeek"><span>ZEEK</span></label>
+              <label class="tog"><input type="checkbox" name="grafana"><span>GRAFANA</span></label>
+              <label class="tog"><input type="checkbox" name="portainer"><span>PORTAINER</span></label>
+            </fieldset>
+          </form>
+          <div class="calc__out">
+            <p class="calc__total"><span data-calc-ram>8 GB</span> recommended RAM <span class="calc__note">(README guidance, not a measurement)</span></p>
+            <div class="ram-bar" data-ram-bar aria-hidden="true"></div>
+            <ul class="ram-legend" data-ram-legend></ul>
+            <p class="calc__ports"><span class="lbl">Host ports</span> <span data-calc-ports></span></p>
+            <p class="calc__ports"><span class="lbl">Disk</span> 100 GB or more for the Docker data root</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3 -->
+      <section id="quick-start" class="g-sec" aria-labelledby="qs-t">
+        <h2 id="qs-t">Quick start</h2>
+        <p>Three commands bring up Wazuh; one or two more add each tool. The first start takes one to two minutes.</p>
+        <ol class="qs" data-qs>
+          <li><span class="qs__dot" aria-hidden="true"></span><div><h3>Clone and install</h3><p>Creates <code>.env</code>, generates passwords, the cluster key and every certificate, removes the demo users, starts the stack.</p><pre class="cmd"><code>git clone https://github.com/EswaranS-06/Vexor.git
+cd Vexor &amp;&amp; sudo ./vexor install</code></pre></div></li>
+          <li><span class="qs__dot" aria-hidden="true"></span><div><h3>Turn on self-healing</h3><p><code>vexor</code> on PATH, start at boot, watchdog, hourly health check, backups.</p><pre class="cmd"><code>sudo ./vexor daemon install
+vexor info --show-secrets</code></pre></div></li>
+          <li><span class="qs__dot" aria-hidden="true"></span><div><h3>Add the rest of the SOC</h3><p>Open n8n right after enabling it: its first visitor becomes the owner.</p><pre class="cmd"><code>vexor suricata enable &amp;&amp; vexor zeek enable
+vexor soc both
+vexor n8n enable &amp;&amp; vexor n8n connect &amp;&amp; vexor n8n workflow
+vexor n8n test</code></pre></div></li>
+          <li><span class="qs__dot" aria-hidden="true"></span><div><h3>Enroll an endpoint, trust the certificate</h3><p>Copy-paste install commands for Windows, Linux or macOS, and a local CA so browsers stop warning.</p><pre class="cmd"><code>vexor agents enroll-cmd windows --name pc-01
+vexor cert create &amp;&amp; vexor cert export-ca</code></pre></div></li>
+        </ol>
+      </section>
+
+      <!-- 4 -->
+      <section id="layout" class="g-sec" aria-labelledby="layout-t">
+        <h2 id="layout-t">Choosing what runs</h2>
+        <p>Two settings decide the shape: <code>SOC</code> and <code>NODE_TYPE</code>. Pick a cell to see the containers it starts. Each switch has its own command that moves the data first; agents keep their keys.</p>
+        <div class="matrix" data-matrix>
+          <div class="matrix__grid" role="grid" aria-label="SOC by NODE_TYPE" data-matrix-grid></div>
+          <div class="matrix__out" aria-live="polite">
+            <p class="matrix__cmd" data-matrix-cmd></p>
+            <ul class="pills" data-matrix-pills></ul>
+            <p class="matrix__note" data-matrix-note></p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 5 -->
+      <section id="flows" class="g-sec" aria-labelledby="flows-t">
+        <h2 id="flows-t">How the pieces connect</h2>
+        <p>Six flows carry everything. Pick one to watch an event move hop by hop.</p>
+        <div class="flows" data-flows>
+          <div class="flows__picker" role="tablist" aria-label="Flows" data-flows-picker></div>
+          <div class="flows__stage">
+            <ol class="pipe" data-pipe aria-live="polite"></ol>
+            <p class="flows__caption" data-flows-caption></p>
+            <button class="ghost-btn ghost-btn--light" type="button" data-flows-replay>Replay</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 6 -->
+      <section id="components" class="g-sec" aria-labelledby="comp-t">
+        <h2 id="comp-t">The components</h2>
+        <p>What Vexor sets up for each one, and the commands you will use.</p>
+        <div class="ctabs" data-ctabs>
+          <div class="ctabs__list" role="tablist" aria-label="Components" data-ctabs-list></div>
+          <div class="ctabs__pane" role="tabpanel" data-ctabs-pane></div>
+        </div>
+      </section>
+
+      <!-- 7 -->
+      <section id="changes" class="g-sec" aria-labelledby="chg-t">
+        <h2 id="chg-t">Change management</h2>
+        <p>Edited something? Pick it to see how to apply it and what restarts.</p>
+        <div class="never" role="note"><strong>Never apply settings with <code>down -v</code> or <code>reset</code>.</strong> They delete the volumes that hold every alert, agent key, rule and workflow.</div>
+        <div class="changer" data-changer>
+          <label class="changer__pick">
+            <span class="lbl">I changed</span>
+            <select data-changer-select></select>
+          </label>
+          <div class="changer__out" data-changer-out aria-live="polite"></div>
+        </div>
+        <p class="aside-note"><code>vexor restart</code> <strong>recreates</strong> manager containers: the Wazuh image applies the mounted <code>ossec.conf</code> only to a fresh container. The data lives in volumes, so this is safe. In <code>.env</code>, never put a comment after an empty value: Compose reads <code>KEY=   # note</code> as the value <code># note</code>.</p>
+      </section>
+
+      <!-- 8 -->
+      <section id="data" class="g-sec" aria-labelledby="data-t">
+        <h2 id="data-t">Data, retention and backups</h2>
+        <p>How long each kind of data is kept by default. Bars are to scale; change the days in <code>.env</code>.</p>
+        <div class="retention" data-retention></div>
+        <div class="backup">
+          <h3>What <code>vexor backup</code> saves, daily at <code>BACKUP_TIME</code></h3>
+          <ul class="checks">
+            <li>Wazuh indexer snapshot</li><li>Master state: agent keys, rules, groups, API users</li>
+            <li>n8n, Grafana and Portainer volumes</li><li><code>.env</code>, <code>config/</code> and certificates</li>
+            <li class="is-no">Elasticsearch data: not yet (<code>vexor volumes backup elk-es-data --stop</code>; planned for V2)</li>
+          </ul>
+          <p class="aside-note">Keep <code>.env</code>: it holds <code>N8N_ENCRYPTION_KEY</code>, without which n8n credentials cannot be decrypted.</p>
+        </div>
+      </section>
+
+      <!-- 9 -->
+      <section id="healing" class="g-sec" aria-labelledby="heal-t">
+        <h2 id="heal-t">Self-healing</h2>
+        <p><code>vexor daemon install</code> sets up a boot service and four timers. Play a day to see when each one runs and what it does.</p>
+        <div class="day" data-day>
+          <div class="day__track" data-day-track aria-hidden="true">
+            <span class="day__cursor" data-day-cursor></span>
+          </div>
+          <div class="day__axis" aria-hidden="true"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+          <div class="day__bar">
+            <button class="btn btn--primary btn--sm" type="button" data-day-play>Play a day</button>
+            <ul class="day__legend">
+              <li><i class="k k--watch"></i>watchdog · every 5 min</li>
+              <li><i class="k k--health"></i>health · hourly</li>
+              <li><i class="k k--backup"></i>backup · 01:30</li>
+              <li><i class="k k--maint"></i>maintenance · 02:15</li>
+            </ul>
+          </div>
+          <ol class="day__log" data-day-log aria-live="polite"></ol>
+        </div>
+        <h3 class="sub-h">Problems it detects and repairs</h3>
+        <label class="search search--inline"><span class="visually-hidden">Filter repairs</span><input type="search" placeholder="Filter: suricata, n8n, elasticsearch…" data-repairs-filter autocomplete="off"></label>
+        <table class="repairs-t">
+          <thead><tr><th scope="col">Problem</th><th scope="col">Repair</th></tr></thead>
+          <tbody data-repairs></tbody>
+        </table>
+      </section>
+
+      <!-- 10 -->
+      <section id="security" class="g-sec" aria-labelledby="sec-t">
+        <h2 id="sec-t">Security</h2>
+        <p>Who should reach which port. Everything else stays on the host or the internal Docker network.</p>
+        <div class="exposure" data-exposure></div>
+        <ul class="checks">
+          <li>Every UI only through nginx, TLS 1.2/1.3; indexer and Elasticsearch bound to <code>127.0.0.1</code>.</li>
+          <li>Least-privilege users: Grafana reads Wazuh indices; Logstash writes <code>vexor-*</code>; <code>vexor-n8n</code> runs agent actions; <code>vexor_n8n</code> reads <code>vexor-*</code>.</li>
+          <li>Alerts to n8n carry a secret <code>X-Vexor-Token</code>; the starter workflow drops calls without it.</li>
+          <li>Demo indexer users with public passwords are removed at install; doctor fails if they come back.</li>
+          <li>Enrollment is open by default: <code>vexor agents password on</code>.</li>
+        </ul>
+      </section>
+
+      <!-- 11 -->
+      <section id="cicd" class="g-sec" aria-labelledby="ci-t">
+        <h2 id="ci-t">CI/CD</h2>
+        <p>Every push runs CI; pushes that touch <code>docs/</code> also publish this site. The latest run on <code>main</code>, live:</p>
+        <ol class="pipeline" data-pipeline>
+          <li class="pl-step is-wait"><span class="pl-name">push to main</span><span class="pl-st">…</span></li>
+        </ol>
+        <p class="aside-note" data-pipeline-note></p>
+      </section>
+
+      <!-- 12 -->
+      <section id="repo" class="g-sec" aria-labelledby="repo-t">
+        <h2 id="repo-t">Repository layout</h2>
+        <p>Select a file or folder to see what it is for.</p>
+        <div class="tree" data-tree>
+          <ul class="tree__list" role="tree" aria-label="Repository" data-tree-list></ul>
+          <div class="tree__info" data-tree-info aria-live="polite"></div>
+        </div>
+      </section>
+
+      <!-- 13 -->
+      <section id="limits" class="g-sec" aria-labelledby="lim-t">
+        <h2 id="lim-t">Limits, and what V2 does about them</h2>
+        <ul class="limits" data-limits></ul>
+        <p><a class="link-arrow" href="roadmap.html">Read the V2 roadmap</a></p>
+      </section>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <p><span class="wordmark wordmark--sm">vexor</span> · <a href="./">Home</a> · <a href="roadmap.html">V2 roadmap</a> · MIT · <a href="https://github.com/EswaranS-06/Vexor">github.com/EswaranS-06/Vexor</a></p>
+  </footer>
+
+  <div class="palette" data-palette hidden>
+    <div class="palette__backdrop" data-palette-close></div>
+    <div class="palette__box" role="dialog" aria-modal="true" aria-label="Command palette">
+      <input class="palette__input" type="text" placeholder="Search pages and commands" aria-label="Search" data-palette-input autocomplete="off" spellcheck="false" role="combobox" aria-expanded="true" aria-controls="palette-list">
+      <ul class="palette__list" id="palette-list" role="listbox" data-palette-list></ul>
+      <p class="palette__hint"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>Enter</kbd> open or copy · <kbd>Esc</kbd> close</p>
+    </div>
+  </div>
+  <div class="toast" data-toast role="status" aria-live="polite"></div>
+</body>
+</html>

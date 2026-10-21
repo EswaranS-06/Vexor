@@ -23,3 +23,6 @@ _stage/
 # design skills used to build docs/ (local only)
 skills/
 .hallmark/
+# copies the Pages workflow publishes with the site
+docs/VEXOR.md
+docs/ROADMAP.md
