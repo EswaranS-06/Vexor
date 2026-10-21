@@ -280,7 +280,7 @@ function overviewHtml(st, csIn, pendIn, dk) {
   const worst = fss.reduce((a, f) => (!a || f.pct > a.pct ? f : a), null);
   if (st) STATE = s;
   const exp = s.services || [];
-  const running = cs.filter((c) => c.state === "running").length;
+  const running = exp.length - exp.filter((x) => !cs.some((c) => c.service === x && c.state === "running")).length;   // of the services the layout expects
   const missing = exp.filter((x) => !cs.some((c) => c.service === x && c.state === "running"));
   const hl = s.health_last || {};
   if (st) setMeta(`${pill("vexor " + (s.vexor || "?"))} ${pill("Wazuh " + (s.wazuh_version || "?"))}`);
