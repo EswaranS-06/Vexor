@@ -185,7 +185,7 @@ $("[data-view]").addEventListener("click", (e) => {
     const vals = Object.fromEntries(new FormData(form));
     args = args.flatMap((a) => { const m = /^\{(\w+)\}$/.exec(a); return m ? (vals[m[1]] ? [vals[m[1]]] : []) : [a]; });
   }
-  run(args);
+  run(args, { text: b.dataset.text });
 });
 function setMeta(html) { const m = $("[data-topmeta]"); if (m.dataset.html !== html) { m.innerHTML = html; m.dataset.html = html; } }
 function setTitle(t, meta = "") { $("[data-title]").textContent = t; setMeta(meta); document.title = `${t} · Vexor Console`; }
@@ -273,11 +273,11 @@ async function vOverview() {
   await progressive(["/api/state", "/api/containers?lite=1", "/api/pending", "/api/disk"], ([s, cs, pend, dk]) => paint(overviewHtml(s, cs, pend, dk)));
 }
 // Any of the four parts may still be on its way (first visit): those show a placeholder until they arrive.
+const diskLevel = (pct) => (pct >= 95 ? "bad" : pct >= 85 ? "warn" : "");
 function overviewHtml(st, csIn, pendIn, dk) {
   const s = st || {}, cs = csIn || [], pend = pendIn || {};
   const fss = dk?.filesystems || [];
   const worst = fss.reduce((a, f) => (!a || f.pct > a.pct ? f : a), null);
-  const level = (pct) => (pct >= 95 ? "bad" : pct >= 85 ? "warn" : "");
   if (st) STATE = s;
   const exp = s.services || [];
   const running = cs.filter((c) => c.state === "running").length;
@@ -286,33 +286,30 @@ function overviewHtml(st, csIn, pendIn, dk) {
   if (st) setMeta(`${pill("vexor " + (s.vexor || "?"))} ${pill("Wazuh " + (s.wazuh_version || "?"))}`);
   const urls = Object.entries(s.urls || {}).filter(([, u]) => u);
   const diskPct = worst?.pct ?? s.disk?.pct;
+  const rem = s.reminders || [];
   return `
     <section class="cards">
       <article class="card"><h2>Stack</h2><p class="big">${st ? `SOC=${esc(s.soc)}` : SK}</p><p class="muted">${esc(s.layout || "")}</p></article>
       <article class="card ${!st || !csIn || !missing.length ? "" : running === 0 && !s.stopped ? "card--bad" : "card--warn"}"><h2>Containers</h2><p class="big">${st && csIn ? `${running} / ${exp.length} running` : SK}</p>
-        <p class="muted">${!st || !csIn ? "" : !missing.length ? "every enabled service is up" : s.stopped ? "stopped with vexor stop - start it under Quick actions" : "not running: " + esc(missing.join(", "))}</p></article>
+        <p class="muted">${!st || !csIn ? "" : !missing.length ? "every enabled service is up" : s.stopped ? 'stopped with vexor stop - <a href="#containers">Start all</a> on Containers' : "not running: " + esc(missing.join(", "))}</p></article>
       <article class="card ${hl.fail > 0 ? "card--bad" : hl.warn > 0 ? "card--warn" : ""}"><h2>Last health check</h2>
         <p class="big">${!st ? SK : hl.epoch ? `${hl.pass} passed · ${hl.warn} warn · ${hl.fail} failed` : "not run yet"}</p>
         <p class="muted">${!st ? "" : hl.epoch ? new Date(hl.epoch * 1000).toLocaleString() : "the hourly timer runs it (vexor daemon install)"}</p></article>
-      <article class="card ${level(diskPct ?? 0) ? "card--" + level(diskPct ?? 0) : ""}"><h2>Disk</h2><p class="big">${diskPct == null ? (st || dk ? "?% used" : SK) : `${esc(diskPct)}% used`}</p><p class="muted">${esc(worst ? worst.mount + " (fullest)" : s.disk?.path || "")}</p></article>
+      <article class="card ${diskLevel(diskPct ?? 0) ? "card--" + diskLevel(diskPct ?? 0) : ""}"><h2>Disk</h2><p class="big">${diskPct == null ? (st || dk ? "?% used" : SK) : `${esc(diskPct)}% used`}</p><p class="muted">${esc(worst ? worst.mount + " (fullest)" : s.disk?.path || "")} <a href="#storage">Storage</a></p></article>
     </section>
     ${s.legacy_project ? `<section class="pending"><p><b>The Docker project is still named <code>${esc(s.project)}</code>.</b> Vexor 2 names it <code>vexor</code>. <code>vexor migrate</code> copies and checks every volume, then switches. The old volumes are kept; once the stack works, run <code>vexor migrate --yes</code> in the Terminal to remove them. Take a backup first.</p><div class="actions">${btn("Migrate to vexor", ["migrate"], "btn--danger-ghost")}</div></section>` : ""}
     ${pend.keys?.length ? `<section class="pending"><p><b>${pend.keys.length} .env change${pend.keys.length > 1 ? "s" : ""} not applied yet:</b> <code>${esc(pend.keys.join(" "))}</code></p><div class="actions">${btn("Show plan", ["plan"])}${btn("Apply", ["config", "apply"], "btn--primary")}</div></section>` : ""}
-    <section class="block"><h2>Disk usage</h2>
-      <div class="table-wrap"><table class="table">
-        <thead><tr><th>Filesystem</th><th>Holds</th><th>Used / size</th><th>Free</th><th class="w-bar"><span class="vh">Usage</span></th><th>Used</th></tr></thead>
-        <tbody>${fss.map((f) => `<tr><td class="mono"><b>${esc(f.mount)}</b></td><td class="small">${esc((f.roles || []).join(", ") || "-")}</td>
-          <td class="num">${esc(fmtBytes(f.used))} / ${esc(fmtBytes(f.size))}</td><td class="num">${esc(fmtBytes(f.avail))}</td>
-          <td class="w-bar"><span class="bar ${level(f.pct) ? "bar--" + level(f.pct) : ""}"><i data-w="${Math.min(100, f.pct) / 100}"></i></span></td>
-          <td>${pill(f.pct + "%", level(f.pct) === "bad" ? "bad" : level(f.pct) === "warn" ? "warn" : "ok")}</td></tr>`).join("") || `<tr><td colspan="6" class="muted">${dk ? "Disk usage is not available." : SK}</td></tr>`}</tbody></table></div>
-      <p class="muted small">Amber from 85%, red from 95%. Free space with <a href="#reset">Reset</a> (prune unused volumes or images).</p></section>
+    <section class="block"><h2>Quick actions</h2><div class="actions">${btn("Status", ["status"])}${btn("Wait until ready", ["wait-ready", "--timeout", "600"])}</div></section>
     <section class="block"><h2>Open</h2>
       <div class="links">${urls.map(([k, u]) => `<a class="linkcard" href="${esc(u)}" target="_blank" rel="noopener"><b>${esc(k)}</b><span>${esc(u)}</span></a>`).join("") || (st ? '<p class="muted">No web UIs enabled.</p>' : `<p class="muted">${SK}</p>`)}</div></section>
-    ${(s.reminders || []).length ? `<section class="block"><h2>Reminders</h2><ul class="list">${s.reminders.map((r) => `<li><b>${esc(r.msg)}</b><code>${esc(r.cmd)}</code></li>`).join("")}</ul></section>` : ""}
-    <section class="block"><h2>Quick actions</h2><div class="actions">
-      ${btn("Status", ["status"])}${btn("Wait until ready", ["wait-ready", "--timeout", "600"])}${btn("Doctor", ["doctor"])}${btn("Doctor --fix", ["doctor", "--fix"], "btn--primary")}${btn("Start stack", ["start"])}${btn("Backup now", ["backup", "run"])}${btn("AI report", ["ai-context", "--print"])}
-    </div></section>
-    <section class="block"><h2>Services</h2><div class="svc-grid">${st ? exp.map((x) => { const c = cs.find((y) => y.service === x); return `<a class="svc ${c?.state === "running" ? "" : "svc--down"}" href="#containers" data-key="${esc(x)}"><b>${esc(x)}</b>${c ? stateLine(c) : csIn ? pill("missing", "bad") : SK}</a>`; }).join("") : `<p class="muted">${SK}</p>`}</div></section>`;
+    <section class="block"><h2>Services</h2><div class="svc-grid">${st ? exp.map((x) => { const c = cs.find((y) => y.service === x); return `<a class="svc ${c?.state === "running" ? "" : "svc--down"}" href="#containers" data-key="${esc(x)}"><b>${esc(x)}</b>${c ? stateLine(c) : csIn ? pill("missing", "bad") : SK}</a>`; }).join("") : `<p class="muted">${SK}</p>`}</div></section>
+    <section class="block" id="sec-health"><h2>Health</h2>
+      <p class="muted">The doctor runs about 60 checks. With --fix it repairs what it safely can, the same as the hourly timer.</p>
+      <div class="actions">${btn("Run doctor", ["doctor"], "btn--primary")}${btn("Doctor --fix", ["doctor", "--fix"])}${btn("Health details", ["health"])}${btn("Recent errors (1h)", ["logs", "errors", "--since", "1h"])}${btn("All reminders", ["reminders"])}${btn("AI report", ["ai-context", "--print"])}${btn("Watchdog pass", ["watchdog"])}</div>
+      ${rem.length ? `<h3 class="sub3">Due reminders</h3><ul class="list">${rem.map((r) => `<li data-key="${esc(r.msg)}"><b>${esc(r.msg)}</b><code>${esc(r.cmd)}</code></li>`).join("")}</ul>` : ""}</section>
+    <section class="block" id="sec-notify"><h2>Notifications</h2>
+      <p class="muted">The hourly check sends problems it could not fix to <code>NOTIFY_URL</code> (Slack, Teams, Discord or any JSON webhook), or to your n8n webhook when that is empty. Set the URL and <code>NOTIFY_ON</code> under <a href="#settings">Settings</a>.</p>
+      <div class="actions">${btn("Notification status", ["notify"])}${btn("Send a test", ["notify", "test"], "btn--primary")}</div></section>`;
 }
 
 // Row menu: one floating menu for the whole page, anchored to the button that opened it.
@@ -433,7 +430,7 @@ function containersPaint(cs) {
   const names = cs.map((c) => c.service);
   [...SELECTED].forEach((n) => { if (!names.includes(n)) SELECTED.delete(n); });
   paint(`
-    <div class="actions actions--compact">${btn("Start all", ["start"])}${btn("Restart all", ["restart"])}${btn("Stop all", ["stop"], "btn--danger-ghost")}${btn("Errors (1h)", ["logs", "errors", "--since", "1h"])}</div>
+    <div class="actions actions--compact">${btn("Start all", ["start"])}${btn("Restart all", ["restart"])}${btn("Stop all", ["stop"], "btn--danger-ghost")}</div>
     <div class="table-wrap"><table class="table">
       <thead><tr><th class="chk"><input type="checkbox" data-sel-all aria-label="Select all containers"></th><th>Service</th><th>State</th><th>Status</th><th>CPU</th><th>Memory</th><th>Ports</th><th>Image</th><th><span class="vh">Actions</span></th></tr></thead>
       <tbody>${cs.map((c) => `<tr data-svc="${esc(c.service)}"${SELECTED.has(c.service) ? ' class="is-sel"' : ""}>
@@ -455,46 +452,6 @@ function containersPaint(cs) {
     <p class="muted small">Managers are recreated on restart, so they load the current ossec.conf. Data stays in volumes. Bulk actions run one vexor command for all selected services.</p>`);
   $$("[data-sel]", view()).forEach((b) => (b.checked = SELECTED.has(b.dataset.sel)));
   ctSync();
-}
-
-async function vPorts() {
-  setTitle("Ports");
-  loading("ports");
-  const { data: ps } = await get("/api/ports");
-  paint(`
-    <p class="lede">Every port comes from <code>.env</code>. Change a value, check it, then apply: Vexor rewrites nginx and the compose override and recreates only what uses the port.</p>
-    <form class="ports" data-ports-form>
-      <div class="table-wrap"><table class="table">
-        <thead><tr><th>Setting</th><th>Port</th><th>For</th><th>Who connects</th><th>Listening</th></tr></thead>
-        <tbody>${ps.map((p) => `<tr data-key="${esc(p.key)}">
-          <td class="mono"><b>${esc(p.key)}</b></td>
-          <td><input class="in in--port" name="${esc(p.key)}" value="${esc(p.value)}" inputmode="numeric" aria-label="${esc(p.key)}" data-orig="${esc(p.value)}"><span class="field-err" data-err="${esc(p.key)}"></span></td>
-          <td>${esc(p.what)}${p.fiveX ? ' <span class="muted small">(50000-59999)</span>' : ""}</td>
-          <td>${pill(p.audience, { endpoints: "ok", admins: "accent", restricted: "warn", host: "" }[p.audience])}</td>
-          <td>${!p.inUse ? pill("not in use") : p.listening ? pill("yes", "ok") : pill("no", "bad")}</td></tr>`).join("")}</tbody></table></div>
-      <div class="actions"><button class="btn btn--sm" type="button" data-ports-check>Check</button><button class="btn btn--sm btn--primary" type="submit" data-ports-apply disabled>Apply changes</button><span class="muted small" data-ports-msg>No changes.</span></div>
-    </form>`);
-  const form = $("[data-ports-form]");
-  const changes = () => Object.fromEntries($$("input[data-orig]", form).filter((i) => i.value.trim() !== i.dataset.orig).map((i) => [i.name, i.value.trim()]));
-  const refresh = () => {
-    const ch = changes(), n = Object.keys(ch).length;
-    $("[data-ports-apply]").disabled = !n;
-    $("[data-ports-msg]").textContent = n ? `${n} change${n > 1 ? "s" : ""}: ${Object.entries(ch).map(([k, v]) => `${k}=${v}`).join(", ")}` : "No changes.";
-    $$("input[data-orig]", form).forEach((i) => i.classList.toggle("is-changed", i.value.trim() !== i.dataset.orig));
-  };
-  const check = async () => {
-    $$("[data-err]", form).forEach((e) => (e.textContent = ""));
-    const { data } = await api("/api/ports/check", { body: { changes: changes() } });
-    Object.entries(data.errors || {}).forEach(([k, m]) => { const e = $(`[data-err="${k}"]`, form); if (e) e.textContent = m; });
-    return !Object.keys(data.errors || {}).length;
-  };
-  form.addEventListener("input", refresh);
-  $("[data-ports-check]").addEventListener("click", async () => { const good = await check(); toast(good ? "Ports are valid and free." : "Fix the marked ports.", good ? "ok" : "bad"); });
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    if (!(await check())) return toast("Fix the marked ports first.", "bad");
-    await applySettings(changes(), "Agents and browsers must use the new ports afterwards. Firewall rules are not changed.");
-  });
 }
 
 function planText(p) {
@@ -521,26 +478,55 @@ async function applySettings(changes, text) {
   openJob(r.data, (code) => { if (code === 0 && PAGE.key === key) route(); });
 }
 
-async function vVolumes() {
-  setTitle("Volumes");
-  view().onclick = (e) => { if (e.target.closest("[data-vol-fresh]")) refresh({ fresh: true, force: true }); };
-  await load1("/api/volumes", "volumes (sizes take a few seconds)", volumesPaint);
+// Storage: disk per filesystem, every volume with its size, backups, and the actions that free space. The volume sizes
+// come from du over every file, so this page reads them only when opened, after a command, or on Recount sizes.
+const FREE = [
+  { title: "Remove unused volumes", args: ["volumes", "prune", "--yes"],
+    what: "Deletes Vexor volumes the current layout no longer uses (e.g. old worker or indexer data after a switch to single). Volumes still attached to a container and tool data are kept." },
+  { title: "Remove unused images", args: ["images", "prune", "--yes"],
+    what: "Deletes old versions of the stack's images that the current setup no longer uses and no container runs. Running containers and volumes are untouched." },
+];
+// Cards for commands that delete something: the command, what it does, and a button that asks for the typed name.
+const dangerCards = (list) => `<div class="resets">${list.map((r) => `<article class="reset" data-key="${esc(r.args.join(" "))}"><h3>${esc(r.title)}</h3><p class="small">${esc(r.what)}</p><code class="mono small">vexor ${esc(r.args.join(" "))}</code>
+  <div class="actions">${btn(r.title + "…", r.args, "btn--danger-ghost", `data-text="${esc(r.what)}"`)}</div></article>`).join("")}</div>`;
+async function vStorage() {
+  setTitle("Storage");
+  view().onclick = (e) => {
+    if (e.target.closest("[data-vol-fresh]")) refresh({ fresh: true, force: true });
+    const j = e.target.closest("[data-jump]");
+    if (j) { e.preventDefault(); jumpTo(j.dataset.jump); }
+  };
+  await progressive(["/api/disk", "/api/volumes"], ([dk, vsIn]) => paint(storageHtml(dk, vsIn)));
 }
-function volumesPaint(vs) {
+function storageHtml(dk, vsIn) {
+  const fss = dk?.filesystems || [], vs = Array.isArray(vsIn) ? vsIn : [];
   const total = vs.reduce((a, v) => a + (v.bytes || 0), 0);
-  const fmt = (b) => (b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(0) + " MB" : b >= 1e3 ? (b / 1e3).toFixed(0) + " KB" : b + " B");
   const max = Math.max(1, ...vs.map((v) => v.bytes || 0));
-  paint(`
-    <p class="lede">${vs.length} volumes, ${fmt(total)} in total. Everything Vexor keeps lives here: alerts, agent keys, rules, workflows.</p>
-    <div class="actions">${btn("Backup all (live)", ["volumes", "backup", "all"])}${btn("Full backup (snapshot + state)", ["backup", "run"], "btn--primary")}${btn("List backups", ["backup", "list"])}${btn("Show unused volumes", ["volumes", "orphans"])}${btn("Remove unused volumes", ["volumes", "prune"], "btn--danger-ghost")}<button class="btn btn--sm btn--ghost" type="button" data-vol-fresh>Recount sizes</button></div>
-    <div class="table-wrap"><table class="table">
-      <thead><tr><th>Volume</th><th>Size</th><th class="w-bar"><span class="vh">Share</span></th><th>Used by</th><th><span class="vh">Actions</span></th></tr></thead>
-      <tbody>${vs.map((v) => `<tr data-key="${esc(v.name)}">
-        <td class="mono"><b>${esc(v.name)}</b></td><td class="num">${esc(fmt(v.bytes || 0))}</td>
-        <td class="w-bar"><span class="bar"><i data-w="${(v.bytes || 0) / max}"></i></span></td>
-        <td class="small">${v.users?.length ? esc(v.users.join(", ")) : pill("unused", "warn")}</td>
-        <td class="row-actions">${btn("Backup", ["volumes", "backup", v.short])}${v.users?.length ? "" : btn("Remove", ["volumes", "rm", v.short], "btn--danger-ghost")}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">No volumes yet - they are created when the stack starts.</td></tr>'}</tbody></table></div>
-    <p class="muted small">A live volume backup of a running indexer can be inconsistent; the full backup uses an indexer snapshot. Restores run from the terminal: <code>vexor volumes restore &lt;volume&gt; &lt;file&gt;</code>.</p>`);
+  const lv = diskLevel;
+  return `
+    <section class="block" id="sec-disk"><h2>Disk usage</h2>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Filesystem</th><th>Holds</th><th>Used / size</th><th>Free</th><th class="w-bar"><span class="vh">Usage</span></th><th>Used</th></tr></thead>
+        <tbody>${fss.map((f) => `<tr data-key="${esc(f.mount)}"><td class="mono"><b>${esc(f.mount)}</b></td><td class="small">${esc((f.roles || []).join(", ") || "-")}</td>
+          <td class="num">${esc(fmtBytes(f.used))} / ${esc(fmtBytes(f.size))}</td><td class="num">${esc(fmtBytes(f.avail))}</td>
+          <td class="w-bar"><span class="bar ${lv(f.pct) ? "bar--" + lv(f.pct) : ""}"><i data-w="${Math.min(100, f.pct) / 100}"></i></span></td>
+          <td>${pill(f.pct + "%", lv(f.pct) === "bad" ? "bad" : lv(f.pct) === "warn" ? "warn" : "ok")}</td></tr>`).join("") || `<tr><td colspan="6" class="muted">${dk ? "Disk usage is not available." : SK}</td></tr>`}</tbody></table></div>
+      <p class="muted small">Amber from 85%, red from 95%. Free space with the commands under <a href="#storage" data-jump="sec-free">Free space</a>, or lower <code>RETENTION_DAYS</code> (Stacks → Apply retention).</p></section>
+    <section class="block" id="sec-volumes"><h2>Volumes</h2>
+      <p class="lede">${vsIn ? `${vs.length} volumes, ${esc(fmtBytes(total))} in total.` : SK} Everything Vexor keeps lives here: alerts, agent keys, rules, workflows.</p>
+      <div class="actions">${btn("Full backup (snapshot + state)", ["backup", "run"], "btn--primary")}${btn("Backup all volumes (live)", ["volumes", "backup", "all"])}${btn("List backups", ["backup", "list"])}<button class="btn btn--sm btn--ghost" type="button" data-vol-fresh>Recount sizes</button></div>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Volume</th><th>Size</th><th class="w-bar"><span class="vh">Share</span></th><th>Used by</th><th><span class="vh">Actions</span></th></tr></thead>
+        <tbody>${vs.map((v) => `<tr data-key="${esc(v.name)}">
+          <td class="mono"><b>${esc(v.name)}</b></td><td class="num">${esc(fmtBytes(v.bytes || 0))}</td>
+          <td class="w-bar"><span class="bar"><i data-w="${(v.bytes || 0) / max}"></i></span></td>
+          <td class="small">${v.users?.length ? esc(v.users.join(", ")) : pill("unused", "warn")}</td>
+          <td class="row-actions">${btn("Backup", ["volumes", "backup", v.short])}${v.users?.length ? "" : btn("Remove", ["volumes", "rm", v.short], "btn--danger-ghost")}</td></tr>`).join("") || `<tr><td colspan="5" class="muted">${vsIn ? "No volumes yet - they are created when the stack starts." : `${SK} sizes take a few seconds`}</td></tr>`}</tbody></table></div>
+      <p class="muted small">A live volume backup of a running indexer can be inconsistent; the full backup uses an indexer snapshot. Restores run from the terminal: <code>vexor volumes restore &lt;volume&gt; &lt;file&gt;</code>.</p></section>
+    <section class="block" id="sec-free"><h2>Free space</h2>
+      <p class="muted">Each command shows what it removes and asks you to type its name. Take a full backup first.</p>
+      <div class="actions">${btn("Show unused volumes", ["volumes", "orphans"])}</div>
+      ${dangerCards(FREE)}</section>`;
 }
 
 const STACKS = (s) => {
@@ -581,69 +567,99 @@ function stacksPaint(s) {
       ${k.actions.length ? `<div class="actions">${k.actions.join("")}</div>` : ""}
       ${k.form || ""}
     </article>`).join("")}</div>
-    <section class="block"><h2>Certificates, backups, automation</h2><div class="actions">
+    <section class="block"><h2>Certificates, retention, automation</h2><div class="actions">
       ${btn("Certificate status", ["cert", "status"])}${btn("Create local-CA cert", ["cert", "create"])}${btn("Renew", ["cert", "renew"])}
       ${btn("Retention", ["retention", "status"])}${btn("Apply retention", ["retention", "apply"])}${btn("Daemon status", ["daemon", "status"])}${btn("Install daemon", ["daemon", "install"])}${btn("Update check", ["update", "check"])}
     </div></section>`);
 }
 
-async function vHealth() {
-  setTitle("Health");
-  paint(`
-    <p class="lede">The doctor runs about 60 checks. With --fix it repairs what it safely can, the same as the hourly timer.</p>
-    <div class="actions">${btn("Run doctor", ["doctor"], "btn--primary")}${btn("Doctor --fix", ["doctor", "--fix"])}${btn("Health details", ["health"])}${btn("Recent errors", ["logs", "errors", "--since", "1h"])}${btn("Reminders", ["reminders"])}${btn("AI report", ["ai-context", "--print"])}${btn("Watchdog pass", ["watchdog"])}</div>
-    <section class="block"><h2>Notifications</h2>
-      <p class="muted">The hourly check sends problems it could not fix to <code>NOTIFY_URL</code> (Slack, Teams, Discord or any JSON webhook), or to your n8n webhook when that is empty. Set the URL and <code>NOTIFY_ON</code> under Settings.</p>
-      <div class="actions">${btn("Notification status", ["notify"])}${btn("Send a test", ["notify", "test"], "btn--primary")}</div></section>`);
-}
-
-async function vSettings() {
-  setTitle("Settings");
-  loading("settings");
-  const { data: rows } = await get("/api/settings");
-  paint(`
-    <p class="lede">All of <code>.env</code>. Passwords and keys are hidden; change them with their commands (Security below). Ports have their own page.</p>
-    <label class="search"><span class="vh">Filter</span><input class="in" placeholder="Filter settings" data-set-filter></label>
-    <form data-set-form><div class="table-wrap"><table class="table">
-      <thead><tr><th>Setting</th><th>Value</th><th>About</th></tr></thead>
-      <tbody>${rows.filter((r) => !r.port).map((r) => `<tr data-row="${esc(r.key.toLowerCase() + " " + (r.help || "").toLowerCase())}">
-        <td class="mono"><b>${esc(r.key)}</b></td>
-        <td>${r.secret ? pill(r.set ? "set" : "not set", r.set ? "ok" : "warn") : `<input class="in" name="${esc(r.key)}" value="${esc(r.value)}" data-orig="${esc(r.value)}" aria-label="${esc(r.key)}">`}</td>
-        <td class="small muted">${esc(r.help || "")}</td></tr>`).join("")}</tbody></table></div>
-      <div class="actions sticky-bar"><button class="btn btn--sm btn--primary" type="submit" data-set-apply disabled>Apply changes</button><span class="muted small" data-set-msg>No changes.</span></div>
-    </form>
-    <section class="block"><h2>Security</h2><div class="actions">
-      ${btn("New admin password", ["passwd", "admin", "--generate"], "btn--danger-ghost")}${btn("New API password", ["passwd", "api", "--generate"], "btn--danger-ghost")}${btn("New dashboard password", ["passwd", "kibanaserver", "--generate"], "btn--danger-ghost")}${btn("Enrollment password on", ["agents", "password", "on"])}${btn("New console password", ["console", "password", "--generate"], "btn--danger-ghost")}
-    </div><p class="muted small">New passwords appear in the output once; they are also stored in .env.</p></section>`);
-  const form = $("[data-set-form]");
-  const changes = () => Object.fromEntries($$("input[data-orig]", form).filter((i) => i.value !== i.dataset.orig).map((i) => [i.name, i.value]));
-  form.addEventListener("input", () => {
-    const ch = changes(), n = Object.keys(ch).length;
-    $("[data-set-apply]").disabled = !n;
-    $("[data-set-msg]").textContent = n ? Object.entries(ch).map(([k, v]) => `${k}=${v}`).join(", ") : "No changes.";
-    $$("input[data-orig]", form).forEach((i) => i.classList.toggle("is-changed", i.value !== i.dataset.orig));
-  });
-  form.addEventListener("submit", (e) => { e.preventDefault(); applySettings(changes()); });
-  $("[data-set-filter]").addEventListener("input", (e) => { const q = e.target.value.toLowerCase(); $$("[data-row]", form).forEach((r) => (r.hidden = q && !r.dataset.row.includes(q))); });
-}
-
-const RESETS = [
+// Settings: the ports, every other .env value, password rotation, and removing Vexor. Forms: never refreshed on their own;
+// a successful apply repaints the page from the new values.
+const UNINSTALL = [
   { title: "Uninstall, keep data", args: ["uninstall", "--keep-data", "--yes"],
     what: "Stops and removes the Vexor containers and network. Volumes (alerts, agent keys, rules, workflows) and generated files are kept; images are not removed. Run vexor start to bring it back." },
   { title: "Uninstall everything", args: ["uninstall", "--yes"],
     what: "Stops and removes the containers and network, then removes the project volumes and generated files. All stored alerts and agent keys are lost. Images are not removed." },
-  { title: "Remove unused volumes", args: ["volumes", "prune", "--yes"],
-    what: "Deletes Vexor volumes the current layout no longer uses (e.g. old worker or indexer data after a switch to single). Volumes still attached to a container and tool data are kept." },
-  { title: "Remove unused images", args: ["images", "prune", "--yes"],
-    what: "Deletes old versions of the stack's images that the current setup no longer uses and no container runs. Running containers and volumes are untouched." },
 ];
-async function vReset() {
-  setTitle("Reset");
-  paint(`
-    <p class="lede">Remove Vexor, or free disk space. Each action shows the command and asks you to type its name before it runs. Take a backup first (Volumes page).</p>
-    <div class="resets">${RESETS.map((r, i) => `<article class="reset"><h2>${esc(r.title)}</h2><p class="small">${esc(r.what)}</p><code class="mono small">vexor ${esc(r.args.join(" "))}</code>
-      <div class="actions"><button type="button" class="btn btn--sm btn--danger-ghost" data-reset="${i}">${esc(r.title)}…</button></div></article>`).join("")}</div>`);
-  $$("[data-reset]").forEach((b) => b.addEventListener("click", () => { const r = RESETS[+b.dataset.reset]; run(r.args, { text: r.what }); }));
+async function vSettings() {
+  setTitle("Settings");
+  const v = view();
+  const portsForm = () => $("[data-ports-form]", v), setForm = () => $("[data-set-form]", v);
+  const portChanges = () => Object.fromEntries($$("input[data-orig]", portsForm()).filter((i) => i.value.trim() !== i.dataset.orig).map((i) => [i.name, i.value.trim()]));
+  const setChanges = () => Object.fromEntries($$("input[data-orig]", setForm()).filter((i) => i.value !== i.dataset.orig).map((i) => [i.name, i.value]));
+  const checkPorts = async () => {
+    const f = portsForm();
+    $$("[data-err]", f).forEach((e) => (e.textContent = ""));
+    const { data } = await api("/api/ports/check", { body: { changes: portChanges() } });
+    Object.entries(data.errors || {}).forEach(([k, m]) => { const e = $(`[data-err="${k}"]`, f); if (e) e.textContent = m; });
+    return !Object.keys(data.errors || {}).length;
+  };
+  v.oninput = (e) => {
+    const t = e.target;
+    if (t.matches("[data-set-filter]")) { const q = t.value.toLowerCase(); $$("[data-row]", setForm()).forEach((r) => (r.hidden = q && !r.dataset.row.includes(q))); return; }
+    if (t.closest("[data-ports-form]")) {
+      const ch = portChanges(), n = Object.keys(ch).length;
+      $("[data-ports-apply]", v).disabled = !n;
+      $("[data-ports-msg]", v).textContent = n ? `${n} change${n > 1 ? "s" : ""}: ${Object.entries(ch).map(([k, x]) => `${k}=${x}`).join(", ")}` : "No changes.";
+      $$("input[data-orig]", portsForm()).forEach((i) => i.classList.toggle("is-changed", i.value.trim() !== i.dataset.orig));
+    } else if (t.closest("[data-set-form]")) {
+      const ch = setChanges(), n = Object.keys(ch).length;
+      $("[data-set-apply]", v).disabled = !n;
+      $("[data-set-msg]", v).textContent = n ? Object.entries(ch).map(([k, x]) => `${k}=${x}`).join(", ") : "No changes.";
+      $$("input[data-orig]", setForm()).forEach((i) => i.classList.toggle("is-changed", i.value !== i.dataset.orig));
+    }
+  };
+  v.onclick = async (e) => {
+    if (!e.target.closest("[data-ports-check]")) return;
+    const good = await checkPorts();
+    toast(good ? "Ports are valid and free." : "Fix the marked ports.", good ? "ok" : "bad");
+  };
+  v.onsubmit = async (e) => {
+    e.preventDefault();
+    if (e.target.matches("[data-ports-form]")) {
+      if (!(await checkPorts())) return toast("Fix the marked ports first.", "bad");
+      await applySettings(portChanges(), "Agents and browsers must use the new ports afterwards. Firewall rules are not changed.");
+    } else if (e.target.matches("[data-set-form]")) applySettings(setChanges());
+  };
+  // The last values this browser read paint at once; the fresh ones follow (one fetch each, in parallel).
+  const draw = () => { if (LAST["/api/ports"] && LAST["/api/settings"]) paint(settingsHtml(LAST["/api/ports"], LAST["/api/settings"])); };
+  if (LAST["/api/ports"] && LAST["/api/settings"]) draw(); else loading("settings");
+  const rs = await Promise.all([get("/api/ports"), get("/api/settings")]);
+  if (rs.some((r) => r.status !== 200)) throw new Error(rs.find((r) => r.status !== 200).data.error || "the settings could not be read");
+  draw();
+}
+function settingsHtml(ps, rows) {
+  return `
+    <p class="lede">All of <code>.env</code>: ports first, then every other setting. Passwords and keys are hidden; change them with their commands under Security.</p>
+    <section class="block" id="sec-ports"><h2>Ports</h2>
+      <p class="muted">Change a value, check it, then apply: Vexor rewrites nginx and the compose override and recreates only what uses the port.</p>
+      <form class="ports" data-ports-form>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Setting</th><th>Port</th><th>For</th><th>Who connects</th><th>Listening</th></tr></thead>
+          <tbody>${ps.map((p) => `<tr data-key="${esc(p.key)}">
+            <td class="mono"><b>${esc(p.key)}</b></td>
+            <td><input class="in in--port" name="${esc(p.key)}" value="${esc(p.value)}" inputmode="numeric" aria-label="${esc(p.key)}" data-orig="${esc(p.value)}"><span class="field-err" data-err="${esc(p.key)}"></span></td>
+            <td>${esc(p.what)}${p.fiveX ? ' <span class="muted small">(50000-59999)</span>' : ""}</td>
+            <td>${pill(p.audience, { endpoints: "ok", admins: "accent", restricted: "warn", host: "" }[p.audience])}</td>
+            <td>${!p.inUse ? pill("not in use") : p.listening ? pill("yes", "ok") : pill("no", "bad")}</td></tr>`).join("")}</tbody></table></div>
+        <div class="actions"><button class="btn btn--sm" type="button" data-ports-check>Check</button><button class="btn btn--sm btn--primary" type="submit" data-ports-apply disabled>Apply port changes</button><span class="muted small" data-ports-msg>No changes.</span></div>
+      </form></section>
+    <section class="block" id="sec-env"><h2>Settings</h2>
+      <label class="search"><span class="vh">Filter</span><input class="in" placeholder="Filter settings" data-set-filter></label>
+      <form data-set-form><div class="table-wrap"><table class="table">
+        <thead><tr><th>Setting</th><th>Value</th><th>About</th></tr></thead>
+        <tbody>${rows.filter((r) => !r.port).map((r) => `<tr data-key="${esc(r.key)}" data-row="${esc(r.key.toLowerCase() + " " + (r.help || "").toLowerCase())}">
+          <td class="mono"><b>${esc(r.key)}</b></td>
+          <td>${r.secret ? pill(r.set ? "set" : "not set", r.set ? "ok" : "warn") : `<input class="in" name="${esc(r.key)}" value="${esc(r.value)}" data-orig="${esc(r.value)}" aria-label="${esc(r.key)}">`}</td>
+          <td class="small muted">${esc(r.help || "")}</td></tr>`).join("")}</tbody></table></div>
+        <div class="actions sticky-bar"><button class="btn btn--sm btn--primary" type="submit" data-set-apply disabled>Apply changes</button><span class="muted small" data-set-msg>No changes.</span></div>
+      </form></section>
+    <section class="block" id="sec-security"><h2>Security</h2><div class="actions">
+      ${btn("New admin password", ["passwd", "admin", "--generate"], "btn--danger-ghost")}${btn("New API password", ["passwd", "api", "--generate"], "btn--danger-ghost")}${btn("New dashboard password", ["passwd", "kibanaserver", "--generate"], "btn--danger-ghost")}${btn("Enrollment password on", ["agents", "password", "on"])}${btn("New console password", ["console", "password", "--generate"], "btn--danger-ghost")}
+    </div><p class="muted small">New passwords appear in the output once; they are also stored in .env.</p></section>
+    <section class="block" id="sec-remove"><h2>Remove Vexor</h2>
+      <p class="muted">Each action shows the command and asks you to type its name before it runs. Take a full backup first (<a href="#storage">Storage</a>). To free disk space without removing Vexor, use Storage → Free space.</p>
+      ${dangerCards(UNINSTALL)}</section>`;
 }
 
 const SUGGEST = ["status", "doctor", "doctor --fix", "wazuh alerts -n 20", "agents list", "elk", "elk indices", "n8n", "n8n test", "suricata", "suricata alerts --since 1h", "suricata test", "zeek", "zeek top hosts", "tools", "soc", "volumes ls", "backup list", "cert status", "logs errors --since 1h", "logs nginx -n 100", "retention status", "disk", "volumes orphans", "wait-ready", "update check", "version", "reminders"];
@@ -654,7 +670,8 @@ async function vTerminal() {
     <form class="term" data-term><span class="term__p">vexor</span><input class="in in--term" name="cmd" list="vx-suggest" placeholder="suricata alerts --since 1h" autocomplete="off" spellcheck="false" autofocus><button type="button" class="btn btn--ghost btn--sm btn--icon" data-term-copy aria-label="Copy command" title="Copy command"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg></button><button class="btn btn--primary btn--sm">Run</button></form>
     <datalist id="vx-suggest">${SUGGEST.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>
     <div class="chips">${SUGGEST.slice(0, 14).map((s) => `<button type="button" class="chip" data-fill="${esc(s)}">${esc(s)}</button>`).join("")}</div>
-    <h2 class="sub">History</h2><ol class="hist" data-hist></ol>`);
+    <h2 class="sub">History</h2><ol class="hist" data-hist></ol>
+    <div class="sections" id="sec-activity" data-activity></div>`);
   const f = $("[data-term]"), inp = $("[name=cmd]", f);
   const hist = JSON.parse(sessionStorage.getItem("vx-hist") || "[]");
   const drawHist = () => ($("[data-hist]").innerHTML = hist.slice(0, 20).map((h) => `<li><button type="button" class="link-btn mono" data-fill="${esc(h)}" title="vexor ${esc(h)}">vexor ${esc(h)}</button><button type="button" class="btn btn--ghost btn--xs btn--icon" data-copy-hist="${esc(h)}" aria-label="Copy command" title="Copy command"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg></button></li>`).join("") || '<li class="muted">Nothing yet.</li>');
@@ -664,27 +681,33 @@ async function vTerminal() {
     const c = inp.value.trim().replace(/^vexor\s+/, "");
     if (!c) return;
     const ok = await run(c);
-    if (ok) { hist.unshift(c); try { sessionStorage.setItem("vx-hist", JSON.stringify([...new Set(hist)].slice(0, 30))); } catch { /* private mode */ } drawHist(); inp.select(); }
+    if (ok) { hist.unshift(c); try { sessionStorage.setItem("vx-hist", JSON.stringify([...new Set(hist)].slice(0, 30))); } catch { /* private mode */ } drawHist(); inp.select(); termActivity().catch(() => {}); }
   });
   view().onclick = (e) => {
     const c = e.target.closest("[data-copy-hist]"); if (c) return copyText("vexor " + c.dataset.copyHist, c);
     const b = e.target.closest("[data-fill]"); if (b) { inp.value = b.dataset.fill; inp.focus(); }
+    const j = e.target.closest("[data-job]"); if (j) openJob(JSON.parse(j.dataset.job));
   };
   $("[data-term-copy]").addEventListener("click", (e) => { const v = inp.value.trim().replace(/^vexor\s+/, ""); if (v) copyText("vexor " + v, e.currentTarget); else toast("Type a command first.", "bad"); });
+  await termActivity();
 }
-
-async function vActivity() {
-  setTitle("Activity");
-  view().onclick = (e) => { const b = e.target.closest("[data-job]"); if (b) openJob(JSON.parse(b.dataset.job)); };
+// The Terminal's activity sections (commands run from this console, audit log). Only this part is re-read: on open,
+// after a command starts or ends, and on Refresh. The command box and history above it are never touched.
+async function termActivity() {
+  const pg = PAGE;
+  if (pg.key !== "terminal") return;
+  const box = () => (PAGE === pg ? $("[data-activity]", view()) : null);
   await progressive(["/api/jobs", "/api/audit"], ([jobsIn, logIn]) => {
-    const jobs = jobsIn || [], log = logIn || [];
-    paint(`
-    <section class="block"><h2>Commands this session of the console</h2>
-      <div class="table-wrap"><table class="table"><thead><tr><th>Started</th><th>Command</th><th>By</th><th>Result</th><th></th></tr></thead>
+    const el = box();
+    if (!el) return;
+    const jobs = Array.isArray(jobsIn) ? jobsIn : [], log = Array.isArray(logIn) ? logIn : [];
+    morphInto(el, `
+    <section class="block"><h2>Commands in this console session</h2>
+      <div class="table-wrap"><table class="table"><thead><tr><th>Started</th><th>Command</th><th>By</th><th>Result</th><th><span class="vh">Output</span></th></tr></thead>
       <tbody>${jobs.map((j) => `<tr data-key="${esc(j.id)}"><td class="num small">${new Date(j.started * 1000).toLocaleTimeString()}</td><td class="mono small">${esc(j.cmd)}</td><td>${esc(j.user)}</td>
         <td>${j.ended ? pill(j.code === 0 ? "done" : "exit " + j.code, j.code === 0 ? "ok" : "bad") : pill("running", "warn")}</td>
         <td><button type="button" class="btn btn--sm btn--ghost" data-job='${esc(JSON.stringify(j))}'>Output</button></td></tr>`).join("") || `<tr><td colspan="5" class="muted">${jobsIn ? "No commands yet." : SK}</td></tr>`}</tbody></table></div></section>
-    <section class="block"><h2>Audit log</h2><pre class="audit">${logIn ? esc(log.join("\n")) || "empty" : SK}</pre><p class="muted small">Kept in .state/console-audit.log on the host.</p></section>`);
+    <section class="block" id="sec-audit"><h2>Audit log</h2><pre class="audit">${logIn ? esc(log.join("\n")) || "empty" : SK}</pre><p class="muted small">Kept in .state/console-audit.log on the host.</p></section>`);
   });
 }
 
@@ -1213,18 +1236,31 @@ function proxyPaint(d) {
     </dialog>`);
 }
 
-const ROUTES = { overview: vOverview, map: vMap, containers: vContainers, ports: vPorts, volumes: vVolumes, stacks: vStacks, health: vHealth, logins: vLogins, settings: vSettings, terminal: vTerminal, activity: vActivity, reset: vReset, proxy: vProxy };
+const ROUTES = { overview: vOverview, map: vMap, containers: vContainers, stacks: vStacks, storage: vStorage, proxy: vProxy, logins: vLogins, settings: vSettings, terminal: vTerminal };
+// Pages that were merged into others: the old address opens the new page at the matching section.
+const MOVED = { health: ["overview", "sec-health"], ports: ["settings", "sec-ports"], volumes: ["storage", "sec-volumes"], activity: ["terminal", "sec-activity"], reset: ["settings", "sec-remove"] };
+// Scroll a section of the page on screen into view (below the sticky bar on phones) and move focus there for keyboards.
+function jumpTo(id) {
+  const el = id && document.getElementById(id);
+  if (!el || !view().contains(el)) return false;
+  el.scrollIntoView({ block: "start" });
+  if (!el.hasAttribute("tabindex")) el.setAttribute("tabindex", "-1");
+  el.focus({ preventScroll: true });
+  return true;
+}
 // The page on screen: its fetches share one AbortController, aborted as soon as another page opens.
 let PAGE = { key: "", ctl: new AbortController(), soft: false, fresh: false };
 async function route() {
   closeMenu(false);
-  const key = ROUTES[(location.hash || "#overview").slice(1)] ? (location.hash || "#overview").slice(1) : "overview";
+  let key = (location.hash || "#overview").slice(1), jump = "";
+  if (MOVED[key]) { [key, jump] = MOVED[key]; history.replaceState(null, "", "#" + key); }
+  if (!ROUTES[key]) key = "overview";
   PAGE.ctl.abort();
   PAGE.cleanup?.();
   clearTimeout(liveTimer);
   const pg = (PAGE = { key, ctl: new AbortController(), soft: false, fresh: false });
   const v = view();
-  v.onclick = v.onchange = v.onsubmit = null;
+  v.onclick = v.onchange = v.onsubmit = v.oninput = null;
   v.dataset.page = "";
   liveAt = 0; liveErr = "";
   $$("[data-nav] a").forEach((a) => a.setAttribute("aria-current", a.getAttribute("href") === "#" + key ? "page" : "false"));
@@ -1233,6 +1269,7 @@ async function route() {
   try {
     await ROUTES[key]();
     if (PAGE === pg) liveAt = Date.now();
+    if (PAGE === pg && jump) requestAnimationFrame(() => PAGE === pg && jumpTo(jump));
   } catch (e) {
     if (PAGE !== pg || e.name === "AbortError" || e.message === "login required") return;
     if (v.dataset.page === key) liveErr = e.message || "update failed";      // keep what is on screen
@@ -1244,10 +1281,10 @@ async function route() {
 // ---------------------------------------------------------------- live refresh
 // Pages with live data refresh quietly in place: no placeholder, no scroll jump, focus and open menus stay. A tick is
 // skipped while the user is busy (menu or dialog open, typing, selecting text, pressing) or the tab is hidden, never
-// overlaps the previous one, and backs off when the server is slow. Forms (Settings, Ports, Terminal, ...) never refresh
+// overlaps the previous one, and backs off when the server is slow. Forms (Settings, Terminal, ...) never refresh
 // on their own. A small indicator in the header says when the data was read.
 const LIVE = { overview: 15000, containers: 10000, map: 3000 };
-const AFTER_JOB = new Set(["overview", "containers", "volumes", "stacks", "proxy", "activity", "map"]);
+const AFTER_JOB = new Set(["overview", "containers", "storage", "stacks", "proxy", "map"]);   // + the Terminal's activity part
 let liveTimer = null, liveRun = null, liveAt = 0, liveErr = "", pointerDown = 0;
 document.addEventListener("pointerdown", () => (pointerDown = Date.now()), true);
 for (const ev of ["pointerup", "pointercancel"]) document.addEventListener(ev, () => (pointerDown = 0), true);
@@ -1294,6 +1331,7 @@ async function liveTick() {
 // After a command ends: one quiet, fresh refresh of the page on screen, once the user is not in the middle of something.
 function afterJob() {
   const pg = PAGE;
+  if (pg.key === "terminal") { setTimeout(() => termActivity().catch(() => {}), 400); return; }
   if (!AFTER_JOB.has(pg.key)) return;
   let tries = 0;
   const go = () => {
@@ -1324,5 +1362,5 @@ function liveShow(spin = !!liveRun) {
 setInterval(() => { if (!document.hidden) liveShow(); }, 1000);
 
 window.addEventListener("hashchange", () => route());
-$("[data-refresh]").addEventListener("click", () => (AFTER_JOB.has(PAGE.key) ? refresh({ fresh: true, force: true }) : route()));
+$("[data-refresh]").addEventListener("click", () => (AFTER_JOB.has(PAGE.key) ? refresh({ fresh: true, force: true }) : PAGE.key === "terminal" ? termActivity().catch(() => {}) : route()));
 boot();

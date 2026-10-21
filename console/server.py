@@ -104,7 +104,7 @@ DANGER_SUBS = {
     "cert": {"internal-regen"}, "agents": {"remove"}, "soc": {"wazuh", "elk", "both"},
     "proxy": {"rm", "remove", "del", "delete"},
 }
-# Reset page: these commands run only with exactly these arguments.
+# Storage (free space) and Settings (remove Vexor): these commands run only with exactly these arguments.
 DANGER_EXACT = {
     "uninstall": [["uninstall", "--keep-data", "--yes"], ["uninstall", "--yes"]],
     "images": [["images", "prune", "--yes"]],
@@ -137,7 +137,7 @@ def classify(args):
         return "read", None  # streamed until the browser closes it
     if cmd in ("uninstall", "images") or (cmd == "volumes" and sub == "prune"):
         if args not in DANGER_EXACT[cmd]:
-            return None, f"'{' '.join(args)}' is not one of the Reset commands - use the Reset page or the terminal"
+            return None, f"'{' '.join(args)}' is not allowed in the console in this form - use Storage → Free space, Settings → Remove Vexor, or a terminal"
         return "danger", None
     if cmd in DANGER_SUBS and sub in DANGER_SUBS[cmd]:
         return "danger", None
@@ -319,7 +319,7 @@ def warmer():
 
 def warm_start():
     """Fill the slow caches once at startup, so the first page after a restart does not wait. Not volumes: their du walks
-    every file of the indexer data, so it runs only when someone opens the Volumes page."""
+    every file of the indexer data, so it runs only when someone opens the Storage page."""
     for key, fn in (("state", state), ("containers", containers), ("disk", disk), ("proxy", proxy_routes)):
         _refresh(key, fn)
         with _cache_lock:

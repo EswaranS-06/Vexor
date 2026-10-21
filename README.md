@@ -266,23 +266,25 @@ A web UI for the whole stack at `https://<host>:CONSOLE_PORT` (50443), on by def
 
 | Page | What you can do |
 |---|---|
-| Overview | Stack, containers running, last health check, disk usage per drive (amber from 85%, red from 95%), links to every UI, reminders, quick actions |
+| **Monitor** | |
+| Overview | Stack, containers running, last health check, disk use of the fullest drive, links to every UI, Status and Wait until ready; **Health**: doctor, doctor --fix, health details, recent errors, reminders, AI report, watchdog pass; **Notifications**: status and a test message |
 | Map | Live map of the containers and the connections between them, with traffic rates and status; tap a container for details, logs, restart |
-| Containers | State, CPU, memory, ports, image; a ⋯ menu per row (logs, follow, restart, stop or start, show on map); tick rows for bulk start, stop, restart or logs in one command |
-| Ports | Every port from `.env` with what uses it and whether it listens; edit, check (range, duplicates, in use), apply |
+| **Stack** | |
+| Containers | State, CPU, memory, ports, image; start, restart or stop all; a ⋯ menu per row (logs, follow, restart, stop or start, show on map); tick rows for bulk start, stop, restart or logs in one command |
+| Stacks | Per stack: status, tests, alerts, n8n connect, Zeek logs, enable or disable tools, switch SOC, node type, workers; certificates, retention, the daemon, update check |
+| Storage | Disk usage per drive (amber from 85%, red from 95%); every volume with its size and users; full backup, back up one or all volumes, list backups; **Free space**: show unused volumes, remove unused volumes, remove unused images |
+| **Access** | |
 | Proxy | Proxy routes (`vexor proxy`): open a service under its own name like `soc.example.com`; add, edit, remove, issue or renew certificates, download the local CA and route certificates, DNS and trust help |
-| Volumes | Every volume with its size and users; back up one or all, full backup, remove unused |
-| Stacks | Per stack: status, tests, alerts, n8n connect, Zeek logs, enable or disable tools, switch SOC, node type, workers |
-| Health | Doctor, doctor --fix, recent errors, AI report, notifications |
 | Logins | Every login Vexor manages (url, user, password); passwords stay hidden until you show or copy one, and each reveal is audited |
-| Settings | Every `.env` value (secrets hidden), edit and apply; rotate passwords |
-| Terminal | Any `vexor` command, with suggestions and history |
-| Activity | Every command run from the console, and the audit log |
-| Reset | `uninstall --keep-data` (keeps volumes and generated files), `uninstall` (removes project volumes and generated files), remove unused volumes, remove unused images. Neither uninstall removes images. Each asks you to type its name |
+| **System** | |
+| Settings | **Ports**: every port from `.env` with what uses it and whether it listens; edit, check (range, duplicates, in use), apply. Then every other `.env` value (secrets hidden), edit and apply; **Security**: rotate passwords; **Remove Vexor**: `uninstall --keep-data` (keeps volumes and generated files) or `uninstall` (removes project volumes and generated files); neither removes images |
+| Terminal | Any `vexor` command, with suggestions and history; below it, every command run from this console (with its output) and the audit log |
+
+Each action lives on one page only. Commands that delete something (remove volumes or images, uninstall) ask you to type their name. Old links keep working: `#health` opens Overview at Health, `#ports` and `#reset` open Settings at Ports and Remove Vexor, `#volumes` opens Storage, `#activity` opens the Terminal's activity list.
 
 The Map is drawn only from what the host sees: one `docker inspect` of the project's containers, plus each container's own `/proc/<pid>/net` (traffic counters and open TCP/UDP sockets). A line between two containers means a connection is open right now; it moves while both ends carry traffic, and addresses outside the project's networks (agents, browsers, other hosts) show as one External box. Green is running, amber an issue (unhealthy, restarting, 3 or more restarts, killed for memory, network errors), red offline, dashed missing (the layout expects it but there is no container). It refreshes every 3 seconds while the page is open. Without root access to `/proc` (Docker Desktop, for one) it shows the containers without traffic.
 
-Overview (every 15 s), Containers (every 10 s) and the Map refresh on their own, in place: the page does not reload, so scrolling, an open ⋯ menu, ticked rows and keyboard focus stay. A refresh waits while you type, select text or have a menu or dialog open, pauses while the tab is hidden and slows down when the host is slow. After a command ends, the page on screen updates once. The header shows when the data was read ("updated 5s ago"); Refresh reads it again at once. Forms (Settings, Ports, Terminal) never refresh under your hands. The server answers from a cache that a background thread keeps fresh, so pages open without waiting for `docker` or `vexor`.
+Overview (every 15 s), Containers (every 10 s) and the Map refresh on their own, in place: the page does not reload, so scrolling, an open ⋯ menu, ticked rows and keyboard focus stay. A refresh waits while you type, select text or have a menu or dialog open, pauses while the tab is hidden and slows down when the host is slow. After a command ends, the page on screen updates once; Storage reads the volume sizes only then, when you open it, or on Recount sizes, because measuring them reads every file. The header shows when the data was read ("updated 5s ago"); Refresh reads it again at once. Settings and the Terminal never refresh under your hands. The server answers from a cache that a background thread keeps fresh, so pages open without waiting for `docker` or `vexor`.
 
 The sidebar groups the pages (Monitor, Stack, Access, System), scrolls on its own when the screen is short (a fade shows more pages above or below), and collapses to icons only with the button at its top (the choice is kept in that browser). On a phone or a narrow window a **Menu** button opens the page list. The console follows the device's light or dark setting. **Theme** in the sidebar switches between auto, light and dark; the choice is kept in that browser.
 

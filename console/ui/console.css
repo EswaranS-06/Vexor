@@ -99,7 +99,8 @@ body.has-out .app { grid-template-columns: var(--side-w) minmax(0, 1fr) minmax(0
 .view > * { min-width: 0; }
 .view { display: grid; gap: var(--space-5); }
 .lede { max-width: 70ch; color: var(--color-ink-2); }
-.block { display: grid; gap: var(--space-3); }
+.block { display: grid; gap: var(--space-3); min-width: 0; }
+.block > *, .sections > * { min-width: 0; }
 .block h2, .sub { font-size: var(--text-lg); }
 .actions { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
 .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--space-3); }
@@ -204,11 +205,17 @@ body:has(dialog[open]) { overflow: hidden; }
 
 .secret { display: inline-block; min-width: 7rem; margin-right: var(--space-2); overflow-wrap: anywhere; }
 
-/* disk bars and the Reset page */
+/* disk bars and the delete cards (Storage → Free space, Settings → Remove Vexor) */
 .bar--warn i { background: var(--color-warn); } .bar--bad i { background: var(--color-bad); }
+.sections { display: grid; gap: var(--space-5); min-width: 0; }
+.sub3 { font: 500 var(--text-xs)/1 var(--font-mono); letter-spacing: var(--tracking-label); text-transform: uppercase; color: var(--color-muted); margin-top: var(--space-2); }
+/* sections that old addresses (#health, #ports, ...) jump to: clear of the sticky top bar on phones */
+[id^="sec-"] { scroll-margin-top: var(--space-4); }
+[id^="sec-"]:focus { outline: none; }
+@media (max-width: 760px) { [id^="sec-"] { scroll-margin-top: 4.5rem; } }
 .resets { display: grid; gap: var(--space-4); grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
 .reset { display: grid; gap: var(--space-3); align-content: start; border: var(--rule-w) solid var(--color-rule); border-top: 3px solid var(--color-bad); border-radius: var(--radius-lg); padding: var(--space-5); background: var(--color-paper); }
-.reset h2 { font-size: 1.05rem; }
+.reset h2, .reset h3 { font-size: 1.05rem; }
 .reset p { margin: 0; }
 
 /* Map page: live container map (inline SVG, styled with the tokens) */
@@ -388,6 +395,8 @@ td.row-more { width: 3.5rem; text-align: right; }
 .hist li { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
 .hist .link-btn { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .term .btn--icon { flex: none; }
+.term .btn--ghost { color: var(--color-on-graphite-2); border-color: var(--color-graphite-rule); }
+.term .btn--ghost:hover { color: var(--color-on-graphite); border-color: var(--color-accent-on-dark); }
 /* phone tap targets (after the component rules so they win) */
 @media (max-width: 760px) { .actions--compact .btn, .bulk .btn { min-height: 40px; } }
 
