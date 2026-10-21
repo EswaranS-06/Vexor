@@ -410,9 +410,9 @@ const RESETS = [
   { title: "Uninstall everything", args: ["uninstall", "--yes"],
     what: "Stops and removes the containers and network, then removes the project volumes and generated files. All stored alerts and agent keys are lost. Images are not removed." },
   { title: "Remove unused volumes", args: ["volumes", "prune", "--yes"],
-    what: "Deletes Vexor volumes that no container uses. Volumes in use are untouched." },
+    what: "Deletes Vexor volumes the current layout no longer uses (e.g. old worker or indexer data after a switch to single). Volumes still attached to a container and tool data are kept." },
   { title: "Remove unused images", args: ["images", "prune", "--yes"],
-    what: "Deletes Vexor image versions no container uses. Running containers and volumes are untouched." },
+    what: "Deletes old versions of the stack's images that the current setup no longer uses and no container runs. Running containers and volumes are untouched." },
 ];
 async function vReset() {
   setTitle("Reset");
