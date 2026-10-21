@@ -91,7 +91,7 @@ READ_SUBS = {
     "tools": {"status", "ls", ""}, "soc": {"status", ""}, "elk": {"status", "indices", "search", "explain", ""},
     "n8n": {"status", ""}, "suricata": {"status", "alerts", ""}, "zeek": {"status", "show", "notices", "top", ""},
     "agents": {"list", "summary", "outdated", "enroll-cmd", ""}, "cert": {"status", ""}, "backup": {"list", "ls"},
-    "retention": {"show", ""}, "volumes": {"ls", "list", ""}, "reminders": {"list", ""}, "config": {"show", "get", "validate"},
+    "retention": {"show", "status", ""}, "volumes": {"ls", "list", ""}, "reminders": {"list", ""}, "config": {"show", "get", "validate"},
     "daemon": {"status", "logs", ""}, "console": {"status", "url", ""}, "update": {"check", ""},
     "indexers": {"status", ""}, "node-type": {"status", ""}, "notify": {"status", ""},
 }

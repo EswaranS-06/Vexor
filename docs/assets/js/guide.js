@@ -11,11 +11,11 @@ const code = (s) => esc(s).replace(/`([^`]+)`/g, "<code>$1</code>");
 const COMPONENTS = [
   { id: "wazuh", name: "Wazuh", ver: "4.14", when: "SOC=wazuh or both",
     role: "Agents on your endpoints, detection rules, alerts and active response. Single node, or a master with 1–3 workers and three indexers.",
-    setup: ["Passwords, cluster key and every internal certificate generated", "OpenSearch demo users (public passwords) removed before the first start", "Dashboard on `8080` through nginx; agent traffic balanced over the managers", "Index retention by `INDEX_RETENTION_DAYS` (ISM)"],
+    setup: ["Passwords, cluster key and every internal certificate generated", "OpenSearch demo users (public passwords) removed before the first start", "Dashboard on `8080` through nginx; agent traffic balanced over the managers", "Index retention by `RETENTION_DAYS` (ISM, default 30 days)"],
     cmds: [["vexor wazuh", "indexer and manager cluster, API"], ["vexor wazuh alerts --level 10", "newest alerts of every manager"], ["vexor wazuh logtest", "test a log line against the rules"], ["vexor agents enroll-cmd windows --name pc-01", "install command for an endpoint"], ["vexor node-type multi", "master + workers + 3 indexers"]] },
   { id: "elk", name: "ELK", ver: "9.5", when: "SOC=elk or both",
     role: "Elasticsearch stores and searches everything, Kibana shows it, Logstash takes in Beats, Elastic Agent, sensor logs and (with SOC=both) every Wazuh alert.",
-    setup: ["Elastic passwords generated", "`vexor_logstash`: a user that can only write `vexor-*`", "ILM retention by `ELK_RETENTION_DAYS`, 0 replicas on one node", "Kibana data views: Wazuh alerts, Suricata, Zeek, Beats", "Kibana on `55601` through nginx; Elasticsearch on `127.0.0.1:59200` only"],
+    setup: ["Elastic passwords generated", "`vexor_logstash`: a user that can only write `vexor-*`", "ILM retention by `RETENTION_DAYS`, 0 replicas on one node", "Kibana data views: Wazuh alerts, Suricata, Zeek, Beats", "Kibana on `55601` through nginx; Elasticsearch on `127.0.0.1:59200` only"],
     cmds: [["vexor soc both", "turn ELK on next to Wazuh"], ["vexor elk", "health, Kibana, events in the last hour"], ["vexor elk search 'rule.level:>=10' -n 20", "Lucene search across vexor-*"], ["vexor elk indices", "index sizes"], ["vexor elk beats-config", "filebeat.yml for other machines"]] },
   { id: "n8n", name: "n8n", ver: "2.40", when: "N8N=true",
     role: "The response engine. Receives alerts above the level you choose and runs your playbooks: notify, open a ticket, isolate a host through the Wazuh API, query Elasticsearch.",
@@ -65,8 +65,8 @@ const CHANGES = [
 ];
 
 const RETENTION = [
-  { what: "Wazuh alerts", key: "INDEX_RETENTION_DAYS", days: 90, how: "ISM policy" },
-  { what: "ELK events", key: "ELK_RETENTION_DAYS", days: 30, how: "ILM policy" },
+  { what: "Wazuh alerts", key: "RETENTION_DAYS", days: 30, how: "ISM policy (INDEX_RETENTION_DAYS overrides)" },
+  { what: "ELK events", key: "RETENTION_DAYS", days: 30, how: "ILM policy (ELK_RETENTION_DAYS overrides)" },
   { what: "Manager logs", key: "MANAGER_LOG_RETENTION_DAYS", days: 30, how: "maintenance prune" },
   { what: "Backups + snapshots", key: "SNAPSHOT_RETENTION_DAYS", days: 14, how: "pruned after each backup" },
   { what: "Suricata + Zeek logs", key: "TOOLS_LOG_RETENTION_DAYS", days: 7, how: "maintenance prune" },
