@@ -1186,7 +1186,68 @@ class Server(http.server.ThreadingHTTPServer):
         super().__init__(addr, handler)
 
 
+# ---------------------------------------------------------------- reload after an update
+# A `git pull` changes the code but nothing restarts the service, so the new page would talk to the old
+# server. Watch this file and re-exec when it changed (and compiles), keeping the signed-in sessions.
+SELF = Path(__file__).resolve()
+SESSIONS_FILE = STATE / "console-sessions.json"
+
+
+def code_stamp():
+    try:
+        st = SELF.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def load_sessions():
+    try:
+        data = json.loads(SESSIONS_FILE.read_text())
+        SESSIONS_FILE.unlink()
+    except (OSError, ValueError):
+        return
+    now = time.time()
+    for tok, s in data.items() if isinstance(data, dict) else []:
+        if re.fullmatch(r"[a-f0-9]{64}", tok) and isinstance(s, dict) and s.get("exp", 0) > now:
+            SESSIONS[tok] = s
+
+
+def reload_watch(httpd):
+    start = code_stamp()
+    while True:
+        time.sleep(3)
+        now = code_stamp()
+        if not now or now == start:
+            continue
+        time.sleep(2)                                   # let the writer (git) finish
+        if code_stamp() != now:
+            continue
+        try:
+            compile(SELF.read_text(), str(SELF), "exec")    # a broken file keeps the running server
+        except (OSError, SyntaxError, ValueError) as e:
+            print(f"console: new server.py does not compile, keeping the running one: {e}", flush=True)
+            start = now
+            continue
+        with JOBS_LOCK:
+            busy = any(j.ended is None for j in JOBS.values())
+        if busy:                                        # finish running commands first
+            continue
+        try:
+            STATE.mkdir(exist_ok=True)
+            fd = os.open(SESSIONS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(SESSIONS, f)
+        except OSError:
+            pass
+        audit("(console)", "server.py changed - reloading")
+        print("console: server.py changed - reloading", flush=True)
+        httpd.socket.close()
+        os.execv(sys.executable, [sys.executable, str(SELF), *sys.argv[1:]])
+
+
 def main():
+    load_sessions()
     env = env_dict()
     bind = env.get("CONSOLE_BIND") or env.get("BIND_IP") or "0.0.0.0"   # empty CONSOLE_BIND follows BIND_IP
     port = int(env.get("CONSOLE_PORT", "50443") or 50443)
@@ -1200,6 +1261,7 @@ def main():
     # handshake in the request thread, not in accept(): one client that connects and sends nothing must not block the console
     httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
     print(f"vexor console on https://{bind}:{port}  (cert {cert})", flush=True)
+    threading.Thread(target=reload_watch, args=(httpd,), daemon=True).start()
     httpd.serve_forever()
 
 

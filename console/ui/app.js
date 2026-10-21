@@ -929,11 +929,15 @@ const pxFields = (r = {}, list = "px-targets") => `
 async function vProxy() {
   setTitle("Proxy");
   loading("proxy routes");
-  const { data: d } = await api("/api/proxy");
+  const { status: code, data: d } = await api("/api/proxy");
   const routes = d.routes || [];
+  // nginx state is known only when the status call worked; never report "down" for a failed request
+  const known = code === 200 && !d.error && typeof d.nginx_running === "boolean";
+  if (code === 404) d.error = "This console server is older than the page (updated with git pull?). Restart it on the host: sudo vexor console restart";
+  else if (code !== 200 && !d.error) d.error = `The proxy status could not be read (HTTP ${code}).`;
   const again = () => { if (location.hash === "#proxy") route(true); };
   const portTxt = (p, def) => (String(p) === def ? "" : ":" + p);
-  $("[data-topmeta]").innerHTML = `${pill(`https${portTxt(d.https_port, "443")} · http${portTxt(d.http_port, "80")}`)} ${pill(d.nginx_running ? "nginx up" : "nginx down", d.nginx_running ? "ok" : "bad")}`;
+  $("[data-topmeta]").innerHTML = `${pill(`https${portTxt(d.https_port, "443")} · http${portTxt(d.http_port, "80")}`)} ${!known ? pill("nginx: unknown", "warn") : pill(d.nginx_running ? "nginx up" : "nginx down", d.nginx_running ? "ok" : "bad")}`;
   view().innerHTML = `
     <p class="lede">Open a Vexor service or anything on this host or your LAN under its own name, like <code>soc.example.com</code>. nginx answers on port ${esc(d.https_port || 443)} (HTTPS) and ${esc(d.http_port || 80)} (HTTP, redirects and Let's Encrypt) once the first route exists. Every change is tested with <code>nginx -t</code> before nginx reloads.</p>
     ${d.error ? `<p class="err">${esc(d.error)}</p>` : ""}
