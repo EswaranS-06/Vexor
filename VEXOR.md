@@ -99,7 +99,7 @@ Available when `SOC` is `elk` or `both`.
 | `elk [status]` | Elasticsearch health, Kibana, events in the last hour, the Beats endpoint. |
 | `elk indices` | `vexor-*` indices with health, document count and size. |
 | `elk search [query] [-n N] [--index P]` | Lucene search, newest first, with a short summary of each hit. Example: `vexor elk search 'alert.signature_id:2100498' --index 'vexor-suricata-*'`. |
-| `elk data-views` / `elk retention` | Re-create the Kibana data views / re-apply ILM retention (`ELK_RETENTION_DAYS`) and the index template. |
+| `elk data-views` / `elk retention` | Re-create the Kibana data views / re-apply ILM retention (`RETENTION_DAYS` or `ELK_RETENTION_DAYS`) and the index template. |
 | `elk beats-ca` | The CA that Beats senders trust when `LOGSTASH_BEATS_TLS=true`. |
 | `elk beats-config` | `filebeat.yml` snippet for machines that ship logs to Logstash (`LOGSTASH_BEATS_PORT`). |
 | `elk es <METHOD> <path> [json]` | Raw Elasticsearch API as `elastic`, e.g. `vexor elk es GET /_cat/health?v`. |
@@ -261,7 +261,8 @@ Wazuh password policy: 8–64 characters from letters, digits and `. * + ? -`, w
 | `backup restore-es <es-snap-id> [--indices P] [--rename] [--kibana]` | Restore Elasticsearch indices (and with `--kibana` the saved objects) from an `es-snap-*` snapshot. |
 | `backup restore-snapshot <id> [--indices P] [--rename]` / `restore-manager <stamp>` / `restore-config <file>` | Restore indices / agent keys, rules and groups / `.env` and `config/`. |
 | `n8n backup [dir]` | Workflows and credentials as JSON. |
-| `retention [show\|apply]` / `prune-logs` | Wazuh index retention / delete old manager logs. |
+| `retention [status\|apply]` | Deletion policies for Wazuh and Elasticsearch data (`RETENTION_DAYS`, 0 = keep forever). `status` shows them and the indices they cover; `apply` sets them. Also runs at start, after install and in maintenance. |
+| `prune-logs` | Delete old rotated manager logs. |
 | `volumes ls \| backup <vol\|all> [--stop] \| restore <vol> <file> \| rm <vol> \| prune` | Project volumes. |
 | `reset [containers\|data\|full\|purge]` | From removing containers up to a full wipe; backups are never deleted. |
 

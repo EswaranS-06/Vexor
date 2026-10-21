@@ -166,7 +166,7 @@ vexor node-type multi            # grow to master + workers + 3 indexers
 
 - generates the Elastic passwords
 - creates `vexor_logstash`, a user that can only write `vexor-*`
-- applies ILM retention (`ELK_RETENTION_DAYS`) with 0 replicas
+- applies ILM retention (`RETENTION_DAYS`, or `ELK_RETENTION_DAYS`) with 0 replicas
 - adds Kibana data views for Wazuh alerts, Suricata, Zeek and Beats
 
 Kibana is served at `KIBANA_PORT` (55601) through nginx. Elasticsearch listens on `127.0.0.1:ES_PORT` only.
@@ -305,12 +305,14 @@ Never put a comment on the same line as an **empty** value in `.env`: Docker Com
 
 | Data | Where | Retention |
 |---|---|---|
-| Wazuh alerts | `wazuh-alerts-*` in the Wazuh indexer | `INDEX_RETENTION_DAYS` (ISM) |
-| ELK events | `vexor-wazuh-alerts-*`, `vexor-suricata-*`, `vexor-zeek-*`, `vexor-beats-*` | `ELK_RETENTION_DAYS` (ILM) |
+| Wazuh alerts | `wazuh-alerts-*` and `wazuh-archives-*` in the Wazuh indexer | `RETENTION_DAYS` (ISM; `INDEX_RETENTION_DAYS` overrides) |
+| ELK events | `vexor-wazuh-alerts-*`, `vexor-suricata-*`, `vexor-zeek-*`, `vexor-beats-*` | `RETENTION_DAYS` (ILM; `ELK_RETENTION_DAYS` overrides) |
 | Suricata and Zeek logs | `tools-data/` | `TOOLS_LOG_RETENTION_DAYS` |
 | n8n workflows and credentials | `n8n-data` volume | kept; `vexor n8n backup` exports them |
 | Manager logs | `/var/ossec/logs` (volume) | `MANAGER_LOG_RETENTION_DAYS` |
 | Container logs | Docker `json-file` | `LOG_MAX_SIZE` × `LOG_MAX_FILE` |
+
+`RETENTION_DAYS` (default 30) is how long alerts and events are kept; `0` keeps them forever. The indexers delete old data by themselves: an ISM policy `wazuh-retention` on the Wazuh indexer and an ILM policy `vexor-retention` in Elasticsearch. `vexor retention status` shows both and how many indices they cover, and `vexor retention apply` sets them. The policies are applied at start, after install and in the daily maintenance. An existing `.env` keeps its `INDEX_RETENTION_DAYS=90`, so delete that line to use `RETENTION_DAYS`.
 
 `vexor backup` (daily with the daemon) saves an indexer snapshot, the master's state, the n8n, Grafana and Portainer volumes, and the configuration. Restore with `vexor backup restore-snapshot | restore-manager | restore-config`. Keep `.env`: it holds `N8N_ENCRYPTION_KEY`, without which n8n credentials cannot be decrypted. With `SOC=elk` or `both` the backup also takes an Elasticsearch snapshot of `vexor-*` and the Kibana saved objects (repository `backups/es-snapshots`); restore with `vexor backup restore-es <id>`.
 

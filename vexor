@@ -234,7 +234,8 @@ KIBANA_PORT=55601              # https://PUBLIC_HOST:KIBANA_PORT through nginx
 ES_PORT=59200                  # Elasticsearch API on ES_BIND (host only by default)
 ES_BIND=127.0.0.1
 LOGSTASH_BEATS_PORT=55044      # Beats / Elastic Agent -> Logstash
-ELK_RETENTION_DAYS=30          # vexor-* indices in Elasticsearch are deleted after this (ILM)
+RETENTION_DAYS=30              # Wazuh alerts and ELK events older than this are deleted (0 = keep forever)
+ELK_RETENTION_DAYS=            # optional ELK-only override of RETENTION_DAYS (empty = RETENTION_DAYS)
 ELASTIC_PASSWORD=CHANGE_ME           # Kibana / Elasticsearch login "elastic" (applied on the FIRST start only)
 KIBANA_SYSTEM_PASSWORD=CHANGE_ME     # internal Kibana -> Elasticsearch user
 LOGSTASH_ES_PASSWORD=CHANGE_ME       # Logstash writer user vexor_logstash
@@ -970,7 +971,7 @@ cmd_doctor() {
   if [ "$mt" -lt $(( rw - 2 )) ]; then d_warn "RAM ${mt} GB total, ${ma} GB available (${rw} GB+ recommended for node type $(node_type))" "$(is_single && echo 'lower INDEXER_HEAP' || echo 'node type single needs about half: vexor node-type single')"
   else d_pass "RAM ${mt} GB total, ${ma} GB available"; fi
   dr="$(docker_root)"; dp="$(disk_pct "$dr")"
-  if   [ "${dp:-0}" -ge 90 ]; then d_fail "Docker disk $dr ${dp}% used - indexers stop writing at 95% and go read-only" "free space or lower INDEX_RETENTION_DAYS, then: vexor retention apply"
+  if   [ "${dp:-0}" -ge 90 ]; then d_fail "Docker disk $dr ${dp}% used - indexers stop writing at 95% and go read-only" "free space or lower RETENTION_DAYS, then: vexor retention apply"
   elif [ "${dp:-0}" -ge "$warn_pct" ]; then d_warn "Docker disk $dr ${dp}% used (indexer stops allocating new replicas at 85%)"
   fi
   if [ "${dp:-0}" -ge "$warn_pct" ]; then
@@ -1131,7 +1132,7 @@ cmd_doctor() {
     local limit; limit="$(ix GET '/_cluster/settings?include_defaults=true&flat_settings=true' | pj 'print(d["persistent"].get("cluster.max_shards_per_node") or d["defaults"].get("cluster.max_shards_per_node","1000"))')"
     [[ "$limit" =~ ^[0-9]+$ ]] || limit=1000; [[ "$nodes" =~ ^[0-9]+$ ]] || nodes=3; [[ "$act" =~ ^[0-9]+$ ]] || act=0
     if [ "$act" -gt $(( limit * nodes * 80 / 100 )) ]; then
-      d_warn "$act shards open, limit $(( limit * nodes )) - new daily indices will fail near the limit" "lower INDEX_RETENTION_DAYS + vexor retention apply"
+      d_warn "$act shards open, limit $(( limit * nodes )) - new daily indices will fail near the limit" "lower RETENTION_DAYS + vexor retention apply"
     else d_pass "$act shards open (limit $(( ${limit:-1000} * ${nodes:-3} )))"; fi
     local ro; ro="$(ix GET '/_all/_settings/index.blocks.read_only_allow_delete' | pj 'print(sum(1 for v in d.values() if v.get("settings",{}).get("index",{}).get("blocks",{}).get("read_only_allow_delete") == "true"))')"
     if [ "${ro:-0}" -gt 0 ]; then
@@ -1140,8 +1141,10 @@ cmd_doctor() {
     else d_pass "no read-only index blocks"; fi
     local alloc; alloc="$(ix GET '/_cat/allocation?format=json' | pj 'print(max(int(x.get("disk.percent") or 0) for x in d if x.get("node") != "UNASSIGNED"))')"
     [ "${alloc:-0}" -ge 85 ] && d_warn "indexer data disk ${alloc}% (low watermark 85%)"
-    if [ "$(ix_code "/_plugins/_ism/policies/$ISM_POLICY")" = 200 ]; then d_pass "retention policy '$ISM_POLICY' present ($(env_def INDEX_RETENTION_DAYS 90) days)"
-    else d_warn "retention policy missing - indices are never deleted" "vexor retention apply"; d_fix "apply retention" && retention_apply; fi
+    local wd; wd="$(retention_days INDEX_RETENTION_DAYS)" || wd=bad
+    if [ "$wd" = bad ]; then d_warn "INDEX_RETENTION_DAYS / RETENTION_DAYS is not a whole number of days" "vexor config set RETENTION_DAYS 30"
+    elif [ "$(ism_policy_age)" = "$(retention_expect "$wd")" ]; then d_pass "retention policy '$ISM_POLICY' matches ($(retention_words "$wd"))"
+    else d_warn "retention policy is $(ism_policy_age), expected $(retention_expect "$wd") - indices are not deleted as configured" "vexor retention apply"; d_fix "apply retention" && retention_apply; fi
     if [ "$(ix_code "/_snapshot/$SNAP_REPO")" = 200 ]; then d_pass "snapshot repository '$SNAP_REPO' registered"
     else d_warn "snapshot repository not registered" "vexor backup register"; d_fix "register snapshot repo" && snapshot_register; fi
     local n24; n24="$(ix POST '/wazuh-alerts-*/_count' -d '{"query":{"range":{"timestamp":{"gte":"now-24h"}}}}' | pj 'print(d.get("count",0))')"
@@ -1432,7 +1435,7 @@ cmd_config() {
         NODE_TYPE) cmd_node_type "$v"; return ;;
         INDEXER_COUNT) die "Use: vexor indexers 1|3 (moves the data first)" ;;
         COMPOSE_PROFILES) die "COMPOSE_PROFILES follows NODE_TYPE, WORKER_COUNT and INDEXER_COUNT - do not set it" ;;
-        *PORT|INDEX_RETENTION_DAYS|MANAGER_LOG_RETENTION_DAYS|SNAPSHOT_RETENTION_DAYS|DISK_WARN_PCT|CERT_DAYS|LOG_MAX_FILE|NGINX_WORKER_CONNECTIONS)
+        *PORT|RETENTION_DAYS|INDEX_RETENTION_DAYS|ELK_RETENTION_DAYS|MANAGER_LOG_RETENTION_DAYS|SNAPSHOT_RETENTION_DAYS|DISK_WARN_PCT|CERT_DAYS|LOG_MAX_FILE|NGINX_WORKER_CONNECTIONS)
           [[ "$v" =~ ^[0-9]+$ ]] || die "$k must be a number" ;;
         INDEXER_HEAP) [[ "$v" =~ ^[0-9]+[mg]$ ]] || die "INDEXER_HEAP like 1g or 2048m" ;;
         BACKUP_TIME|MAINT_TIME) [[ "$v" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "$k must be HH:MM" ;;
@@ -3147,15 +3150,39 @@ elk_post() {                   # after `docker compose up`: users, roles, retent
   if [ "$c" = 200 ]; then elk_data_views; else warn "Kibana not ready yet (HTTP ${c:-000}) - first start takes 2-3 min; vexor doctor --fix adds the data views"; fi
   return 0
 }
-elk_retention_apply() {        # ILM delete after ELK_RETENTION_DAYS + template: 0 replicas (single node), no mapping conflicts on data.*
-  local d; d="$(env_def ELK_RETENTION_DAYS 30)"
-  es_curl PUT /_ilm/policy/vexor-retention -d "{\"policy\":{\"phases\":{\"hot\":{\"actions\":{}},\"delete\":{\"min_age\":\"${d}d\",\"actions\":{\"delete\":{}}}}}}" >/dev/null
-  es_curl PUT /_index_template/vexor -d '{"index_patterns":["vexor-*"],"priority":200,
-    "template":{"settings":{"number_of_replicas":0,"index.lifecycle.name":"vexor-retention","index.mapping.total_fields.limit":5000},
-      "mappings":{"dynamic_templates":[{"strings_as_keyword":{"match_mapping_type":"string","mapping":{"type":"keyword","ignore_above":1024}}}],
-        "properties":{"@timestamp":{"type":"date"},"full_log":{"type":"text"},"data":{"type":"flattened"},"syscheck":{"type":"flattened"},
-          "rule":{"properties":{"level":{"type":"integer"},"id":{"type":"keyword"}}}}}}}' | has '"acknowledged":true' \
-    && ok "Elasticsearch retention: vexor-* indices deleted after $d days (ILM), 0 replicas"
+elk_template_body() {          # index template for vexor-*: 0 replicas, mappings; $1 = ILM policy to attach (none = no lifecycle)
+  local lc=""
+  [ -n "${1:-}" ] && lc="\"index.lifecycle.name\":\"$1\","
+  cat <<JSON
+{"index_patterns":["vexor-*"],"priority":200,
+ "template":{"settings":{"number_of_replicas":0,${lc}"index.mapping.total_fields.limit":5000},
+   "mappings":{"dynamic_templates":[{"strings_as_keyword":{"match_mapping_type":"string","mapping":{"type":"keyword","ignore_above":1024}}}],
+     "properties":{"@timestamp":{"type":"date"},"full_log":{"type":"text"},"data":{"type":"flattened"},"syscheck":{"type":"flattened"},
+       "rule":{"properties":{"level":{"type":"integer"},"id":{"type":"keyword"}}}}}}}
+JSON
+}
+elk_policy_age() {             # min_age of the live vexor-retention ILM delete phase ("none" when it is missing)
+  es_curl GET /_ilm/policy/vexor-retention 2>/dev/null \
+    | pj 'print(d["vexor-retention"]["policy"]["phases"]["delete"]["min_age"])' 2>/dev/null || echo none
+}
+elk_covered() {                # "managed of total": vexor-* indices under the vexor-retention ILM policy
+  es_curl GET '/vexor-*/_ilm/explain' 2>/dev/null \
+    | pj 'idx = d.get("indices", {})
+print(sum(1 for v in idx.values() if v.get("policy") == sys.argv[1]), "of", len(idx))' "vexor-retention" 2>/dev/null || echo "?"
+}
+elk_retention_apply() {        # ILM delete after ELK_RETENTION_DAYS (else RETENTION_DAYS) + template: 0 replicas (single node); 0 days = keep forever
+  local d; d="$(retention_days ELK_RETENTION_DAYS)" || { warn "ELK_RETENTION_DAYS / RETENTION_DAYS must be a whole number of days"; return 1; }
+  if [ "$d" = 0 ]; then
+    es_curl PUT /_index_template/vexor -d "$(elk_template_body)" | has '"acknowledged":true' || warn "could not update the vexor index template"
+    es_curl PUT '/vexor-*/_settings?allow_no_indices=true' -d '{"index.lifecycle.name":null}' >/dev/null 2>&1
+    es_curl DELETE /_ilm/policy/vexor-retention >/dev/null 2>&1
+    ok "Elasticsearch retention: vexor-* indices kept forever (ILM policy removed)"
+  else
+    es_curl PUT /_ilm/policy/vexor-retention -d "{\"policy\":{\"phases\":{\"hot\":{\"actions\":{}},\"delete\":{\"min_age\":\"${d}d\",\"actions\":{\"delete\":{}}}}}}" >/dev/null
+    es_curl PUT /_index_template/vexor -d "$(elk_template_body vexor-retention)" | has '"acknowledged":true' \
+      && ok "Elasticsearch retention: vexor-* indices deleted after $d days (ILM), 0 replicas"
+    es_curl PUT '/vexor-*/_settings?allow_no_indices=true' -d '{"index.lifecycle.name":"vexor-retention"}' >/dev/null 2>&1
+  fi
   es_curl PUT '/vexor-*/_settings?allow_no_indices=true' -d '{"index":{"number_of_replicas":0}}' >/dev/null 2>&1
   return 0
 }
@@ -3208,8 +3235,10 @@ elk_doctor() {                 # ELK checks + predictable repairs
       d_fail "$ro Elasticsearch indices are read-only (disk flood stage)" "free disk or lower ELK_RETENTION_DAYS"
       d_fix "clear read-only blocks" && es_curl PUT /_all/_settings -d '{"index.blocks.read_only_allow_delete": null}' >/dev/null
     fi
-    if [ "$(es_code /_ilm/policy/vexor-retention)" = 200 ] && [ "$(es_code /_index_template/vexor)" = 200 ]; then d_pass "retention (ILM) + index template present"
-    else d_warn "ILM policy / index template missing" "vexor doctor --fix"; d_fix "apply ELK retention + template" && elk_retention_apply >/dev/null; fi
+    local ed; ed="$(retention_days ELK_RETENTION_DAYS)" || ed=bad
+    if [ "$ed" = bad ]; then d_warn "ELK_RETENTION_DAYS / RETENTION_DAYS is not a whole number of days" "vexor config set RETENTION_DAYS 30"
+    elif [ "$(elk_policy_age)" = "$(retention_expect "$ed")" ] && [ "$(es_code /_index_template/vexor)" = 200 ]; then d_pass "retention (ILM): $(retention_words "$ed") + index template present"
+    else d_warn "ILM policy is $(elk_policy_age), expected $(retention_expect "$ed"), or the index template is missing" "vexor doctor --fix"; d_fix "apply ELK retention + template" && elk_retention_apply >/dev/null; fi
     if [ "$(es_code "/_snapshot/$ES_SNAP_REPO")" = 200 ]; then d_pass "Elasticsearch snapshot repository registered (vexor backup includes ELK)"
     else d_warn "Elasticsearch snapshot repository not registered yet" "vexor doctor --fix   (or the next vexor backup)"
          d_fix "register the Elasticsearch snapshot repository" && es_snapshot_register >/dev/null; fi
@@ -4378,17 +4407,48 @@ cmd_cluster() {
 }
 
 # ============================================================== retention / logs pruning
-retention_apply() {
-  local days body resp seq pri
-  days="$(env_def INDEX_RETENTION_DAYS 90)"
-  [[ "$days" =~ ^[0-9]+$ ]] && [ "$days" -ge 1 ] || die "INDEX_RETENTION_DAYS must be a positive number"
-  body="$(cat <<JSON
-{"policy":{"description":"Delete Wazuh alert/archive indices after ${days} days","default_state":"hot",
- "states":[{"name":"hot","actions":[],"transitions":[{"state_name":"delete","conditions":{"min_index_age":"${days}d"}}]},
+# RETENTION_DAYS (default 30, 0 = keep forever) is the one setting. INDEX_RETENTION_DAYS (Wazuh) and
+# ELK_RETENTION_DAYS (Elasticsearch) override it for their backend when they hold a number.
+retention_days() {             # retention_days KEY -> days for one backend; fails when the value is not a whole number
+  local v; v="$(env_def "$1" "$(env_def RETENTION_DAYS 30)")"
+  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  echo "$v"
+}
+retention_expect() {           # retention_expect DAYS -> the min age a live policy must show (none = no policy)
+  if [ "$1" = 0 ]; then echo none; else echo "${1}d"; fi
+}
+retention_words() {            # retention_words DAYS -> wording for status and doctor
+  if [ "$1" = 0 ]; then echo "kept forever"; else echo "deleted after $1 days"; fi
+}
+ism_policy_body() {            # ISM policy: delete Wazuh alert and archive indices $1 days after they were created
+  cat <<JSON
+{"policy":{"description":"Delete Wazuh alert/archive indices after $1 days","default_state":"hot",
+ "states":[{"name":"hot","actions":[],"transitions":[{"state_name":"delete","conditions":{"min_index_age":"$1d"}}]},
            {"name":"delete","actions":[{"delete":{}}],"transitions":[]}],
  "ism_template":[{"index_patterns":["wazuh-alerts-*","wazuh-archives-*"],"priority":100}]}}
 JSON
-)"
+}
+ism_policy_age() {             # min_index_age of the live Wazuh policy ("none" when it is missing)
+  ix GET "/_plugins/_ism/policies/$ISM_POLICY" 2>/dev/null \
+    | pj 'print(d["policy"]["states"][0]["transitions"][0]["conditions"]["min_index_age"])' 2>/dev/null || echo none
+}
+ism_covered() {                # "managed of total": wazuh-alerts-* / wazuh-archives-* indices under the policy
+  ix GET "/_plugins/_ism/explain/wazuh-alerts-*,wazuh-archives-*" 2>/dev/null \
+    | pj 'idx = {k: v for k, v in d.items() if k != "total_managed_indices" and isinstance(v, dict)}
+print(sum(1 for v in idx.values() if v.get("index.plugins.index_state_management.policy_id") == sys.argv[1]), "of", len(idx))' "$ISM_POLICY" 2>/dev/null || echo "?"
+}
+retention_apply() {            # Wazuh indexer: ISM policy, attached to wazuh-alerts-* and wazuh-archives-* (0 days = remove it)
+  local days body resp seq pri pat
+  days="$(retention_days INDEX_RETENTION_DAYS)" || { warn "INDEX_RETENTION_DAYS / RETENTION_DAYS must be a whole number of days"; return 1; }
+  if [ "$days" = 0 ]; then
+    for pat in 'wazuh-alerts-*' 'wazuh-archives-*'; do
+      ix POST "/_plugins/_ism/remove/$pat" >/dev/null 2>&1 || true
+    done
+    ix DELETE "/_plugins/_ism/policies/$ISM_POLICY" >/dev/null 2>&1 || true
+    ok "Wazuh indices kept forever (retention 0: policy '$ISM_POLICY' removed)"
+    return 0
+  fi
+  body="$(ism_policy_body "$days")"
   resp="$(ix GET "/_plugins/_ism/policies/$ISM_POLICY")"
   seq="$(pj 'print(d.get("_seq_no","") if "policy" in d else "")' <<<"$resp" || true)"
   pri="$(pj 'print(d.get("_primary_term","") if "policy" in d else "")' <<<"$resp" || true)"
@@ -4399,7 +4459,6 @@ JSON
     ix PUT "/_plugins/_ism/policies/$ISM_POLICY" -d "$body" | has '"_id"' || return 1
     ok "retention policy created: delete alert/archive indices after $days days"
   fi
-  local pat
   for pat in 'wazuh-alerts-*' 'wazuh-archives-*'; do
     ix POST "/_plugins/_ism/add/$pat" -d "{\"policy_id\":\"$ISM_POLICY\"}" >/dev/null 2>&1 || true
   done
@@ -4409,18 +4468,45 @@ JSON
   done
   return 0
 }
-cmd_retention() {
-  case "${1:-show}" in
-    apply) take_lock; [ "$(ix_code)" = 200 ] || die "indexer unreachable"; retention_apply ;;
-    show)
-      [ "$(ix_code)" = 200 ] || die "indexer unreachable"
-      say "INDEX_RETENTION_DAYS=$(env_def INDEX_RETENTION_DAYS 90)   MANAGER_LOG_RETENTION_DAYS=$(env_def MANAGER_LOG_RETENTION_DAYS 30)   SNAPSHOT_RETENTION_DAYS=$(env_def SNAPSHOT_RETENTION_DAYS 14)"
-      if [ "$(ix_code "/_plugins/_ism/policies/$ISM_POLICY")" = 200 ]; then ok "ISM policy '$ISM_POLICY' present"; else warn "ISM policy missing (vexor retention apply)"; fi
-      hdr "Alert / archive indices (oldest first)"
-      ix GET "/_cat/indices/wazuh-alerts-*,wazuh-archives-*?v&s=index&h=index,docs.count,store.size,creation.date.string" | head -n 60
-      hdr "Total size"
-      ix GET "/_cat/indices/wazuh-*?h=store.size&bytes=b" | awk '{s+=$1} END {printf "  %.2f GB (all wazuh-* indices, incl. replicas)\n", s/1073741824}' ;;
-    *) die "usage: vexor retention show|apply  (set INDEX_RETENTION_DAYS first: vexor config set INDEX_RETENTION_DAYS 60)" ;;
+cmd_retention() {              # vexor retention [status|apply]: deletion policies for Wazuh and Elasticsearch data
+  local rc=0 wd ed ri re
+  case "${1:-status}" in
+    apply)
+      take_lock
+      if soc_wazuh; then
+        if [ "$(ix_code)" = 200 ]; then retention_apply || rc=1; else warn "Wazuh indexer unreachable - skipped"; rc=1; fi
+      fi
+      if soc_elk; then
+        if [ "$(es_code /_cluster/health)" = 200 ]; then elk_retention_apply || rc=1; else warn "Elasticsearch unreachable - skipped"; rc=1; fi
+      fi
+      [ "$rc" = 0 ] || die "retention apply did not finish (see above)" ;;
+    status|show)
+      ri="$(env_get INDEX_RETENTION_DAYS)"; re="$(env_get ELK_RETENTION_DAYS)"
+      say "RETENTION_DAYS=$(env_def RETENTION_DAYS 30) (0 = keep forever)   INDEX_RETENTION_DAYS=${ri:-unset}   ELK_RETENTION_DAYS=${re:-unset}"
+      say "MANAGER_LOG_RETENTION_DAYS=$(env_def MANAGER_LOG_RETENTION_DAYS 30)   SNAPSHOT_RETENTION_DAYS=$(env_def SNAPSHOT_RETENTION_DAYS 14)"
+      if soc_wazuh; then
+        wd="$(retention_days INDEX_RETENTION_DAYS)" || wd=""
+        if [ -z "$wd" ]; then warn "Wazuh: INDEX_RETENTION_DAYS / RETENTION_DAYS is not a whole number"
+        elif [ "$(ix_code)" != 200 ]; then warn "Wazuh indexer unreachable"
+        elif [ "$(ism_policy_age)" = "$(retention_expect "$wd")" ]; then
+          ok "Wazuh: $(retention_words "$wd") (policy '$ISM_POLICY', indices under it: $(ism_covered))"
+        else warn "Wazuh: policy is $(ism_policy_age), expected $(retention_expect "$wd") (vexor retention apply)"; fi
+      fi
+      if soc_elk; then
+        ed="$(retention_days ELK_RETENTION_DAYS)" || ed=""
+        if [ -z "$ed" ]; then warn "ELK: ELK_RETENTION_DAYS / RETENTION_DAYS is not a whole number"
+        elif [ "$(es_code /_cluster/health)" != 200 ]; then warn "Elasticsearch not answering"
+        elif [ "$(elk_policy_age)" = "$(retention_expect "$ed")" ]; then
+          ok "ELK vexor-* indices: $(retention_words "$ed") (ILM policy 'vexor-retention', indices under it: $(elk_covered))"
+        else warn "ELK: ILM policy is $(elk_policy_age), expected $(retention_expect "$ed") (vexor retention apply)"; fi
+      fi
+      if soc_wazuh && [ "$(ix_code)" = 200 ]; then
+        hdr "Alert / archive indices (oldest first)"
+        ix GET "/_cat/indices/wazuh-alerts-*,wazuh-archives-*?v&s=index&h=index,docs.count,store.size,creation.date.string" | head -n 60
+        hdr "Total size"
+        ix GET "/_cat/indices/wazuh-*?h=store.size&bytes=b" | awk '{s+=$1} END {printf "  %.2f GB (all wazuh-* indices, incl. replicas)\n", s/1073741824}'
+      fi ;;
+    *) die "usage: vexor retention status|apply  (sets: vexor config set RETENTION_DAYS 60; 0 = keep forever)" ;;
   esac
 }
 prune_logs() {
@@ -4830,6 +4916,7 @@ cmd_maintenance() {
   prune_logs
   tools_maintenance
   [ "$(ix_code)" = 200 ] && retention_apply
+  soc_elk && [ "$(es_code /_cluster/health)" = 200 ] && elk_retention_apply
   cert_renew
   docker image prune -f >/dev/null 2>&1
   log "maintenance done"
@@ -5013,7 +5100,7 @@ _vexor() {
       reminders) words="list done" ;;
       ai-context) words="--print" ;;
       backup)  words="run list register restore-snapshot restore-es restore-manager restore-config --rename --indices --kibana" ;;
-      retention) words="show apply" ;;
+      retention) words="status show apply" ;;
       volumes) words="ls backup restore rm prune all --stop --out" ;;
       reset)   words="containers data full purge" ;;
       daemon)  words="install uninstall status logs" ;;
@@ -5592,7 +5679,7 @@ ${C_BD}Data${C_0}
   backup [run]|list|register     indexer snapshot + manager state + config (keeps SNAPSHOT_RETENTION_DAYS)
   backup restore-snapshot <id> [--indices P] [--rename] | restore-manager <stamp> | restore-config <file>
   backup restore-es <es-snap-id> [--indices P] [--rename] [--kibana]   Elasticsearch (SOC=elk|both) is in every backup
-  retention [show|apply]         delete indices older than INDEX_RETENTION_DAYS
+  retention [status|apply]       delete Wazuh and ELK data older than RETENTION_DAYS (0 = keep forever)
   prune-logs                     delete rotated manager logs older than MANAGER_LOG_RETENTION_DAYS
   volumes ls | backup <vol|all> [--stop] [--out DIR] | restore <vol> <file> | rm <vol> | prune
   reset [containers|data|full|purge]          interactive menu without a level
