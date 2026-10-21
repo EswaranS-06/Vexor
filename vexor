@@ -1438,11 +1438,17 @@ cmd_config() {
     validate) dc config -q && ok "docker-compose.yml + .env valid" ;;
     apply)
       take_lock; preflight
-      if soc_wazuh && maybe_switch_node_type; then ok "Settings applied (node type switched)"; return 0; fi
+      if [ "${ASSUME_YES:-0}" != 1 ] && [ -t 0 ]; then
+        cmd_plan; confirm "Apply this?" || die "Aborted - nothing changed"
+      else
+        cmd_plan 2>/dev/null | sed -n '1,40p'
+      fi
+      if soc_wazuh && maybe_switch_node_type; then ok "Settings applied (node type switched)"; record_applied_env; return 0; fi
       render_nginx; render_override
       apply_all
       ok "Settings applied (only changed containers were recreated)" ;;
-    *) die "usage: vexor config show|get|set|edit|validate|apply" ;;
+    plan) shift 0; cmd_plan "$@" ;;
+    *) die "usage: vexor config show|get|set|edit|validate|plan|apply" ;;
   esac
 }
 
@@ -3219,6 +3225,7 @@ apply_all() {                  # the one reconcile path: render everything, pull
   soc_wazuh && wait_dashboard 240
   nginx_reload >/dev/null 2>&1 || true
   console_sync || true
+  record_applied_env
   return 0
 }
 cmd_elk() {
@@ -4736,12 +4743,13 @@ _vexor() {
   local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}" words
   local svcs="master worker worker2 worker3 indexer1 indexer2 indexer3 dashboard nginx managers indexers"
   if [ "$COMP_CWORD" -eq 1 ]; then
-    words="install info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
+    words="install info config start stop restart down scale node-type status health doctor logs shell exec indexer api support-bundle update version cert passwd agents cluster wazuh elk n8n suricata zeek console plan tools soc indexers autoheal ai-context reminders motd backup retention prune-logs volumes reset daemon watchdog maintenance completion help"
   else
     case "$cmd" in
       start|stop|restart|shell|exec) words="$svcs" ;;
       logs)    words="$svcs ossec api cluster alerts archives errors size -f -n --since" ;;
-      config)  words="show get set edit validate apply --show-secrets" ;;
+      config)  words="show get set edit validate plan apply --show-secrets" ;;
+      plan)    words="--json" ;;
       update)  words="check apply rollback images latest --no-backup --force" ;;
       cert)    words="status create export-ca serve-ca import letsencrypt renew use-default internal-regen --force --email --staging --dns" ;;
       passwd)  words="admin kibanaserver api --generate" ;;
@@ -4778,6 +4786,117 @@ EOF
 cmd_completion() {
   if [ "${1:-}" = install ]; then completion_script > /etc/bash_completion.d/vexor && ok "installed - open a new shell"
   else completion_script; fi
+}
+
+# ============================================================== plan: preview what an apply would change
+# vexor plan                 -> .env edits since the last apply, and what `config apply` would recreate
+# vexor plan KEY=VALUE ...   -> the same for a change that is not written yet (nothing is modified)
+# The new override + nginx.conf are rendered into a temp dir and `docker compose --dry-run up -d` runs against them.
+record_applied_env() { mkdir -p "$STATE_DIR"; cp "$ENV_FILE" "$STATE_DIR/env.applied" 2>/dev/null && chmod 600 "$STATE_DIR/env.applied"; return 0; }
+cmd_plan() {
+  local json=0 kv d base cf
+  local -a sets=()
+  for kv in "$@"; do
+    [ "$kv" = --json ] && { json=1; continue; }
+    [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=.*$ ]] || die "usage: vexor plan [KEY=VALUE ...] [--json]"
+    case "${kv%%=*}" in *PASSWORD) die "passwords are not planned - vexor passwd" ;; esac
+    sets+=("$kv")
+  done
+  d="$RUN_TMP/plan"; mkdir -p "$d"
+  cp "$ENV_FILE" "$d/.env"
+  base="$STATE_DIR/env.applied"; [ -f "$base" ] || base="$ENV_FILE"
+  (
+    ENV_FILE="$d/.env"; OVERRIDE_FILE="$d/override.yml"; NGINX_CONF="$d/nginx.conf"
+    for kv in "${sets[@]}"; do env_set "${kv%%=*}" "${kv#*=}"; done
+    sync_profiles; render_override; render_nginx
+    enabled_services > "$d/enabled"
+  ) >/dev/null 2>&1
+  cf="docker-compose.yml:docker-compose.tools.yml:docker-compose.elk.yml:$d/override.yml"
+  (cd "$ROOT" && COMPOSE_FILE="$cf" COMPOSE_PROFILES="$(grep -E '^COMPOSE_PROFILES=' "$d/.env" | tail -1 | cut -d= -f2-)" \
+     docker compose --env-file "$d/.env" --dry-run up -d 2>&1) > "$d/dry"
+  running_services > "$d/running" 2>/dev/null
+  diff -u "$NGINX_CONF" "$d/nginx.conf" > "$d/nginx.diff" 2>/dev/null
+  python3 -I - "$base" "$d/.env" "$d/dry" "$d/enabled" "$d/running" "$d/nginx.diff" "$json" "$(project)" "$( [ -f "$STATE_DIR/env.applied" ] && echo 1 || echo 0)" <<'PY'
+import json, re, sys
+base, new, dry, enabled, running, ndiff, as_json, proj, have_base = sys.argv[1:10]
+def env(p):
+    out = {}
+    for line in open(p, errors="replace"):
+        m = re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$", line.rstrip("\n"))
+        if not m:
+            continue
+        v = m.group(2)
+        c = re.search(r"\s+#", v)
+        if c and not v.startswith("#"):
+            v = v[: c.start()]
+        out[m.group(1)] = v.strip().strip('"').strip("'")
+    return out
+SECRET = re.compile(r"(PASSWORD|SECRET|TOKEN|_KEY)$")
+IGNORE = {"COMPOSE_PROFILES", "COMPOSE_FILE"}
+a, b = env(base), env(new)
+settings = []
+for k in sorted(set(a) | set(b)):
+    if k in IGNORE or a.get(k) == b.get(k):
+        continue
+    secret = bool(SECRET.search(k))
+    settings.append({"key": k, "old": "(set)" if secret and a.get(k) else a.get(k), "new": "(changed)" if secret else b.get(k)})
+recreate, create = [], []
+for line in open(dry, errors="replace"):
+    m = re.match(r"\s*Container\s+(\S+)\s+(Recreate|Creating)\s*$", line)
+    if not m:
+        continue
+    name = re.sub(r"^[0-9a-f]{12}_", "", m.group(1))
+    svc = re.sub(rf"^{re.escape(proj)}-(.*)-\d+$", r"\1", name)
+    (recreate if m.group(2) == "Recreate" else create).append(svc)
+recreate, create = sorted(set(recreate)), sorted(set(create) - set(recreate))
+en = set(open(enabled).read().split())
+remove = sorted(s for s in open(running).read().split() if s not in en)
+nginx_lines = [l for l in open(ndiff, errors="replace") if l[:1] in "+-" and not l.startswith(("+++", "---"))]
+DOWN = {
+    "wazuh.master": "agents reconnect within about a minute; enrollment and the API pause",
+    "nginx": "every web UI and the agent port drop for a few seconds",
+    "wazuh.dashboard": "the dashboard is unavailable for about a minute",
+    "elasticsearch": "Kibana and Logstash wait for Elasticsearch (about a minute)",
+    "suricata": "a short gap in IDS alerts", "zeek": "a short gap in network logs",
+}
+notes = []
+for s in recreate + create:
+    if s in DOWN:
+        notes.append(f"{s}: {DOWN[s]}")
+    elif s.startswith("wazuh") and "worker" in s:
+        notes.append(f"{s}: its agents move to another manager and come back")
+    elif "indexer" in s:
+        notes.append(f"{s}: the cluster is yellow while it restarts; filebeat queues alerts")
+keys = {x["key"] for x in settings}
+if {"NODE_TYPE", "WORKER_COUNT", "INDEXER_COUNT"} & keys:
+    notes.append("layout changes are applied by vexor node-type / scale / indexers, which move the data first")
+if {"SOC"} & keys:
+    notes.append("SOC changes are applied by vexor soc, which also sets up ELK users, retention and data views")
+if any(k.endswith("_PORT") for k in keys):
+    notes.append("clients, agents and firewall rules must use the new ports; Vexor does not change firewall rules")
+if keys & {"SURICATA", "ZEEK", "ZEEK_WAZUH_LOGS", "N8N"}:
+    notes.append("tools apply also updates the master's log sources / integration, which recreates the master")
+if not (settings or recreate or create or remove or nginx_lines):
+    notes.append("nothing to apply")
+res = {"settings": settings, "recreate": recreate, "create": create, "remove": remove,
+       "nginx_changes": len(nginx_lines), "notes": notes, "baseline": "last apply" if have_base == "1" else "current .env (no apply recorded yet)"}
+if as_json == "1":
+    print(json.dumps(res)); sys.exit()
+print(f"==> Plan (compared with the {res['baseline']})")
+if settings:
+    print("  settings:")
+    for x in settings:
+        print(f"    {x['key']}: {x['old'] if x['old'] is not None else '(new)'} -> {x['new'] if x['new'] is not None else '(removed)'}")
+else:
+    print("  settings: no changes")
+for label, items in (("recreate", recreate), ("create", create), ("remove", remove)):
+    if items:
+        print(f"  {label}: {' '.join(items)}")
+if nginx_lines:
+    print(f"  nginx.conf: {len(nginx_lines)} changed lines (reload)")
+for n in notes:
+    print(f"  → {n}")
+PY
 }
 
 # ============================================================== console (web UI) + JSON for it
@@ -4921,6 +5040,8 @@ ${C_BD}Setup${C_0}
   install                        first-time setup: kernel, passwords, certificates, start (safe to re-run)
   info [--show-secrets]          dashboard URL, login, agent ports, certificate mode
   config show|get|set|edit|validate|apply     view / change .env settings, apply them
+  plan [KEY=VALUE ..] [--json]   what an apply would change: settings, containers recreated/created/removed,
+                                 nginx, downtime - without changing anything (config apply prints it first)
 
 ${C_BD}Run${C_0} (everything SOC and the tool flags in .env enable)
   start [svc..]                  start the stack (or services) and wait until it is ready
@@ -5097,7 +5218,7 @@ main() {
   if [ -f "$ENV_FILE" ] && [ "$(id -u)" -eq 0 ] && [[ "$cmd" != help && "$cmd" != completion ]]; then
     ensure_env_defaults >/dev/null; env_drop_legacy >/dev/null; migrate_layout
     case "$cmd" in   # action history (feeds ai-context); read-only commands are not logged
-      help|version|--version|-v|completion|status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check|wazuh|suricata|zeek|json) ;;
+      help|version|--version|-v|completion|status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check|wazuh|suricata|zeek|json|plan) ;;
       doctor|troubleshoot|check) [ "${args[0]:-}" = --fix ] && echo "$(ts) doctor --fix" >> "$HISTORY_FILE" ;;
       *) mkdir -p "$STATE_DIR"; echo "$(ts) $cmd ${args[0]:-} ${args[1]:-}" | mask_secrets >> "$HISTORY_FILE" ;;
     esac
@@ -5135,6 +5256,7 @@ main() {
     suricata|ids)          cmd_suricata "${args[@]}" ;;
     zeek)                  cmd_zeek "${args[@]}" ;;
     console|ui)            cmd_console "${args[@]}" ;;
+    plan)                  cmd_plan "${args[@]}" ;;
     json)                  cmd_json "${args[@]}" ;;
     shuffle)               die "Shuffle was replaced by n8n in vexor 1.2.0 - see: vexor n8n" ;;
     tools|tool)            cmd_tools "${args[@]}" ;;

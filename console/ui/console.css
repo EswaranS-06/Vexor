@@ -1,6 +1,7 @@
 /* Vexor Console · Hallmark theme: Cobalt (shared tokens with the site) · Ant-style dense data panels
  * layout: side nav + main + live output drawer · tone: technical
  */
+.pending { display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; justify-content: space-between; border: var(--rule-w) solid var(--color-warn); border-left-width: 3px; border-radius: var(--radius-md); padding: var(--space-3) var(--space-4); background: var(--color-paper); }
 *, *::before, *::after { box-sizing: border-box; }
 html, body { overflow-x: clip; }
 body { margin: 0; background: var(--color-paper); color: var(--color-ink-2); font: 400 var(--text-sm)/1.55 var(--font-body); -webkit-font-smoothing: antialiased; }

@@ -152,7 +152,7 @@ function stateLine(c) {
 async function vOverview() {
   setTitle("Overview");
   loading("the stack");
-  const [{ data: s }, { data: cs }] = await Promise.all([api("/api/state"), api("/api/containers")]);
+  const [{ data: s }, { data: cs }, { data: pend }] = await Promise.all([api("/api/state"), api("/api/containers"), api("/api/pending")]);
   STATE = s;
   const exp = s.services || [];
   const running = cs.filter((c) => c.state === "running").length;
@@ -170,6 +170,7 @@ async function vOverview() {
         <p class="muted">${hl.epoch ? new Date(hl.epoch * 1000).toLocaleString() : "the hourly timer runs it (vexor daemon install)"}</p></article>
       <article class="card ${s.disk?.pct >= 85 ? "card--warn" : ""}"><h2>Disk</h2><p class="big">${esc(s.disk?.pct ?? "?")}% used</p><p class="muted">${esc(s.disk?.path || "")}</p></article>
     </section>
+    ${pend.keys?.length ? `<section class="pending"><p><b>${pend.keys.length} .env change${pend.keys.length > 1 ? "s" : ""} not applied yet:</b> <code>${esc(pend.keys.join(" "))}</code></p><div class="actions">${btn("Show plan", ["plan"])}${btn("Apply", ["config", "apply"], "btn--primary")}</div></section>` : ""}
     <section class="block"><h2>Open</h2>
       <div class="links">${urls.map(([k, u]) => `<a class="linkcard" href="${esc(u)}" target="_blank" rel="noopener"><b>${esc(k)}</b><span>${esc(u)}</span></a>`).join("") || '<p class="muted">No web UIs enabled.</p>'}</div></section>
     ${(s.reminders || []).length ? `<section class="block"><h2>Reminders</h2><ul class="list">${s.reminders.map((r) => `<li><b>${esc(r.msg)}</b><code>${esc(r.cmd)}</code></li>`).join("")}</ul></section>` : ""}
@@ -239,11 +240,23 @@ async function vPorts() {
   });
 }
 
+function planText(p) {
+  if (!p || p.error) return "The plan could not be computed; the output shows what the apply does.";
+  const parts = [];
+  if (p.recreate?.length) parts.push(`Recreates: ${p.recreate.join(", ")}.`);
+  if (p.create?.length) parts.push(`Creates: ${p.create.join(", ")}.`);
+  if (p.remove?.length) parts.push(`Removes: ${p.remove.join(", ")} (volumes kept).`);
+  if (p.nginx_changes) parts.push(`nginx: ${p.nginx_changes} changed lines (reload).`);
+  if (!parts.length) parts.push("No container is recreated.");
+  return parts.join(" ") + (p.notes?.length ? " " + p.notes.join(". ") + "." : "");
+}
 async function applySettings(changes, text) {
   let r = await api("/api/settings/apply", { body: { changes } });
   if (r.status === 409) {
     const cmd = Object.entries(changes).map(([k, v]) => `vexor config set ${k} ${v}`).join("\n") + "\nvexor config apply";
-    if (!(await confirmDialog({ cmd, level: "change", text }))) return;
+    toast("Working out what this changes…");
+    const { data: plan } = await api("/api/plan", { body: { changes } });
+    if (!(await confirmDialog({ cmd, level: "change", text: planText(plan) + (text ? " " + text : "") }))) return;
     r = await api("/api/settings/apply", { body: { changes, confirmed: true } });
   }
   if (r.status !== 200) { toast(r.data.error || Object.entries(r.data.errors || {}).map(([k, v]) => `${k}: ${v}`).join("; ") || "Refused.", "bad"); return; }

@@ -84,7 +84,7 @@ CATALOG = {
     "start": "change", "stop": "change", "restart": "change", "scale": "danger", "node-type": "danger",
     "indexers": "danger", "update": "danger", "config": "change", "daemon": "change", "prune-logs": "change",
     "maintenance": "change", "watchdog": "change", "support-bundle": "change", "ai-context": "read",
-    "indexer": "read", "api": "read", "passwd": "danger", "reset": "danger", "console": "change",
+    "indexer": "read", "api": "read", "passwd": "danger", "reset": "danger", "console": "change", "plan": "read",
 }
 READ_SUBS = {
     "tools": {"status", "ls", ""}, "soc": {"status", ""}, "elk": {"status", "indices", "search", "explain", ""},
@@ -328,6 +328,32 @@ def validate_ports(changes):
     return errors
 
 
+def pending():
+    """.env keys that differ from the last applied snapshot (cheap; no docker calls)."""
+    applied = STATE / "env.applied"
+    if not applied.exists():
+        return {"known": False, "keys": []}
+    cur = env_dict()
+    old = {}
+    for raw in applied.read_text(errors="replace").splitlines():
+        m = re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$", raw.strip())
+        if m:
+            v = m.group(2)
+            c = re.search(r"\s+#", v)
+            old[m.group(1)] = (v[: c.start()] if c and not v.startswith("#") else v).strip().strip('"').strip("'")
+    keys = sorted(k for k in set(cur) | set(old) if cur.get(k) != old.get(k) and k not in ("COMPOSE_PROFILES", "COMPOSE_FILE"))
+    return {"known": True, "keys": keys}
+
+
+def plan(changes):
+    args = [str(VEXOR), "--no-color", "plan", "--json"] + [f"{k}={v}" for k, v in changes.items()]
+    out = run_quick(args, timeout=180)
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"error": "plan failed", "raw": out[-1500:]}
+
+
 def settings():
     rows = []
     for k, v, h in read_env():
@@ -467,6 +493,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(ports())
         if p == "/api/settings":
             return self.send_json(settings())
+        if p == "/api/pending":
+            return self.send_json(pending())
         if p == "/api/catalog":
             return self.send_json({"commands": CATALOG, "read": {k: sorted(v) for k, v in READ_SUBS.items()},
                                    "danger": {k: sorted(v) for k, v in DANGER_SUBS.items()}, "blocked": sorted(BLOCKED)})
@@ -565,6 +593,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json({"errors": validate_ports(ch)})
         if p == "/api/settings/apply":
             return self.apply_settings(s, data)
+        if p == "/api/plan":
+            changes = {str(k): str(v) for k, v in (data.get("changes") or {}).items()
+                       if re.fullmatch(r"[A-Z][A-Z0-9_]*", str(k)) and not SECRET_RE.search(str(k))}
+            return self.send_json(plan(changes))
         self.send_json({"error": "not found"}, 404)
 
     def apply_settings(self, s, data):
