@@ -86,7 +86,7 @@ CATALOG = {
     "maintenance": "change", "watchdog": "change", "support-bundle": "change", "ai-context": "read",
     "indexer": "read", "api": "read", "passwd": "danger", "reset": "danger", "console": "change", "plan": "read",
     "notify": "change", "login": "change", "disk": "read", "uninstall": "danger", "images": "danger",
-    "wait-ready": "read", "wait": "read", "migrate": "danger",
+    "wait-ready": "read", "wait": "read", "migrate": "danger", "proxy": "change",
 }
 READ_SUBS = {
     "tools": {"status", "ls", ""}, "soc": {"status", ""}, "elk": {"status", "indices", "search", "explain", ""},
@@ -95,10 +95,12 @@ READ_SUBS = {
     "retention": {"show", "status", ""}, "volumes": {"ls", "list", "orphans", ""}, "reminders": {"list", ""}, "config": {"show", "get", "validate"},
     "daemon": {"status", "logs", ""}, "console": {"status", "url", ""}, "update": {"check", ""},
     "indexers": {"status", ""}, "node-type": {"status", ""}, "notify": {"status", ""},
+    "proxy": {"ls", "list", "status", "show", "cert-file", ""},
 }
 DANGER_SUBS = {
     "volumes": {"rm", "prune", "restore"}, "backup": {"restore-snapshot", "restore-manager", "restore-config"},
     "cert": {"internal-regen"}, "agents": {"remove"}, "soc": {"wazuh", "elk", "both"},
+    "proxy": {"rm", "remove", "del", "delete"},
 }
 # Reset page: these commands run only with exactly these arguments.
 DANGER_EXACT = {
@@ -323,6 +325,8 @@ PORT_KEYS = {
     "GRAFANA_PORT": ("Grafana (HTTPS through nginx)", "admins"),
     "PORTAINER_PORT": ("Portainer (HTTPS through nginx)", "admins"),
     "CONSOLE_PORT": ("This console (HTTPS)", "admins"),
+    "ROUTES_HTTPS_PORT": ("Proxy routes: named hosts over HTTPS (vexor proxy)", "admins"),
+    "ROUTES_HTTP_PORT": ("Proxy routes: HTTP redirect + Let's Encrypt challenges", "admins"),
 }
 FIVE_X = {"KIBANA_PORT", "ES_PORT", "LOGSTASH_BEATS_PORT", "N8N_PORT", "GRAFANA_PORT", "PORTAINER_PORT", "CONSOLE_PORT"}
 
@@ -341,6 +345,11 @@ def port_in_use(k, env):
         return on(k[:-5])
     if k == "CONSOLE_PORT":
         return on("CONSOLE", "true")
+    if k in ("ROUTES_HTTPS_PORT", "ROUTES_HTTP_PORT"):
+        try:
+            return bool(json.loads((ROOT / "config" / "nginx" / "routes.json").read_text()).get("routes"))
+        except (OSError, ValueError):
+            return False
     return soc != "elk"
 
 
@@ -663,6 +672,51 @@ def _build_map():
             "networks": [{"name": k, "containers": v} for k, v in sorted(nets.items())], "limits": limits}
 
 
+# ---------------------------------------------------------------- proxy routes (vexor proxy)
+ROUTE_HOST_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
+NGINX_CFG = ROOT / "config" / "nginx"
+PEM_CERT_RE = re.compile(rb"-----BEGIN CERTIFICATE-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----\r?\n?")
+
+
+def proxy_routes():
+    out = run_quick([str(VEXOR), "--no-color", "proxy", "ls", "--json"], timeout=60)
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"routes": [], "error": "vexor proxy ls failed", "raw": out[-1500:]}
+
+
+def proxy_cert_file(host, what):
+    """-> (bytes, filename) of a PUBLIC certificate, or (None, error). Never a private key."""
+    if what not in ("ca", "cert"):
+        return None, "what must be ca or cert"
+    if what == "cert":
+        if not ROUTE_HOST_RE.match(host or ""):
+            return None, "bad host"
+        if host not in {r.get("host") for r in proxy_routes().get("routes", [])}:
+            return None, "no such route"
+        args = ["proxy", "cert-file", host, "cert"]
+    else:
+        args = ["proxy", "cert-file", "ca"]
+    lines = run_quick([str(VEXOR), "--no-color", *args], timeout=30).strip().splitlines()
+    if not lines:
+        return None, "no certificate yet"
+    try:
+        f = Path(lines[-1].strip()).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, "no certificate yet"
+    base = NGINX_CFG.resolve()
+    if base not in f.parents or f.name.endswith("-key.pem") or f.suffix not in (".pem", ".crt") or not f.is_file():
+        return None, "refused"
+    data = f.read_bytes()[:262144]
+    if b"PRIVATE KEY" in data:
+        return None, "refused"
+    m = PEM_CERT_RE.search(data)   # the first certificate: the route's own (its file also carries the chain)
+    if not m:
+        return None, "not a certificate"
+    return m.group(0), ("vexor-local-ca.crt" if what == "ca" else f"{host}.crt")
+
+
 def logins():
     out = run_quick([str(VEXOR), "--no-color", "login", "--json"], timeout=30)
     try:
@@ -870,6 +924,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(settings())
         if p == "/api/pending":
             return self.send_json(pending())
+        if p == "/api/proxy":
+            return self.send_json(proxy_routes())
+        if p == "/api/proxy/download":
+            what = (q.get("what") or ["cert"])[0]
+            host = (q.get("host") or [""])[0].strip().lower()
+            data, name = proxy_cert_file(host, what)
+            if data is None:
+                return self.send_json({"error": name}, 404 if name in ("no such route", "no certificate yet") else 400)
+            audit(s["user"], f"download {name}")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-pem-file")
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.send_header("Cache-Control", "no-store")
+            self.security_headers()
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            return self.wfile.write(data)
         if p == "/api/logins":           # list without secrets; passwords come one at a time from /reveal
             rows = logins().get("logins", [])
             return self.send_json([{k: v for k, v in r.items() if k != "password"} | {"hasPassword": bool(r.get("password"))} for r in rows])

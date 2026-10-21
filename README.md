@@ -24,7 +24,7 @@ You choose what runs in `.env`, and `vexor` wires everything together: certifica
 3. [Quick start](#quick-start)
 4. [Choosing what runs](#choosing-what-runs)
 5. [How the pieces connect](#how-the-pieces-connect)
-6. [The components](#the-components): [Wazuh](#wazuh) · [ELK](#elk) · [n8n](#n8n) · [Suricata](#suricata) · [Zeek](#zeek) · [Grafana and Portainer](#grafana-and-portainer) · [Vexor Console](#vexor-console)
+6. [The components](#the-components): [Wazuh](#wazuh) · [ELK](#elk) · [n8n](#n8n) · [Suricata](#suricata) · [Zeek](#zeek) · [Grafana and Portainer](#grafana-and-portainer) · [Proxy routes](#proxy-routes) · [Vexor Console](#vexor-console)
 7. [Change management](#change-management)
 8. [Data, retention and backups](#data-retention-and-backups)
 9. [Self-healing and troubleshooting](#self-healing-and-troubleshooting)
@@ -256,6 +256,10 @@ vexor zeek test
 
 Grafana gets an OpenSearch datasource with the read-only indexer user `grafana` and a **Wazuh alerts overview** dashboard. Portainer's admin password comes from `PORTAINER_ADMIN_PASSWORD`. Both are served only through nginx, on `GRAFANA_PORT` (53000) and `PORTAINER_PORT` (59443).
 
+### Proxy routes
+
+`vexor proxy` puts a name in front of any Vexor service or anything on your host or LAN: `vexor proxy add soc.example.com wazuh.dashboard:5601` makes the dashboard answer on `https://soc.example.com`. nginx serves the routes on `ROUTES_HTTPS_PORT` (443) and `ROUTES_HTTP_PORT` (80), which are published on `BIND_IP` only once a route exists. Each route gets a certificate from the local CA (trust the CA once per device), from Let's Encrypt, or none. Point an A record for the name at this server. Every change is tested with `nginx -t` first and rolled back if nginx rejects it, so a bad route never takes nginx down. Details, DNS and per-OS CA install steps: [VEXOR.md](VEXOR.md#proxy-routes).
+
 ### Vexor Console
 
 A web UI for the whole stack at `https://<host>:CONSOLE_PORT` (50443), on by default (`CONSOLE=true`). It runs on the host as the `vexor-console` service, uses the dashboard certificate, and signs in with `CONSOLE_USER` / `CONSOLE_PASSWORD` (`vexor console password`). The generated password works for the first sign-in only: the console asks for a new one (12 characters or more) before it shows anything else.
@@ -266,6 +270,7 @@ A web UI for the whole stack at `https://<host>:CONSOLE_PORT` (50443), on by def
 | Map | Live map of the containers and the connections between them, with traffic rates and status; tap a container for details, logs, restart |
 | Containers | State, CPU, memory, ports, image; logs and live log follow; start, stop, restart |
 | Ports | Every port from `.env` with what uses it and whether it listens; edit, check (range, duplicates, in use), apply |
+| Proxy | Proxy routes (`vexor proxy`): open a service under its own name like `soc.example.com`; add, edit, remove, issue or renew certificates, download the local CA and route certificates, DNS and trust help |
 | Volumes | Every volume with its size and users; back up one or all, full backup, remove unused |
 | Stacks | Per stack: status, tests, alerts, n8n connect, Zeek logs, enable or disable tools, switch SOC, node type, workers |
 | Health | Doctor, doctor --fix, recent errors, AI report, notifications |

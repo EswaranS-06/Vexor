@@ -11,6 +11,9 @@ config/nginx/certs/*
 !config/nginx/certs/.gitkeep
 config/nginx/letsencrypt/
 config/nginx/nginx.conf
+config/nginx/routes.json
+config/nginx/routes-certs/
+config/nginx/acme/
 config/tools/
 config/elk/
 docker-compose.override.yml
