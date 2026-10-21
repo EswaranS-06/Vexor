@@ -879,6 +879,50 @@ let storedSide = false;
 try { storedSide = localStorage.getItem("vx-side") === "1"; } catch { /* storage blocked */ }
 setSide(storedSide, false);
 
+// Collapsed-sidebar tooltip: one fixed element placed on hover/focus, so the scrolling nav cannot clip it.
+const sideTip = Object.assign(document.createElement("div"), { className: "side-tip", hidden: true });
+document.body.appendChild(sideTip);
+const hideTip = () => { sideTip.hidden = true; };
+function showTip(e) {
+  const t = e.target.closest?.("[data-tip]");
+  if (!t || !sideEl.classList.contains("is-collapsed") || matchMedia("(max-width: 760px)").matches) return hideTip();
+  if (e.type === "focusin" && !t.matches(":focus-visible")) return;
+  const r = t.getBoundingClientRect();
+  sideTip.textContent = t.dataset.tip;
+  sideTip.style.left = r.right + 8 + "px";
+  sideTip.style.top = r.top + r.height / 2 + "px";
+  sideTip.hidden = false;
+}
+const sideRoot = $(".side");
+["mouseover", "focusin"].forEach((ev) => sideRoot.addEventListener(ev, showTip));
+["mouseleave", "focusout", "click"].forEach((ev) => sideRoot.addEventListener(ev, hideTip));
+$("[data-nav]").addEventListener("scroll", hideTip, { passive: true });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideTip(); });
+
+// Keep the current page's nav item in view (vertical list on desktop, horizontal row on phones); scrolls only the nav.
+function revealNav() {
+  const nav = $("[data-nav]"), cur = $("[data-nav] a[aria-current=page]");
+  if (!cur || !nav.clientWidth) return;
+  const n = nav.getBoundingClientRect(), c = cur.getBoundingClientRect();
+  if (c.top < n.top + 4) nav.scrollTop += c.top - n.top - 4;
+  else if (c.bottom > n.bottom - 4) nav.scrollTop += c.bottom - n.bottom + 4;
+  if (c.left < n.left) nav.scrollLeft += c.left - n.left - 16;
+  else if (c.right > n.right) nav.scrollLeft += c.right - n.right + 16;
+}
+new MutationObserver(() => requestAnimationFrame(revealNav)).observe($("[data-nav]"), { attributes: true, attributeFilter: ["aria-current"], subtree: true });   // route() marks the page; follow it
+window.addEventListener("resize", revealNav);
+sideBtn.addEventListener("click", () => setTimeout(revealNav, 250));
+// Wheel over the sidebar never scrolls the page: phone top bar = vertical wheel scrolls the row sideways;
+// desktop = only the nav list scrolls (contain), the head and footer swallow the wheel.
+sideRoot.addEventListener("wheel", (e) => {
+  const nav = $("[data-nav]");
+  if (matchMedia("(max-width: 760px)").matches) {
+    if (!nav.contains(e.target) || nav.scrollWidth <= nav.clientWidth || Math.abs(e.deltaX) >= Math.abs(e.deltaY)) return;
+    e.preventDefault();
+    nav.scrollLeft += e.deltaY;
+  } else if (!nav.contains(e.target)) e.preventDefault();
+}, { passive: false });
+
 // ---------------------------------------------------------------- router
 // ---------------------------------------------------------------- Proxy page: named hosts through nginx (vexor proxy)
 const PX_HOST = /^(?=.{1,253}$)(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
