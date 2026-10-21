@@ -164,7 +164,7 @@ Grafana gets an OpenSearch datasource and a **Wazuh alerts overview** dashboard 
 
 ## Console
 
-The web UI (`CONSOLE=true`, `https://PUBLIC_HOST:CONSOLE_PORT`). The README lists its pages.
+The web UI (`CONSOLE=true`, `https://PUBLIC_HOST:CONSOLE_PORT`). The README lists its pages. While `CONSOLE_PASSWORD` is still the generated one, every API call except sign-in returns 403 `password_change_required` until `POST /api/password` (`current`, `new`, `repeat`, header `X-Vexor-CSRF`) sets one the user chose; the console remembers that in `.state/console-password-set`. `vexor console password --generate` makes the next sign-in ask again.
 
 | Command | Description |
 |---|---|

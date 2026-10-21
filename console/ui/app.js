@@ -15,17 +15,21 @@ async function api(path, opts = {}) {
   });
   if (r.status === 401 && path !== "/api/login") { showLogin(); throw new Error("login required"); }
   const data = await r.json().catch(() => ({}));
+  if (r.status === 403 && data.code === "password_change_required") { showPasswordChange(); throw new Error("login required"); }
   return { status: r.status, data };
 }
 
 // ---------------------------------------------------------------- login
-function showLogin() { $("[data-app]").hidden = true; $("[data-login]").hidden = false; $("[name=password]").focus(); }
+function showLogin() { $("[data-app]").hidden = true; $("[data-pw]").hidden = true; $("[data-login]").hidden = false; $("[name=password]").focus(); }
+function showPasswordChange() { $("[data-app]").hidden = true; $("[data-login]").hidden = true; $("[data-pw]").hidden = false; $("[name=current]").focus(); }
 async function boot() {
   const { data } = await api("/api/session");
   if (!data.user) return showLogin();
   CSRF = data.csrf;
+  if (data.mustChange) return showPasswordChange();
   $("[data-whoami]").textContent = data.user;
   $("[data-login]").hidden = true;
+  $("[data-pw]").hidden = true;
   $("[data-app]").hidden = false;
   route();
 }
@@ -40,7 +44,22 @@ $("[data-login-form]").addEventListener("submit", async (e) => {
   e.target.reset();
   boot();
 });
-$("[data-logout]").addEventListener("click", async () => { await api("/api/logout", { body: {} }); location.hash = ""; showLogin(); });
+const logout = async () => { await api("/api/logout", { body: {} }); location.hash = ""; showLogin(); };
+$("[data-logout]").addEventListener("click", logout);
+$("[data-pw-logout]").addEventListener("click", logout);
+$("[data-pw-form]").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target));
+  const err = $("[data-pw-err]");
+  err.textContent = "";
+  if (f.new !== f.repeat) { err.textContent = "The two new passwords differ."; return; }
+  if (f.new.length < 12) { err.textContent = "Use at least 12 characters."; return; }
+  if (f.new === f.current) { err.textContent = "The new password must differ from the current one."; return; }
+  const { status, data } = await api("/api/password", { body: f }).catch(() => ({ status: 0, data: {} }));
+  if (status !== 200) { err.textContent = data.error || "The password was not changed."; return; }
+  e.target.reset();
+  boot();
+});
 
 // ---------------------------------------------------------------- confirm dialog
 function confirmDialog({ cmd, level, word, text }) {
@@ -149,10 +168,14 @@ function stateLine(c) {
 }
 
 // ---------------------------------------------------------------- views
+const fmtBytes = (b) => (b >= 1e12 ? (b / 1e12).toFixed(1) + " TB" : b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(0) + " MB" : b >= 1e3 ? (b / 1e3).toFixed(0) + " KB" : (b || 0) + " B");
 async function vOverview() {
   setTitle("Overview");
   loading("the stack");
-  const [{ data: s }, { data: cs }, { data: pend }] = await Promise.all([api("/api/state"), api("/api/containers"), api("/api/pending")]);
+  const [{ data: s }, { data: cs }, { data: pend }, { data: dk }] = await Promise.all([api("/api/state"), api("/api/containers"), api("/api/pending"), api("/api/disk")]);
+  const fss = dk.filesystems || [];
+  const worst = fss.reduce((a, f) => (!a || f.pct > a.pct ? f : a), null);
+  const level = (pct) => (pct >= 95 ? "bad" : pct >= 85 ? "warn" : "");
   STATE = s;
   const exp = s.services || [];
   const running = cs.filter((c) => c.state === "running").length;
@@ -168,9 +191,17 @@ async function vOverview() {
       <article class="card ${hl.fail > 0 ? "card--bad" : hl.warn > 0 ? "card--warn" : ""}"><h2>Last health check</h2>
         <p class="big">${hl.epoch ? `${hl.pass} passed · ${hl.warn} warn · ${hl.fail} failed` : "not run yet"}</p>
         <p class="muted">${hl.epoch ? new Date(hl.epoch * 1000).toLocaleString() : "the hourly timer runs it (vexor daemon install)"}</p></article>
-      <article class="card ${s.disk?.pct >= 85 ? "card--warn" : ""}"><h2>Disk</h2><p class="big">${esc(s.disk?.pct ?? "?")}% used</p><p class="muted">${esc(s.disk?.path || "")}</p></article>
+      <article class="card ${level(worst?.pct ?? s.disk?.pct ?? 0) ? "card--" + level(worst?.pct ?? s.disk?.pct ?? 0) : ""}"><h2>Disk</h2><p class="big">${esc(worst?.pct ?? s.disk?.pct ?? "?")}% used</p><p class="muted">${esc(worst ? worst.mount + " (fullest)" : s.disk?.path || "")}</p></article>
     </section>
     ${pend.keys?.length ? `<section class="pending"><p><b>${pend.keys.length} .env change${pend.keys.length > 1 ? "s" : ""} not applied yet:</b> <code>${esc(pend.keys.join(" "))}</code></p><div class="actions">${btn("Show plan", ["plan"])}${btn("Apply", ["config", "apply"], "btn--primary")}</div></section>` : ""}
+    <section class="block"><h2>Disk usage</h2>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Filesystem</th><th>Holds</th><th>Used / size</th><th>Free</th><th class="w-bar"><span class="vh">Usage</span></th><th>Used</th></tr></thead>
+        <tbody>${fss.map((f) => `<tr><td class="mono"><b>${esc(f.mount)}</b></td><td class="small">${esc((f.roles || []).join(", ") || "-")}</td>
+          <td class="num">${esc(fmtBytes(f.used))} / ${esc(fmtBytes(f.size))}</td><td class="num">${esc(fmtBytes(f.avail))}</td>
+          <td class="w-bar"><span class="bar ${level(f.pct) ? "bar--" + level(f.pct) : ""}"><i data-w="${Math.min(100, f.pct) / 100}"></i></span></td>
+          <td>${pill(f.pct + "%", level(f.pct) === "bad" ? "bad" : level(f.pct) === "warn" ? "warn" : "ok")}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">Disk usage is not available.</td></tr>'}</tbody></table></div>
+      <p class="muted small">Amber from 85%, red from 95%. Free space with <a href="#reset">Reset</a> (prune unused volumes or images).</p></section>
     <section class="block"><h2>Open</h2>
       <div class="links">${urls.map(([k, u]) => `<a class="linkcard" href="${esc(u)}" target="_blank" rel="noopener"><b>${esc(k)}</b><span>${esc(u)}</span></a>`).join("") || '<p class="muted">No web UIs enabled.</p>'}</div></section>
     ${(s.reminders || []).length ? `<section class="block"><h2>Reminders</h2><ul class="list">${s.reminders.map((r) => `<li><b>${esc(r.msg)}</b><code>${esc(r.cmd)}</code></li>`).join("")}</ul></section>` : ""}
@@ -178,6 +209,7 @@ async function vOverview() {
       ${btn("Status", ["status"])}${btn("Doctor", ["doctor"])}${btn("Doctor --fix", ["doctor", "--fix"], "btn--primary")}${btn("Start stack", ["start"])}${btn("Backup now", ["backup", "run"])}${btn("AI report", ["ai-context", "--print"])}
     </div></section>
     <section class="block"><h2>Services</h2><div class="svc-grid">${exp.map((x) => { const c = cs.find((y) => y.service === x); return `<a class="svc ${c?.state === "running" ? "" : "svc--down"}" href="#containers"><b>${esc(x)}</b>${c ? stateLine(c) : pill("missing", "bad")}</a>`; }).join("")}</div></section>`;
+  $$("[data-w]").forEach((i) => (i.style.transform = `scaleX(${i.dataset.w})`));
   bindRunButtons(view());
 }
 
@@ -372,6 +404,25 @@ async function vSettings() {
   bindRunButtons(view());
 }
 
+const RESETS = [
+  { title: "Uninstall, keep data", args: ["uninstall", "--keep-data", "--yes"],
+    what: "Stops and removes the Vexor containers and network. Volumes (alerts, agent keys, rules, workflows) and generated files are kept; images are not removed. Run vexor start to bring it back." },
+  { title: "Uninstall everything", args: ["uninstall", "--yes"],
+    what: "Stops and removes the containers and network, then removes the project volumes and generated files. All stored alerts and agent keys are lost. Images are not removed." },
+  { title: "Remove unused volumes", args: ["volumes", "prune", "--yes"],
+    what: "Deletes Vexor volumes that no container uses. Volumes in use are untouched." },
+  { title: "Remove unused images", args: ["images", "prune", "--yes"],
+    what: "Deletes Vexor image versions no container uses. Running containers and volumes are untouched." },
+];
+async function vReset() {
+  setTitle("Reset");
+  view().innerHTML = `
+    <p class="lede">Remove Vexor, or free disk space. Each action shows the command and asks you to type its name before it runs. Take a backup first (Volumes page).</p>
+    <div class="resets">${RESETS.map((r, i) => `<article class="reset"><h2>${esc(r.title)}</h2><p class="small">${esc(r.what)}</p><code class="mono small">vexor ${esc(r.args.join(" "))}</code>
+      <div class="actions"><button type="button" class="btn btn--sm btn--danger-ghost" data-reset="${i}">${esc(r.title)}…</button></div></article>`).join("")}</div>`;
+  $$("[data-reset]").forEach((b) => b.addEventListener("click", () => { const r = RESETS[+b.dataset.reset]; run(r.args, { text: r.what }); }));
+}
+
 const SUGGEST = ["status", "doctor", "doctor --fix", "wazuh alerts -n 20", "agents list", "elk", "elk indices", "n8n", "n8n test", "suricata", "suricata alerts --since 1h", "suricata test", "zeek", "zeek top hosts", "tools", "soc", "volumes ls", "backup list", "cert status", "logs errors --since 1h", "logs nginx -n 100", "retention show", "update check", "version", "reminders"];
 async function vTerminal() {
   setTitle("Terminal");
@@ -446,7 +497,7 @@ async function vLogins() {
 }
 
 // ---------------------------------------------------------------- router
-const ROUTES = { overview: vOverview, containers: vContainers, ports: vPorts, volumes: vVolumes, stacks: vStacks, health: vHealth, logins: vLogins, settings: vSettings, terminal: vTerminal, activity: vActivity };
+const ROUTES = { overview: vOverview, containers: vContainers, ports: vPorts, volumes: vVolumes, stacks: vStacks, health: vHealth, logins: vLogins, settings: vSettings, terminal: vTerminal, activity: vActivity, reset: vReset };
 let routing = false;
 async function route(soft = false) {
   if (routing) return;
