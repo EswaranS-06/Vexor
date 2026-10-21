@@ -695,7 +695,7 @@ class Server(http.server.ThreadingHTTPServer):
 
 def main():
     env = env_dict()
-    bind = env.get("CONSOLE_BIND", "0.0.0.0") or "0.0.0.0"
+    bind = env.get("CONSOLE_BIND") or env.get("BIND_IP") or "0.0.0.0"   # empty CONSOLE_BIND follows BIND_IP
     port = int(env.get("CONSOLE_PORT", "50443") or 50443)
     cert = env.get("PROXY_CERT") or "./config/wazuh_indexer_ssl_certs/wazuh.dashboard.pem"
     key = env.get("PROXY_KEY") or "./config/wazuh_indexer_ssl_certs/wazuh.dashboard-key.pem"

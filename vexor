@@ -171,7 +171,8 @@ ensure_env_defaults() {        # adds settings introduced by vexor to older .env
     [ "$added" = 0 ] && printf '\n# ---- Added by vexor (edit freely, then: vexor config apply) ----\n' >> "$ENV_FILE"
     printf '%s\n' "$line" >> "$ENV_FILE"; added=1
   done <<'EOF'
-PUBLIC_HOST=                   # IP or DNS name clients use for this server (empty = auto-detect)
+PUBLIC_HOST=                   # IP or DNS name clients use for this server (empty = detected each time vexor runs)
+BIND_IP=0.0.0.0                # address the published ports listen on; 0.0.0.0 = all interfaces
 CERT_EXTRA_SANS=               # extra names/IPs for the dashboard certificate, comma separated
 CERT_DAYS=397                  # dashboard cert validity in days (browsers reject more than 398)
 PROXY_CERT_MODE=default        # default | local | custom | letsencrypt  (managed by: vexor cert ...)
@@ -224,7 +225,7 @@ NOTIFY_URL=
 NOTIFY_REPEAT_HOURS=6          # re-send a problem that persists
 CONSOLE=true                   # Vexor Console web UI (vexor console enable|disable)
 CONSOLE_PORT=50443             # console port (50000-59999), HTTPS with the dashboard certificate
-CONSOLE_BIND=0.0.0.0           # address the console listens on
+CONSOLE_BIND=                  # address the console listens on (empty = BIND_IP)
 CONSOLE_USER=admin
 CONSOLE_PASSWORD=CHANGE_ME     # generated when the console starts (vexor console password)
 ELK_VERSION=9.5.4              # Elasticsearch / Logstash / Kibana version
@@ -246,8 +247,8 @@ EOF
 }
 
 # ============================================================== docker helpers
-dc()      { (cd "$ROOT" && docker compose "$@"); }
-dc_all()  { (cd "$ROOT" && COMPOSE_PROFILES=wazuh,elk,multi,w2,w3,ix3,n8n,grafana,portainer,suricata,zeek docker compose "$@"); }    # every service of both node types
+dc()      { (cd "$ROOT" && PUBLIC_HOST="$(public_host)" docker compose "$@"); }
+dc_all()  { (cd "$ROOT" && PUBLIC_HOST="$(public_host)" COMPOSE_PROFILES=wazuh,elk,multi,w2,w3,ix3,n8n,grafana,portainer,suricata,zeek docker compose "$@"); }    # every service of both node types
 project() { env_def COMPOSE_PROJECT_NAME wazuh; }
 dc_restart() {                 # restart services; MANAGERS ARE RECREATED instead:
   # the wazuh-manager image copies the mounted ossec.conf (/wazuh-config-mount) only when a container
@@ -349,10 +350,21 @@ primary_ip() {
   echo "${ip:-127.0.0.1}"
 }
 host_ips() {
-  ip -o -4 addr show scope global 2>/dev/null \
-    | awk '$2 !~ /^(docker|br-|veth|virbr|cni|flannel|cali|vxlan)/ {split($4,a,"/"); print a[1]}'
+  if command -v ip >/dev/null 2>&1; then
+    ip -o -4 addr show scope global 2>/dev/null \
+      | awk '$2 !~ /^(docker|br-|veth|virbr|cni|flannel|cali|vxlan)/ {split($4,a,"/"); print a[1]}'
+  else
+    hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+(\.[0-9]+){3}$' | grep -v '^127\.'
+  fi
+  return 0
 }
-public_host() { local h; h="$(env_get PUBLIC_HOST)"; echo "${h:-$(primary_ip)}"; }
+public_host() { local h; h="$(env_get PUBLIC_HOST)"; echo "${h:-$(primary_ip)}"; }   # empty PUBLIC_HOST = detected each run, never saved
+bind_ip() { env_def BIND_IP 0.0.0.0; }
+local_ip() {                   # local_ip [bind]: address vexor uses to reach its own published ports
+  local b="${1:-$(bind_ip)}"
+  case "$b" in 0.0.0.0|::|"[::]") echo 127.0.0.1 ;; *) echo "$b" ;; esac
+}
+host_has_ip() { [ "$1" = 127.0.0.1 ] || [ "$1" = "$(primary_ip)" ] || host_ips | has -xF "$1"; }
 port_listening() { ss -Hltn "( sport = :$1 )" 2>/dev/null | has .; }
 tcp_open() { timeout 3 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 host_published() {             # host_published <svc> <container-port>: the port is bound on the host
@@ -387,7 +399,7 @@ api_login() {
   local t
   t="$(curl -sk --connect-timeout 5 --max-time 20 -X POST \
         -u "$(env_def API_USERNAME wazuh-wui):$(env_get API_PASSWORD)" \
-        "https://127.0.0.1:$(api_port)/security/user/authenticate?raw=true" 2>/dev/null)" || return 1
+        "https://$(local_ip):$(api_port)/security/user/authenticate?raw=true" 2>/dev/null)" || return 1
   [[ "$t" == ey* ]] || return 1
   API_TOKEN="$t"
 }
@@ -395,9 +407,9 @@ api() {
   local m="$1" p="$2"; shift 2
   api_login || { echo '{"error":1,"message":"Wazuh API authentication failed"}'; return 1; }
   curl -sk --connect-timeout 5 --max-time 60 -X "$m" -H "Authorization: Bearer $API_TOKEN" \
-       -H 'Content-Type: application/json' "https://127.0.0.1:$(api_port)$p" "$@"
+       -H 'Content-Type: application/json' "https://$(local_ip):$(api_port)$p" "$@"
 }
-proxy_code() { curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "${1:-https}://127.0.0.1:$(env_def PROXY_PORT 8080)/" 2>/dev/null || true; }
+proxy_code() { curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "${1:-https}://$(local_ip):$(env_def PROXY_PORT 8080)/" 2>/dev/null || true; }
 pretty() { local out; out="$(cat)"; printf '%s' "$out" | python3 -I -m json.tool 2>/dev/null || printf '%s\n' "$out"; }
 
 ver_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
@@ -560,7 +572,6 @@ sync_profiles() {              # COMPOSE_PROFILES follows NODE_TYPE (applied) + 
 }
 migrate_layout() {             # idempotent upgrades of files written by older versions
   ensure_tools_compose; ensure_elk_compose
-  [ -n "$(env_get PUBLIC_HOST)" ] || env_set PUBLIC_HOST "$(primary_ip)"
   python3 -I - "$ROOT/docker-compose.yml" <<'PY'
 import re, sys
 p = sys.argv[1]; s = open(p).read(); o = s
@@ -592,6 +603,7 @@ if i >= 0:
     blk = re.sub(r"    depends_on:\n(?:      - .*\n)+", "", blk)
     s = s[:i] + blk + s[j:]
 s = s.replace('"${INDEXER_BIND:-127.0.0.1}:9200:9200"', '"${INDEXER_BIND:-127.0.0.1}:${INDEXER_HOST_PORT:-9200}:9200"')
+s = re.sub(r'(\n      - ")(\$\{(?:ENROLL|SYSLOG|API)_PORT:-)', r'\1${BIND_IP:-0.0.0.0}:\2', s)   # published ports listen on BIND_IP
 if s != o:
     open(p, "w").write(s)
 PY
@@ -620,8 +632,8 @@ override_content() {           # docker-compose.override.yml: layout + SOC + too
   echo "  nginx:"
   echo "    ports:"
   if soc_wazuh; then
-    echo '      - "${PROXY_PORT:-8080}:8080"'
-    echo '      - "${AGENT_PORT:-1514}:1514"'
+    echo '      - "${BIND_IP:-0.0.0.0}:${PROXY_PORT:-8080}:8080"'
+    echo '      - "${BIND_IP:-0.0.0.0}:${AGENT_PORT:-1514}:1514"'
   fi
   [ -n "$nports" ] && printf '%s\n' "$nports"      # SOC=elk always has Kibana here, so the list is never empty
   return 0
@@ -720,8 +732,8 @@ cmd_install() {
   hdr "2/9 Kernel (vm.max_map_count for the indexers)"; ensure_sysctl
   hdr "3/9 Settings"
   ensure_env_defaults
-  if [ -z "$(env_get PUBLIC_HOST)" ]; then env_set PUBLIC_HOST "$(primary_ip)"; fi
-  ok "PUBLIC_HOST = $(public_host)   (change in .env if clients use another IP/name)"
+  if [ -n "$(env_get PUBLIC_HOST)" ]; then ok "PUBLIC_HOST = $(public_host)   (from .env)"
+  else ok "PUBLIC_HOST = $(public_host)   (detected each time - set PUBLIC_HOST in .env if clients use another IP/name)"; fi
   fresh_install_layout
   ok "$(layout_desc)"
   hdr "4/9 Credentials"
@@ -1016,6 +1028,15 @@ cmd_doctor() {
   else
     d_fail "internal certificates missing: ${missing[*]}" "vexor cert internal-regen"
   fi
+  # ---- addresses: this machine may have moved or got a new IP since install
+  local eph bip ph cur; eph="$(env_get PUBLIC_HOST)"; bip="$(bind_ip)"; ph="$(public_host)"; cur="$(primary_ip)"
+  if [[ "$eph" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && ! host_has_ip "$eph"; then
+    d_warn "PUBLIC_HOST=$eph is not an address of this machine (moved, or a new IP? this machine: $cur)" \
+      "empty PUBLIC_HOST in .env to detect the address each time (keep it only for a NAT/public address), then: vexor cert create"
+  fi
+  if [ "$bip" != 0.0.0.0 ] && ! host_has_ip "$bip"; then
+    d_fail "BIND_IP=$bip is not an address of this machine - containers with published ports cannot start" "set BIND_IP=0.0.0.0 (all interfaces) in .env, then: vexor config apply"
+  fi
   local pc pdays mode; pc="$(proxy_cert_path)"; mode="$(cert_mode)"
   if [ -f "$pc" ]; then
     pdays="$(cert_days_left "$pc")"
@@ -1024,10 +1045,13 @@ cmd_doctor() {
     fi
     if [ "$mode" = default ]; then
       d_warn "dashboard uses the built-in self-signed cert (browser warning)" "vexor cert create   (then trust the CA: vexor cert export-ca)"
-    elif ! cert_sans "$pc" | has -iE "(IP Address|DNS):$(public_host)\$"; then
-      d_warn "dashboard cert does not cover PUBLIC_HOST=$(public_host) (browser name mismatch)" "vexor cert create   (or set PUBLIC_HOST in .env)"
+    elif ! cert_covers "$pc" "$ph"; then
+      if [ -n "$eph" ]; then d_warn "dashboard cert does not cover PUBLIC_HOST=$ph (browser name mismatch)" "vexor cert create   (or set PUBLIC_HOST in .env)"
+      else d_warn "this machine's address $ph (detected, PUBLIC_HOST is empty) is not in the dashboard certificate - the IP changed?" "vexor cert create   (or set PUBLIC_HOST in .env)"; fi
+    elif [ "$mode" = local ] && [ "$cur" != "$ph" ] && ! cert_covers "$pc" "$cur"; then
+      d_warn "dashboard cert covers $ph, but not this machine's current address $cur (the IP changed?)" "vexor cert create"
     else
-      d_pass "dashboard certificate ($mode) covers $(public_host), $pdays days left"
+      d_pass "dashboard certificate ($mode) covers $ph, $pdays days left"
     fi
   else
     d_fail "dashboard certificate file not found: $pc" "vexor cert create"
@@ -1210,7 +1234,7 @@ cmd_doctor() {
     dc exec -T nginx nginx -t -q >/dev/null 2>&1 && d_pass "nginx config valid" || d_fail "nginx config invalid" "vexor exec nginx nginx -t"
     local hc s; hc="$(proxy_code)"
     case "$hc" in
-      200|302) d_pass "https://127.0.0.1:$port -> dashboard (HTTP $hc)" ;;
+      200|302) d_pass "https://$(local_ip):$port -> dashboard (HTTP $hc)" ;;
       502|504) d_fail "nginx up, dashboard not answering (HTTP $hc)" "vexor logs dashboard"
                [ "$(svc_uptime_s wazuh.dashboard)" -ge 300 ] && d_fix "restart the dashboard" && dc_restart wazuh.dashboard >/dev/null ;;
       *)       d_fail "dashboard via nginx: HTTP ${hc:-000}" "vexor logs nginx dashboard" ;;
@@ -1225,10 +1249,10 @@ cmd_doctor() {
   fi
   hdr "Agent ports"
   local who; who="nginx -> $(is_single && echo 'master' || echo 'managers')"
-  if tcp_open 127.0.0.1 "$(env_def AGENT_PORT 1514)"; then d_pass "agent events port $(env_def AGENT_PORT 1514)/tcp open ($who)"
+  if tcp_open "$(local_ip)" "$(env_def AGENT_PORT 1514)"; then d_pass "agent events port $(env_def AGENT_PORT 1514)/tcp open ($who)"
   else d_fail "agent port $(env_def AGENT_PORT 1514) closed ($who) - agents cannot send events" "vexor doctor --fix   (recreates the container that must publish it)"
        d_fix "recreate nginx" && { prune_disabled_containers; dc up -d --no-deps --force-recreate nginx >/dev/null 2>&1; }; fi
-  tcp_open 127.0.0.1 "$(env_def ENROLL_PORT 1515)" && d_pass "enrollment port $(env_def ENROLL_PORT 1515)/tcp open" || d_fail "enrollment port $(env_def ENROLL_PORT 1515) closed" "vexor logs ossec master"
+  tcp_open "$(local_ip)" "$(env_def ENROLL_PORT 1515)" && d_pass "enrollment port $(env_def ENROLL_PORT 1515)/tcp open" || d_fail "enrollment port $(env_def ENROLL_PORT 1515) closed" "vexor logs ossec master"
   if command -v ufw >/dev/null && ufw status 2>/dev/null | has "Status: active"; then
     d_warn "ufw firewall active - make sure ports $port,$(env_def AGENT_PORT 1514),$(env_def ENROLL_PORT 1515)/tcp are allowed"
   fi
@@ -1240,7 +1264,7 @@ cmd_doctor() {
     hdr "Tools ($(enabled_tools | tr '\n' ' '))"
     local tl tc
     for tl in $(web_tools); do
-      tc="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://127.0.0.1:$(tool_port "$tl")/" 2>/dev/null)"
+      tc="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://$(local_ip):$(tool_port "$tl")/" 2>/dev/null)"
       case "$tc" in
         200|301|302|303|307|308|401) d_pass "$tl https://$(public_host):$(tool_port "$tl") (HTTP $tc)" ;;
         502|503|504) d_fail "$tl: nginx answers, $tl does not (HTTP $tc)" "vexor logs $tl   (first start can take 1-2 min)"
@@ -1435,6 +1459,7 @@ cmd_config() {
         *PORT|INDEX_RETENTION_DAYS|MANAGER_LOG_RETENTION_DAYS|SNAPSHOT_RETENTION_DAYS|DISK_WARN_PCT|CERT_DAYS|LOG_MAX_FILE|NGINX_WORKER_CONNECTIONS)
           [[ "$v" =~ ^[0-9]+$ ]] || die "$k must be a number" ;;
         INDEXER_HEAP) [[ "$v" =~ ^[0-9]+[mg]$ ]] || die "INDEXER_HEAP like 1g or 2048m" ;;
+        BIND_IP) [[ "$v" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || die "BIND_IP must be an IPv4 address (0.0.0.0 = all interfaces)" ;;
         BACKUP_TIME|MAINT_TIME) [[ "$v" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "$k must be HH:MM" ;;
       esac
       env_has "$k" || warn "$k is a new key"
@@ -1476,9 +1501,10 @@ cert_days_left() {
   [ -n "$end" ] && echo $(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
 }
 cert_sans() { openssl x509 -noout -ext subjectAltName -in "$1" 2>/dev/null | tail -n +2 | tr ',' '\n' | sed 's/^ *//'; }
+cert_covers() { cert_sans "$1" | has -ixF -e "IP Address:$2" -e "DNS:$2"; }   # cert_covers <cert> <name-or-ip>
 cert_fp() { openssl x509 -noout -fingerprint -sha256 -in "$1" 2>/dev/null | cut -d= -f2; }
 served_fp() {
-  echo | timeout 5 openssl s_client -connect "127.0.0.1:$(env_def PROXY_PORT 8080)" -servername "$(public_host)" 2>/dev/null \
+  echo | timeout 5 openssl s_client -connect "$(local_ip):$(env_def PROXY_PORT 8080)" -servername "$(public_host)" 2>/dev/null \
     | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2
 }
 proxy_cert_path() { local p; p="$(env_get PROXY_CERT)"; abspath "${p:-./config/wazuh_indexer_ssl_certs/wazuh.dashboard.pem}"; }
@@ -1572,7 +1598,7 @@ cmd_cert() {
           [ "$(served_fp)" = "$(cert_fp "$pc")" ] && ok "$(proxy_svc) serves this certificate on port $(env_def PROXY_PORT 8080)" \
             || warn "$(proxy_svc) serves a different certificate (fix: vexor doctor --fix, or vexor cert renew --force)"
         fi
-        cert_sans "$pc" | has -iE "(IP Address|DNS):$(public_host)\$" || warn "PUBLIC_HOST=$(public_host) is not in the certificate names"
+        cert_covers "$pc" "$(public_host)" || warn "PUBLIC_HOST=$(public_host)$([ -z "$(env_get PUBLIC_HOST)" ] && echo " (detected)") is not in the certificate names - vexor cert create"
         [ "$mode" = default ] && hint "self-signed for 'wazuh.dashboard': run vexor cert create to remove the browser warning"
       else
         bad "certificate file missing: $pc"
@@ -1603,7 +1629,7 @@ cmd_cert() {
       mkdir -p "$dir"; cp "$PROXY_CERT_DIR/ca.crt" "$PROXY_CERT_DIR/ca.cer" "$dir/"
       say "Download from another PC:  http://$(public_host):$port/ca.crt   (Windows: ca.cer)"
       say "Only the public CA certificate is served. Ctrl-C to stop."
-      python3 -I -m http.server "$port" --bind 0.0.0.0 --directory "$dir" ;;
+      python3 -I -m http.server "$port" --bind "$(bind_ip)" --directory "$dir" ;;
     import)
       local crt="${1:-}" key="${2:-}" chain="${3:-}"
       [ -f "$crt" ] && [ -f "$key" ] || die "usage: vexor cert import <cert.pem> <key.pem> [chain.pem]"
@@ -2278,8 +2304,8 @@ node_type_verify() {
   done
   if [ "${got:-0}" -ge "$want" ]; then ok "manager cluster: $got/$want node(s)"
   else warn "manager cluster: ${got:-0}/$want node(s) - workers may still be syncing (vexor cluster)"; fi
-  tcp_open 127.0.0.1 "$(env_def AGENT_PORT 1514)"  && ok "agent port $(env_def AGENT_PORT 1514)/tcp open"  || bad "agent port $(env_def AGENT_PORT 1514) closed - vexor doctor --fix"
-  tcp_open 127.0.0.1 "$(env_def ENROLL_PORT 1515)" && ok "enrollment port $(env_def ENROLL_PORT 1515)/tcp open" || bad "enrollment port closed - vexor logs ossec master"
+  tcp_open "$(local_ip)" "$(env_def AGENT_PORT 1514)"  && ok "agent port $(env_def AGENT_PORT 1514)/tcp open"  || bad "agent port $(env_def AGENT_PORT 1514) closed - vexor doctor --fix"
+  tcp_open "$(local_ip)" "$(env_def ENROLL_PORT 1515)" && ok "enrollment port $(env_def ENROLL_PORT 1515)/tcp open" || bad "enrollment port closed - vexor logs ossec master"
   [ "$(served_fp)" = "$(cert_fp "$(proxy_cert_path)")" ] && ok "port $(env_def PROXY_PORT 8080) serves the same dashboard certificate as before" \
     || warn "port $(env_def PROXY_PORT 8080) serves a different certificate - vexor doctor --fix"
   for svc in $(enabled_managers); do
@@ -2556,7 +2582,7 @@ tools_master_volumes() {
   { tool_on suricata || tool_on zeek; } && echo "      - ./config/tools/wazuh/vexor_tools_rules.xml:/var/ossec/etc/rules/vexor_tools_rules.xml:ro"
   return 0
 }
-tools_nginx_ports() { local t; for t in $(web_tools); do echo "      - \"$(tool_port "$t"):$(tool_port "$t")\""; done; return 0; }
+tools_nginx_ports() { local t; for t in $(web_tools); do echo "      - \"\${BIND_IP:-0.0.0.0}:$(tool_port "$t"):$(tool_port "$t")\""; done; return 0; }
 tool_server_block() {          # nginx https server for one web tool (resolved at request time, so nginx
   local t="$1"                 # still starts while the tool container is being created)
   sed -e "s|@NAME@|$t|g" -e "s|@PORT@|$(tool_port "$t")|g" -e "s|@UP@|$(tool_upstream "$t")|g" <<'EOF'
@@ -2924,7 +2950,7 @@ es_curl() {                    # es_curl <METHOD> <path> [curl args]  - as the e
        "http://127.0.0.1:$(es_port)$p" "$@"
 }
 es_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 -u "elastic:$(env_get ELASTIC_PASSWORD)" "http://127.0.0.1:$(es_port)${1:-/}" 2>/dev/null || true; }
-kibana_code() { curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://127.0.0.1:$(env_def KIBANA_PORT 55601)${1:-/api/status}" 2>/dev/null || true; }
+kibana_code() { curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://$(local_ip):$(env_def KIBANA_PORT 55601)${1:-/api/status}" 2>/dev/null || true; }
 ensure_elk_compose() {         # docker-compose.elk.yml is generated by vexor (listed in COMPOSE_FILE)
   local tmp="${RUN_TMP:-/tmp}/elk.compose.yml"
   cat > "$tmp" <<'EOF'
@@ -2997,7 +3023,7 @@ services:
       VEXOR_N8N_URL: ${N8N_HOOK_URL:-}
       VEXOR_N8N_TOKEN: ${N8N_HOOK_TOKEN:-}
     ports:
-      - "${LOGSTASH_BEATS_PORT:-55044}:5044"
+      - "${BIND_IP:-0.0.0.0}:${LOGSTASH_BEATS_PORT:-55044}:5044"
     volumes:
       - ./config/elk/logstash/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
       - ./config/elk/logstash/pipeline:/usr/share/logstash/pipeline:ro
@@ -3160,7 +3186,7 @@ elk_retention_apply() {        # ILM delete after ELK_RETENTION_DAYS + template:
   return 0
 }
 elk_data_views() {             # Kibana data views for every vexor index family
-  local id title name base; base="https://127.0.0.1:$(env_def KIBANA_PORT 55601)"
+  local id title name base; base="https://$(local_ip):$(env_def KIBANA_PORT 55601)"
   for x in "vexor-wazuh-alerts|vexor-wazuh-alerts-*|Vexor - Wazuh alerts" "vexor-suricata|vexor-suricata-*|Vexor - Suricata" \
            "vexor-zeek|vexor-zeek-*|Vexor - Zeek" "vexor-beats|vexor-beats-*|Vexor - Beats / Elastic Agent"; do
     IFS='|' read -r id title name <<<"$x"
@@ -3226,7 +3252,7 @@ elk_doctor() {                 # ELK checks + predictable repairs
     *) d_fail "nothing answers on Kibana port $(env_def KIBANA_PORT 55601) (HTTP ${c:-000})" "vexor doctor --fix"
        d_fix "render nginx + recreate it" && { render_override; render_nginx; dc up -d --no-deps --force-recreate nginx >/dev/null 2>&1; } ;;
   esac
-  [ "$c" = 200 ] && [ "$(curl -sk -o /dev/null -w '%{http_code}' -u "elastic:$(env_get ELASTIC_PASSWORD)" "https://127.0.0.1:$(env_def KIBANA_PORT 55601)/api/data_views/data_view/vexor-wazuh-alerts")" != 200 ] \
+  [ "$c" = 200 ] && [ "$(curl -sk -o /dev/null -w '%{http_code}' -u "elastic:$(env_get ELASTIC_PASSWORD)" "https://$(local_ip):$(env_def KIBANA_PORT 55601)/api/data_views/data_view/vexor-wazuh-alerts")" != 200 ] \
     && { d_warn "Kibana data views missing" "vexor doctor --fix"; d_fix "create the Kibana data views" && elk_data_views >/dev/null; }
   if is_running logstash; then
     local ps; ps="$(dc exec -T logstash curl -s localhost:9600/_node/stats/pipelines 2>/dev/null | pj '
@@ -3239,7 +3265,10 @@ print("none" if p is None else "%s in / %s out" % (p["events"]["in"], p["events"
   fi
   if logstash_tls_on; then
     local ld; ld="$(cert_days_left "$LS_CERT_DIR/logstash.crt" 2>/dev/null)"
-    if [ -n "$ld" ] && [ "$ld" -gt 30 ]; then d_pass "Beats input uses TLS (certificate valid $ld days)"
+    if [ -n "$ld" ] && [ "$ld" -gt 30 ] && [ "$(cat "$LS_CERT_DIR/sans" 2>/dev/null)" != "$(logstash_sans)" ]; then
+      d_warn "Beats TLS certificate does not match this machine's addresses ($(public_host)) - the IP changed?" "vexor doctor --fix"
+      d_fix "re-issue the Logstash certificate" && { logstash_certs && write_logstash_config && dc restart logstash >/dev/null 2>&1; }
+    elif [ -n "$ld" ] && [ "$ld" -gt 30 ]; then d_pass "Beats input uses TLS (certificate valid $ld days)"
     else d_warn "Beats TLS certificate missing or expiring (${ld:-none})" "vexor doctor --fix"
          d_fix "re-issue the Logstash certificate" && { logstash_certs && write_logstash_config; }; fi
   else
@@ -3694,7 +3723,7 @@ n8n_probe() {                  # webhook state seen from the managers' network: 
     *) echo registered ;;
   esac
 }
-n8n_owner_set() { [ "$(curl -sk --max-time 8 "https://127.0.0.1:$(tool_port n8n)/rest/settings" 2>/dev/null | pj 'print(d["data"]["userManagement"]["showSetupOnFirstLoad"])' 2>/dev/null)" = False ]; }
+n8n_owner_set() { [ "$(curl -sk --max-time 8 "https://$(local_ip):$(tool_port n8n)/rest/settings" 2>/dev/null | pj 'print(d["data"]["userManagement"]["showSetupOnFirstLoad"])' 2>/dev/null)" = False ]; }
 n8n_apply() {                  # after connect/disconnect/level change: configs, script, reload what reads them
   if soc_wazuh; then
     local ch restart; ch="$(n8n_sync_blocks)"
@@ -3916,7 +3945,7 @@ n8n_workflow_import() {
   dc exec -T n8n n8n publish:workflow --id=vexorSocAlerts01 >"$RUN_TMP/n8n-publish" 2>&1 \
     || { tail -n 5 "$RUN_TMP/n8n-publish"; warn "imported, but publishing failed - open it in n8n and click Publish"; }
   dc restart n8n >/dev/null 2>&1        # a running n8n only picks up CLI changes after a restart
-  local i; for i in $(seq 1 30); do [ "$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:$(tool_port n8n)/healthz")" = 200 ] && break; sleep 2; done
+  local i; for i in $(seq 1 30); do [ "$(curl -sk -o /dev/null -w '%{http_code}' "https://$(local_ip):$(tool_port n8n)/healthz")" = 200 ] && break; sleep 2; done
   ok "workflow 'Vexor - SOC alerts' imported and published (webhook path: $(n8n_workflow_path))"
   n8n_owner_set || warn "n8n has no owner account yet: open https://$(public_host):$(tool_port n8n) now - the first visitor becomes the owner"
   say "file: $TOOLS_DIR/n8n/vexor-soc-alerts.workflow.json  (re-import after editing it, or edit the workflow in n8n)"
@@ -3944,7 +3973,7 @@ print(",".join(str(p["id"]) for p in d["data"]["affected_items"] if p["name"] in
     ro="$(api GET "/security/roles?limit=500" | pj 'print(next((r["id"] for r in d["data"]["affected_items"] if r["name"] == "readonly"), ""))')"
     api POST "/security/users/$uid/roles?role_ids=${ro:+$ro,}$rid" >/dev/null
     env_set WAZUH_N8N_USER "$user"; env_set WAZUH_N8N_PASSWORD "$pw"; chmod 600 "$ENV_FILE"
-    local c; c="$(curl -sk -o /dev/null -w '%{http_code}' -X POST -u "$user:$pw" "https://127.0.0.1:$(api_port)/security/user/authenticate?raw=true")"
+    local c; c="$(curl -sk -o /dev/null -w '%{http_code}' -X POST -u "$user:$pw" "https://$(local_ip):$(api_port)/security/user/authenticate?raw=true")"
     [ "$c" = 200 ] || die "Wazuh API user created but its login fails (HTTP $c)"
     hdr "n8n credential: Wazuh API (agents, active response, syscheck)"
     say "1. HTTP Request node -> POST https://wazuh.master:55000/security/user/authenticate?raw=true"
@@ -5048,12 +5077,12 @@ notify_send() {                # notify_send <fail|warn|ok|info> <title> <body> 
   local url; url="$(notify_target)"; [ -n "$url" ] || return 1
   local n8n_url=""
   if [ "$url" = n8n ]; then  # the managers' internal n8n address is not reachable from the host: go through nginx
-    n8n_url="$(n8n_hook | sed -E -e "s#^https?://n8n:5678#https://127.0.0.1:$(tool_port n8n)#" \
-                                 -e "s#^https://($(public_host)|localhost):$(tool_port n8n)/#https://127.0.0.1:$(tool_port n8n)/#")"
+    n8n_url="$(n8n_hook | sed -E -e "s#^https?://n8n:5678#https://$(local_ip):$(tool_port n8n)#" \
+                                 -e "s#^https://($(public_host)|localhost):$(tool_port n8n)/#https://$(local_ip):$(tool_port n8n)/#")"
   fi
-  python3 -I - "$url" "$1" "$2" "$3" "$(hostname)" "$(public_host)" "$(env_get N8N_HOOK_TOKEN)" "$n8n_url" "$(env_def NOTIFY_FORMAT auto)" "$STATE_DIR/notify.err" <<'PY'
+  python3 -I - "$url" "$1" "$2" "$3" "$(hostname)" "$(public_host)" "$(env_get N8N_HOOK_TOKEN)" "$n8n_url" "$(env_def NOTIFY_FORMAT auto)" "$STATE_DIR/notify.err" "$(local_ip)" <<'PY'
 import json, ssl, sys, time, urllib.request
-url, level, title, body, host, pub, token, n8n_url, fmt, errf = sys.argv[1:11]
+url, level, title, body, host, pub, token, n8n_url, fmt, errf, own = sys.argv[1:12]
 headers = {"Content-Type": "application/json", "User-Agent": "vexor-notify"}
 ctx = None
 if url == "n8n":
@@ -5063,7 +5092,7 @@ if url == "n8n":
                "rule": {"level": lvl, "id": "vexor-health", "description": title, "groups": ["vexor", "health"]},
                "agent": {"id": "000", "name": host}, "manager": {"name": host}, "full_log": body, "location": "vexor"}
     headers.update({"X-Vexor-Token": token, "X-Vexor-Source": "vexor-health"})
-    if "127.0.0.1" in url:
+    if url.startswith("https://%s:" % own):
         ctx = ssl._create_unverified_context()   # our own nginx, self-signed by default
 else:
     icon = {"fail": "🔴", "warn": "🟠", "ok": "🟢", "info": "🔵"}.get(level, "")
@@ -5319,9 +5348,10 @@ PY
 # dashboard certificate. Every action in the UI is a `vexor` command from an allowlist (see console/server.py).
 console_on() { [[ "$(env_def CONSOLE true)" =~ ^(true|yes|on|1)$ ]]; }
 console_port() { env_def CONSOLE_PORT 50443; }
+console_bind() { env_def CONSOLE_BIND "$(bind_ip)"; }     # empty CONSOLE_BIND follows BIND_IP
 console_url() { echo "https://$(public_host):$(console_port)"; }
 console_fingerprint() {        # restart the console only when something it reads at start changed
-  { cat "$ROOT/console/server.py" 2>/dev/null; echo "$(console_port) $(env_def CONSOLE_BIND 0.0.0.0) $(env_get PROXY_CERT) $(env_get PROXY_KEY)";
+  { cat "$ROOT/console/server.py" 2>/dev/null; echo "$(console_port) $(console_bind) $(env_get PROXY_CERT) $(env_get PROXY_KEY)";
     stat -c %Y "$ROOT/$(env_def PROXY_CERT ./config/wazuh_indexer_ssl_certs/wazuh.dashboard.pem)" 2>/dev/null; } | md5sum | cut -d' ' -f1
 }
 console_unit() {
@@ -5376,7 +5406,7 @@ console_sync() {               # make the service match CONSOLE in .env (called 
   fi
   return 0
 }
-console_answers() { [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 4 "https://127.0.0.1:$(console_port)/api/session" 2>/dev/null)" = 200 ]; }
+console_answers() { [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 4 "https://$(local_ip "$(console_bind)"):$(console_port)/api/session" 2>/dev/null)" = 200 ]; }
 cmd_console() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
