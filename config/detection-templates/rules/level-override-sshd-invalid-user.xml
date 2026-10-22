@@ -1,0 +1,19 @@
+<!-- vexor-template: id=level-override-sshd-invalid-user; title=Change the level of a built-in rule; description=Lower or raise the alert level of sshd invalid user logins (built-in rule 5710) without editing built-in files -->
+<!-- Wazuh ruleset. Change the IDs if you use several templates: custom IDs are 100100-100199. -->
+<!--
+  A child rule (if_sid) matches the same events as the built-in rule and its
+  own level is used for the alert. Set level 0 to drop the alert, or 1-15.
+  The built-in file is not touched, so Wazuh updates keep working.
+
+  overwrite="yes" is a different mechanism. It replaces a built-in rule that
+  has the same ID, so it changes the built-in rule itself. Only use it when
+  you must. Copy the whole match of that rule from its built-in file first,
+  because overwrite replaces all of it, then change the level. Form:
+  <rule id="5710" level="3" overwrite="yes"> ... full copied match ... </rule>
+-->
+<group name="vexor,sshd,">
+  <rule id="100100" level="3">
+    <if_sid>5710</if_sid>
+    <description>sshd: invalid user login (level set by Vexor)</description>
+  </rule>
+</group>

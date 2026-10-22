@@ -1,0 +1,24 @@
+<!-- vexor-template: id=syslog-app-parent-child; title=Syslog app with parent and child decoders; description=A parent decoder matches the program name, child decoders pull the user and source IP from the message -->
+<!--
+  The parent matches the syslog program name (myapp). Each child is tried only
+  for lines the parent accepted. A child's prematch is the start of the message
+  after the program name. Change myapp and the text to your app's messages.
+  order names the regex captures in order: dstuser is the account, srcip the source.
+-->
+<decoder name="vexor-myapp">
+  <program_name>^myapp$</program_name>
+</decoder>
+
+<decoder name="vexor-myapp-login-failed">
+  <parent>vexor-myapp</parent>
+  <prematch>^login failed for</prematch>
+  <regex>^login failed for (\S+) from (\S+)</regex>
+  <order>dstuser,srcip</order>
+</decoder>
+
+<decoder name="vexor-myapp-login-ok">
+  <parent>vexor-myapp</parent>
+  <prematch>^login ok for</prematch>
+  <regex>^login ok for (\S+) from (\S+)</regex>
+  <order>dstuser,srcip</order>
+</decoder>

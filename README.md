@@ -24,7 +24,7 @@ You choose what runs in `.env`, and `vexor` wires everything together: certifica
 3. [Quick start](#quick-start)
 4. [Choosing what runs](#choosing-what-runs)
 5. [How the pieces connect](#how-the-pieces-connect)
-6. [The components](#the-components): [Wazuh](#wazuh) · [ELK](#elk) · [n8n](#n8n) · [Suricata](#suricata) · [Zeek](#zeek) · [Grafana and Portainer](#grafana-and-portainer) · [Proxy routes](#proxy-routes) · [Vexor Console](#vexor-console)
+6. [The components](#the-components): [Wazuh](#wazuh) · [Detection](#detection-rules-decoders-lists-integrations-manager-config) · [ELK](#elk) · [n8n](#n8n) · [Suricata](#suricata) · [Zeek](#zeek) · [Grafana and Portainer](#grafana-and-portainer) · [Proxy routes](#proxy-routes) · [Vexor Console](#vexor-console)
 7. [Change management](#change-management)
 8. [Data, retention and backups](#data-retention-and-backups)
 9. [Self-healing and troubleshooting](#self-healing-and-troubleshooting)
@@ -170,6 +170,25 @@ vexor agents list                # agents, status, node, version
 vexor node-type multi            # grow to master + workers + 3 indexers
 ```
 
+### Detection (rules, decoders, lists, integrations, manager config)
+
+Detection controls what the Wazuh managers do with logs: custom rules, decoders and CDB lists, the integrations that send alerts out, and a few manager settings. Use the Detection page in the console, or `vexor wazuh` in a shell.
+
+Your files live in `config/wazuh_custom/` (`rules/`, `decoders/`, `lists/`). They are backed up with the rest of `config/`, and the master gets them on every apply. Vexor's own rule file and Wazuh's built-in files are listed but cannot be changed.
+
+Every save is checked by Wazuh before it stays. If the check fails, the previous version comes back on the host and in the managers, and the error lines are printed. Vexor keeps the last 20 versions of each file, and History restores one.
+
+`config/detection-templates/` has starting points: rules for level changes, brute force, list lookups, Windows event IDs and Suricata escalation, and decoders for JSON, syslog, key=value and web access logs. Start from one with "New from template" or `vexor wazuh rules templates`. The Test tab (or `vexor wazuh logtest`) shows which decoder and rule match a line, so check a change there before you rely on it.
+
+Integrations cover Slack, PagerDuty, VirusTotal, Shuffle, Maltiverse and your own. API keys are never shown again. The n8n forwarding stays under [Stacks](#vexor-console).
+
+```bash
+vexor wazuh rules ls                          # custom, Vexor and built-in rule files
+vexor wazuh rules put my-rules --from my-rules.xml
+vexor wazuh logtest 'myapp: login failed for alice from 192.0.2.10' --format syslog
+vexor wazuh integrations add slack --hook-url https://hooks.example.com/... --level 10
+```
+
 ### ELK
 
 `vexor soc both` (or `elk`) does the following:
@@ -272,6 +291,7 @@ A web UI for the whole stack at `https://<host>:CONSOLE_PORT` (50443), on by def
 | **Stack** | |
 | Containers | State, CPU, memory, ports, image; start, restart or stop all; a ⋯ menu per row (logs, follow, restart, stop or start, show on map); tick rows for bulk start, stop, restart or logs in one command |
 | Stacks | Per stack: status, tests, alerts, n8n connect, Zeek logs, enable or disable tools, switch SOC, node type, workers; certificates, retention, the daemon, update check |
+| Detection | Wazuh rules, decoders and lists: editor, templates, history and restore; integrations; manager settings; Test: one log line through the decoders and rules |
 | Storage | Disk usage per drive (amber from 85%, red from 95%); every volume with its size and users; full backup, back up one or all volumes, list backups; **Free space**: show unused volumes, remove unused volumes, remove unused images |
 | **Access** | |
 | Proxy | Proxy routes (`vexor proxy`): open a service under its own name like `soc.example.com`; add, edit, remove, issue or renew certificates, download the local CA and route certificates, DNS and trust help |
@@ -445,6 +465,7 @@ Vexor/
 ├── config/
 │   ├── certs.yml                 # nodes the internal certificates are issued for
 │   ├── wazuh_cluster/            # ossec.conf for the master and each worker
+│   ├── detection-templates/      # rule, decoder and list templates for the Detection page
 │   ├── wazuh_indexer/            # opensearch.yml per node + internal users
 │   ├── wazuh_dashboard/          # dashboard config + Wazuh API connection
 │   └── nginx/nginx.conf.tpl      # the template nginx.conf is rendered from
@@ -455,7 +476,7 @@ Vexor/
 └── README.md · VEXOR.md · LICENSE
 ```
 
-Created at run time and ignored by git: `.env`, `.state/`, `backups/`, `reports/`, `tools-data/`, certificates, `config/tools/` (n8n workflow file, integration script, Grafana provisioning, Zeek script, tool rules), `config/elk/`, `docker-compose.override.yml` and `nginx.conf`.
+Created at run time and ignored by git: `.env`, `.state/`, `backups/`, `reports/`, `tools-data/`, certificates, `config/tools/` (n8n workflow file, integration script, Grafana provisioning, Zeek script, tool rules), `config/elk/`, `config/wazuh_custom/` (Detection files), `docker-compose.override.yml` and `nginx.conf`.
 
 ---
 

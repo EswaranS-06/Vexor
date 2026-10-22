@@ -80,8 +80,23 @@ Available when `SOC` is `wazuh` or `both`.
 |---|---|
 | `wazuh [status]` | Indexer cluster health, nodes, disk, Wazuh indices, shards, manager cluster, master daemons, API version. |
 | `wazuh alerts [-n N] [--level N] [--grep TEXT]` | Newest alerts from every manager, merged and sorted, in local time. |
-| `wazuh logtest` | Interactive `wazuh-logtest` on the master: paste a log line and see which decoder and rule match. |
-| `wazuh rules` | Rule files on the master and the number of rules in each. |
+| `wazuh logtest "<log line>" [--format syslog\|json\|...] [--location L] [--json]` | Run one line through the master's decoders and rules: the decoder, the fields, and the rule that matches (or none). Without a line, the interactive `wazuh-logtest`. |
+| `wazuh rules ls [--json]` | Rule files: custom ones, `vexor_tools_rules.xml` and Wazuh's built-in files (read-only), with rule count, ID range and source. |
+| `wazuh rules show <name>` | Print a rule file. |
+| `wazuh rules put <name> --from <path\|->` | Save a rule file from a path or stdin. Wazuh checks it before it stays; a failed check restores the previous version and exits non-zero. |
+| `wazuh rules rm <name>` | Delete a custom rule file. |
+| `wazuh rules history <name> [--json]` / `wazuh rules restore <name> <id>` | The last 20 versions of a file / put one back. |
+| `wazuh rules templates [--json]` | Templates in `config/detection-templates/rules/`. |
+| `wazuh decoders ls \| show \| put \| rm \| history \| restore \| templates` | The same for decoder files; templates from `config/detection-templates/decoders/`. |
+| `wazuh lists ls \| show \| put \| rm \| history \| restore` | The same for CDB lists in `config/wazuh_custom/lists/`. |
+| `wazuh lists add <name> <key>[:<value>]` / `wazuh lists del <name> <key>` | Add or remove one entry without editing the file. |
+| `wazuh integrations ls [--json]` | Integrations in the manager config: hook URL, whether an API key is set (the key is never shown), level, group, rule IDs, format. The n8n block is read-only here. |
+| `wazuh integrations add <name> [--hook-url URL] [--api-key K] [--level N] [--group G] [--rule-id IDS] [--format json]` | Add `slack`, `pagerduty`, `virustotal`, `shuffle`, `maltiverse` or `custom-<id>`. Written to the master and every worker. |
+| `wazuh integrations edit <name> [same options]` / `wazuh integrations rm <name>` / `wazuh integrations test <name>` | Change or remove one / send a sample alert through it. |
+| `wazuh config ls [--json]` | Curated manager settings (alert log level, email, logall, syscheck, localfile, active response, enrollment password) with their scope (`all` or `master`). |
+| `wazuh config set <key> <value>` | Change one of them. |
+| `wazuh config custom show` / `wazuh config custom put --from <path\|-> [--scope master\|all]` | The raw XML block between the `vexor:custom` markers. Vexor's own blocks are never touched. |
+| `wazuh detection status --json` | Counts of rules, decoders and lists, the last change and the last error. The Detection page header shows the same. |
 | `agents list \| summary \| outdated` | Agents with status, node, version and OS / counts by status / agents older than the manager. |
 | `agents enroll-cmd [linux\|rpm\|windows\|macos] [--name N] [--group G]` | Copy-paste install commands, including the enrollment password and non-default ports. |
 | `agents remove <id[,id..]>` | Remove agents. |
@@ -374,6 +389,8 @@ Problems reported with a hint only include:
 | `.env` | Settings and secrets (`chmod 600`) |
 | `docker-compose.override.yml` | Generated: nginx ports, single-indexer URL, sensor mounts, proxy route ports and mounts |
 | `config/nginx/routes.json` | Proxy routes (`vexor proxy`); `routes-certs/` holds their certificates, `acme/` the Let's Encrypt challenge files. Saved by `backup` with the rest of `config/` |
+| `config/wazuh_custom/` | Detection files you save: `rules/`, `decoders/`, `lists/`. Git-ignored, backed up with `config/`, pushed to the managers on every save and apply. Versions in `.state/detection-history/`. |
+| `config/detection-templates/` | Templates for the Detection page and `wazuh rules\|decoders templates` (rules, decoders, a sample list). Tracked in git. |
 | `config/tools/` | Generated: `wazuh/custom-n8n.py` and the tool rules, `n8n/vexor-soc-alerts.workflow.json`, Grafana provisioning, the Zeek script, the Portainer password file |
 | `config/elk/` | Generated: Logstash settings and pipeline (follows `SOC`, sensors and the n8n link) |
 | `tools-data/` | Suricata and Zeek logs |

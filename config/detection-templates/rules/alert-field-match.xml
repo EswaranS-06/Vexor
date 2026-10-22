@@ -1,0 +1,18 @@
+<!-- vexor-template: id=alert-field-match; title=Alert on a field value; description=Alert when a decoded field matches a regex, for example a PAM session opened for root -->
+<!-- Wazuh ruleset. Change the IDs if you use several templates: custom IDs are 100100-100199. -->
+<!--
+  if_sid is the parent rule. 5501 is "Login session opened" from PAM. Change it
+  to any rule whose events carry the field you want to match.
+  Field names are relative to data (dstuser means data.dstuser).
+  type="pcre2" makes the value a Perl-style regex. ^root$ matches only root.
+-->
+<group name="vexor,authentication,">
+  <rule id="100110" level="10">
+    <if_sid>5501</if_sid>
+    <field name="dstuser" type="pcre2">^root$</field>
+    <description>Root login session opened from $(srcip)</description>
+    <mitre>
+      <id>T1078</id>
+    </mitre>
+  </rule>
+</group>
