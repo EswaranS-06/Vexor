@@ -81,7 +81,7 @@ Available when `SOC` is `wazuh` or `both`.
 | `wazuh [status]` | Indexer cluster health, nodes, disk, Wazuh indices, shards, manager cluster, master daemons, API version. |
 | `wazuh alerts [-n N] [--level N] [--grep TEXT]` | Newest alerts from every manager, merged and sorted, in local time. |
 | `wazuh logtest "<log line>" [--format syslog\|json\|...] [--location L] [--json]` | Run one line through the master's decoders and rules: the decoder, the fields, and the rule that matches (or none). Without a line, the interactive `wazuh-logtest`. |
-| `wazuh rules ls [--json]` | Rule files: custom ones, `vexor_tools_rules.xml` and Wazuh's built-in files (read-only), with rule count, ID range and source. |
+| `wazuh rules ls [--json]` | Rule files: custom ones, `vexor_tools_rules.xml` and Wazuh's built-in files, with rule count, ID range and source. |
 | `wazuh rules show <name>` | Print a rule file. |
 | `wazuh rules put <name> --from <path\|->` | Save a rule file from a path or stdin. Wazuh checks it before it stays; a failed check restores the previous version and exits non-zero. |
 | `wazuh rules rm <name>` | Delete a custom rule file. |
@@ -90,6 +90,7 @@ Available when `SOC` is `wazuh` or `both`.
 | `wazuh decoders ls \| show \| put \| rm \| history \| restore \| templates` | The same for decoder files; templates from `config/detection-templates/decoders/`. |
 | `wazuh lists ls \| show \| put \| rm \| history \| restore` | The same for CDB lists in `config/wazuh_custom/lists/`. |
 | `wazuh lists add <name> <key>[:<value>]` / `wazuh lists del <name> <key>` | Add or remove one entry without editing the file. |
+| `wazuh rules\|decoders\|lists reset <name>` | Restore a built-in file to the shipped version and delete its override. Built-in files are edited like custom ones: the first save stores an override under `config/wazuh_custom/<kind>/<name>`. A manager may need a restart to load an overridden built-in rule or decoder file. The Detection page's "Reset to original" does the same. |
 | `wazuh integrations ls [--json]` | Integrations in the manager config: hook URL, whether an API key is set (the key is never shown), level, group, rule IDs, format. The n8n block is listed too (`custom-n8n`). |
 | `wazuh integrations add <name> [--hook-url URL] [--api-key K \| --api-key-file F] [--level N] [--group G] [--rule-id IDS] [--format json]` | Add `slack`, `pagerduty`, `virustotal`, `shuffle`, `maltiverse` or `custom-<id>`. Written to the master and every worker, then the managers are recreated. A `custom-<id>` needs its script in `/var/ossec/integrations/` first. `--api-key-file` keeps the key out of the process list. |
 | `wazuh integrations edit <name> [same options]` / `wazuh integrations rm <name>` / `wazuh integrations test <name>` | Change or remove one / send a sample alert through it. |
@@ -188,6 +189,8 @@ Grafana gets an OpenSearch datasource and a **Wazuh alerts overview** dashboard 
 ## Console
 
 The web UI (`CONSOLE=true`, `https://PUBLIC_HOST:CONSOLE_PORT`). The README lists its nine pages (Monitor: Overview, Map · Stack: Containers, Stacks, Storage · Access: Proxy, Logins · System: Settings, Terminal); each action is on one page only. Older addresses open the page that took them over, at the matching section: `#health` → Overview, `#ports` and `#reset` → Settings, `#volumes` → Storage, `#activity` → Terminal. While `CONSOLE_PASSWORD` is still the generated one, every API call except sign-in returns 403 `password_change_required` until `POST /api/password` (`current`, `new`, `repeat`, header `X-Vexor-CSRF`) sets one the user chose; the console remembers that in `.state/console-password-set`. `vexor console password --generate` makes the next sign-in ask again.
+
+On Detection > Integrations, the cards view has an **Edit as code** button that switches to the XML editor for the same integrations as `wazuh integrations raw`. **Save** checks the XML with Wazuh, and a failing change is rolled back. **Back to cards** returns to the cards.
 
 The slow reads (`json state`, `docker compose ps`, `docker stats` of the project's containers, `disk --json`, `json volumes`, `proxy ls`) are cached: a request gets the last value at once while one background refresh per key runs, and a warmer keeps what a browser reads fresh. A command that changes something makes the next read wait for new data; `?fresh=1` (the Refresh button) does the same. JSON is gzip-compressed for clients that accept it, and the UI files are revalidated with ETag (304 when unchanged).
 
@@ -391,7 +394,7 @@ Problems reported with a hint only include:
 | `.env` | Settings and secrets (`chmod 600`) |
 | `docker-compose.override.yml` | Generated: nginx ports, single-indexer URL, sensor mounts, proxy route ports and mounts |
 | `config/nginx/routes.json` | Proxy routes (`vexor proxy`); `routes-certs/` holds their certificates, `acme/` the Let's Encrypt challenge files. Saved by `backup` with the rest of `config/` |
-| `config/wazuh_custom/` | Detection files you save: `rules/`, `decoders/`, `lists/`. Git-ignored, backed up with `config/`, pushed to the managers on every save and apply. Versions in `.state/detection-history/`. |
+| `config/wazuh_custom/` | Detection files you save, including overrides of built-in files: `rules/`, `decoders/`, `lists/`. Git-ignored, backed up with `config/`, pushed to the managers on every save and apply. Versions in `.state/detection-history/`. |
 | `config/detection-templates/` | Templates for the Detection page and `wazuh rules\|decoders templates` (rules, decoders, a sample list). Tracked in git. |
 | `config/tools/` | Generated: `wazuh/custom-n8n.py` and the tool rules, `n8n/vexor-soc-alerts.workflow.json`, Grafana provisioning, the Zeek script, the Portainer password file |
 | `config/elk/` | Generated: Logstash settings and pipeline (follows `SOC`, sensors and the n8n link) |

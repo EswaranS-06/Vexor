@@ -114,7 +114,7 @@ BLOCKED = {"shell", "exec", "install", "reset purge", "config edit", "completion
 # vexor wazuh <area> <verb>: detection files, integrations and manager config (Detection page)
 WAZUH_VERBS = {
     "read": {"ls", "list", "show", "cat", "history", "templates", ""},
-    "change": {"put", "save", "restore", "add", "edit", "set", "test"},
+    "change": {"put", "save", "restore", "add", "edit", "set", "test", "reset"},   # reset: back to the shipped built-in (history kept)
     "danger": {"rm", "remove", "delete", "del"},
 }
 SECRET_OPTS = {"--api-key"}       # their value never reaches the confirm text, job list or audit log
@@ -583,6 +583,7 @@ DET_DIR = ROOT / "config" / "wazuh_custom"
 DET_HIST = STATE / "detection-history"
 DET_KINDS = ("rules", "decoders", "lists")
 DET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+DET_WAZUH_LISTS = {"audit-keys", "security-eventchannel", "amazon", "malicious-ioc"}   # flat names Wazuh ships (vexor det_custom_ok)
 DET_SHOW = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}(/[A-Za-z0-9][A-Za-z0-9_.-]{0,80})?$")
 DET_VERSION = re.compile(r"^[0-9]{8}T[0-9]{6}Z(-[0-9]+)?$")
 DET_MAX = 256 * 1024
@@ -609,13 +610,36 @@ def detection():
 
 
 def det_name(kind, name):
-    """Validated file name (rules/decoders get .xml) or None."""
+    """Validated custom file name (rules/decoders get .xml) or None (built-in names: det_builtin)."""
     if kind not in DET_KINDS or not isinstance(name, str):
         return None
     base = name[:-4] if kind != "lists" and name.endswith(".xml") else name
-    if not DET_NAME.match(base):
+    if not DET_NAME.match(base) or re.match(r"^[0-9]{4}-", base) or (kind == "lists" and base in DET_WAZUH_LISTS):
         return None
     return base if kind == "lists" else base + ".xml"
+
+
+def det_overridden(kind, name):
+    """Built-in file edited in config/wazuh_custom (the .overrides manifest vexor keeps)."""
+    try:
+        return f"{kind}/{name}" in (DET_DIR / ".overrides").read_text().split()
+    except OSError:
+        return False
+
+
+def det_builtin(kind, name):
+    """A built-in Wazuh file name (vexor lists it with source wazuh, or it is edited already) or None.
+    Same syntax as vexor det_name: no '..', one sub directory for lists only."""
+    if kind not in DET_KINDS or not isinstance(name, str) or ".." in name or det_name(kind, name):
+        return None
+    if kind != "lists" and not name.endswith(".xml"):
+        name += ".xml"
+    if not DET_SHOW.match(name) or (kind != "lists" and "/" in name):
+        return None
+    if det_overridden(kind, name):
+        return name
+    files = ((cached("detection", TTL["detection"], detection) or {}).get(kind) or {}).get("files") or []
+    return name if any(f.get("name") == name and f.get("source") == "wazuh" for f in files) else None
 
 
 def det_tmp(content, prefix):
@@ -1371,7 +1395,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if kind not in DET_KINDS:
             return self.send_json({"error": "kind must be rules, decoders, lists or config"}, 400)
         if ver:
-            fname = det_name(kind, name)
+            fname = det_name(kind, name) or det_builtin(kind, name)
             f = DET_HIST / kind / fname / ver if fname and DET_VERSION.match(ver) else None
             if not f or not f.is_file():
                 return self.send_json({"error": "no such version"}, 404)
@@ -1381,12 +1405,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f = DET_DIR / kind / fname
             if f.stat().st_size > 4 * DET_MAX:
                 return self.send_json({"error": "file too large to edit here"}, 413)
-            return self.send_json({"name": fname, "content": f.read_text(errors="replace"), "editable": True})
+            return self.send_json({"name": fname, "content": f.read_text(errors="replace"), "editable": True, "source": "custom"})
         if not DET_SHOW.match(name or "") or ".." in name:
             return self.send_json({"error": "invalid name"}, 400)
-        code, out = run_rc([str(VEXOR), "--no-color", "wazuh", kind, "show", name], timeout=30)
+        bname = det_builtin(kind, name)       # built-in Wazuh file: editable, the edited copy (if any) is what vexor shows
+        code, out = run_rc([str(VEXOR), "--no-color", "wazuh", kind, "show", bname or name], timeout=30)
         if code != 0:
             return self.send_json({"error": f"no such file: {kind}/{name}"}, 404)
+        if bname:
+            if len(out.encode()) > 4 * DET_MAX:
+                return self.send_json({"error": "file too large to edit here"}, 413)
+            return self.send_json({"name": bname, "content": out, "editable": True, "source": "wazuh",
+                                   "modified": det_overridden(kind, bname)})
         return self.send_json({"name": name, "content": out, "editable": False})
 
     def det_file_post(self, s, data):
@@ -1407,9 +1437,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json({"error": "integrations: name must be raw"}, 400)
             args, label = ["wazuh", "integrations", "raw", "put", "--from", ""], "integrations (XML)"
         else:
-            fname = det_name(kind, name)
+            fname = det_name(kind, name) or det_builtin(kind, name)   # a built-in: vexor keeps an edited copy and excludes the shipped one
             if not fname:
-                return self.send_json({"error": "kind must be rules, decoders or lists; name: 1-64 letters, digits, _ or -"}, 400)
+                return self.send_json({"error": "kind must be rules, decoders or lists; name: 1-64 letters, digits, _ or -, or a built-in Wazuh file"}, 400)
             args, label = ["wazuh", kind, "put", fname, "--from", ""], f"{kind}/{fname}"
         i = args.index("--from") + 1
         if not data.get("confirmed"):

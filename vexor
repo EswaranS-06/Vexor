@@ -5422,7 +5422,19 @@ cmd_wazuh() {
 # the raw custom block, the <list> declarations) are checked with the Wazuh daemons' -t -c on a candidate file,
 # written to config/wazuh_cluster/*.conf between vexor:<name> begin/end markers, and the managers are recreated
 # (rolled back if one does not come up). Versions: .state/detection-history/<kind>/<name>/<UTC stamp>, last 20.
+# Built-in Wazuh files (source "wazuh") are edited the same way: the first save records <kind>/<name> in
+# config/wazuh_custom/.overrides (the shipped original becomes the first version) and the edited copy lives in
+# config/wazuh_custom/<kind>/<name> like a custom file. Rules/decoders: /var/ossec/ruleset is in the image (lost
+# when a manager is recreated), so the copy goes to etc/rules|decoders under the SAME name and the original is
+# excluded with a path-qualified <rule_exclude>ruleset/rules/<name></rule_exclude> (<decoder_exclude> likewise) in
+# the vexor:excludes block. Checked with wazuh-analysisd -t -d (4.14): a bare file name is matched against every
+# rule_dir, so it would drop the copy too; the ruleset/... form drops only the shipped file. overwrite="yes" is no
+# substitute: it replaces single rules, not a whole file (removed rules, decoders, group changes). A copy loaded next
+# to its original is caught by the -t check (duplicated rule ids are new WARNINGs, duplicated decoders are errors).
+# Lists already live in the persistent etc/lists and are declared by the shipped ossec.conf: the copy overwrites
+# the file in place (no exclude, no extra <list>); the original is kept in config/wazuh_custom/.originals for reset.
 DET_DIR="$ROOT/config/wazuh_custom"
+DET_OVR="$DET_DIR/.overrides"
 DET_TPL_DIR="$ROOT/config/detection-templates"
 DET_HIST="$ROOT/.state/detection-history"
 DET_STATUS="$ROOT/.state/detection-status.json"
@@ -5521,17 +5533,19 @@ def check(kind, path, name, custom_dir, extra):
                 errs.append("no <rule id=\"...\"> found")
             seen = {}
             others = {}
+            builtin = os.environ.get("DET_SOURCE") == "wazuh"     # an edited built-in file keeps Wazuh's own ids
             files = [os.path.join(custom_dir, f) for f in sorted(os.listdir(custom_dir))] if os.path.isdir(custom_dir) else []
             for f in files + [x for x in extra if x]:
                 if not f.endswith(".xml") or os.path.basename(f) == name or not os.path.isfile(f):
                     continue
                 for rid, ow, _, _ in rule_ids(read(f))[0]:
-                    others.setdefault(rid, os.path.basename(f))
+                    if not (builtin and ow):                      # an overwrite="yes" elsewhere replaces the rule defined here
+                        others.setdefault(rid, os.path.basename(f))
             for rid, ow, ln, lvl in ids:
                 if not rid.isdigit():
                     errs.append(f"line {ln}: rule id '{rid}' is not a number"); continue
                 n = int(rid)
-                if not ow and not 100000 <= n <= 199999:
+                if not ow and not builtin and not 100000 <= n <= 199999:
                     errs.append(f"line {ln}: rule id {n} is outside 100000-199999 (custom rules; use overwrite=\"yes\" to replace a built-in rule)")
                 if rid in seen:
                     errs.append(f"line {ln}: rule id {n} is used twice in this file (line {seen[rid]})")
@@ -5575,15 +5589,38 @@ def summary(kind, path, name, source, editable):
             "mtime": int(st.st_mtime), "error": err}
 
 
-def ls(kind, custom_dir, builtin_dir, vexor_file, cache):
+def overrides(path, kind):
+    """Built-in files edited in config/wazuh_custom (the .overrides manifest: kind/name per line) -> {name}"""
+    try:
+        return {ln.strip().split("/", 1)[1] for ln in read(path).splitlines() if ln.strip().startswith(kind + "/")}
+    except OSError:
+        return set()
+
+
+def ls(kind, custom_dir, builtin_dir, vexor_file, cache, ovr_file="", hist_dir="", conf=""):
     files = []
+    ovr = overrides(ovr_file, kind) if ovr_file else set()
+    edited = {}                                  # overridden built-ins: listed in place of the shipped file
     if os.path.isdir(custom_dir):
-        for f in sorted(os.listdir(custom_dir)):
-            p = os.path.join(custom_dir, f)
-            if os.path.isfile(p) and not f.startswith(".") and (kind == "lists" or f.endswith(".xml")):
-                files.append(summary(kind, p, f, "custom", True))
+        for dp, dn, fn in os.walk(custom_dir):
+            dn[:] = sorted(d for d in dn if not d.startswith(".")) if kind == "lists" and dp == custom_dir else []
+            for f in sorted(fn):
+                p = os.path.join(dp, f)
+                rel = os.path.relpath(p, custom_dir)
+                if f.startswith(".") or not (kind == "lists" or f.endswith(".xml")):
+                    continue
+                if rel in ovr:
+                    edited[rel] = dict(summary(kind, p, rel, "wazuh", True), modified=True)
+                elif dp == custom_dir:
+                    files.append(summary(kind, p, f, "custom", True))
     if vexor_file and os.path.isfile(vexor_file):
         files.append(summary(kind, vexor_file, os.path.basename(vexor_file), "vexor", False))
+    hist, shipped = set(), set()
+    if kind == "lists":                          # a list with history is ours (maybe deleted) unless Wazuh ships it
+        if hist_dir and os.path.isdir(hist_dir):
+            hist = {os.path.relpath(dp, hist_dir) for dp, dn, fn in os.walk(hist_dir) if fn}
+        if conf and os.path.isfile(conf):
+            shipped = set(re.findall(r"<list>etc/lists/([^<]+)</list>", strip_blocks(read(conf))))
     built = None
     if builtin_dir and os.path.isdir(builtin_dir):
         built = []
@@ -5592,11 +5629,13 @@ def ls(kind, custom_dir, builtin_dir, vexor_file, cache):
                 p = os.path.join(dp, f)
                 rel = os.path.relpath(p, builtin_dir)
                 if kind == "lists":
-                    if f.endswith(".cdb") or rel in [x["name"] for x in files]:
+                    if f.endswith(".cdb") or f.startswith(".") or rel in [x["name"] for x in files]:
+                        continue
+                    if rel in hist and rel not in ovr and rel not in shipped:
                         continue
                 elif not f.endswith(".xml"):
                     continue
-                built.append(summary(kind, p, rel, "wazuh", False))
+                built.append(summary(kind, p, rel, "wazuh", True))
         built.sort(key=lambda x: x["name"])
         if cache:
             with open(cache, "w") as fh:
@@ -5607,7 +5646,9 @@ def ls(kind, custom_dir, builtin_dir, vexor_file, cache):
         except ValueError:
             built = None
     custom = {x["name"] for x in files}
-    files += [b for b in (built or []) if b["name"] not in custom]
+    built = [dict(edited.pop(b["name"], b), editable=True) for b in (built or []) if b["name"] not in custom]
+    built = [dict(b, modified=b.get("modified", False)) for b in built]
+    files += sorted(built + list(edited.values()), key=lambda x: x["name"])
     print(json.dumps({"files": files, "builtin": built is not None}))
 
 
@@ -5686,6 +5727,9 @@ def strip_blocks(s):
 def child(xml, tag):
     m = re.search(r"<" + tag + r"(?:\s[^>]*)?>(.*?)</" + tag + r">", xml, re.S)
     return m.group(1).strip() if m else None
+
+
+N8N_NOTE = "<!-- custom-n8n is managed by vexor n8n: hook_url, level and group can be changed here; the API key is created automatically and is not shown. Remove this block to disconnect n8n. -->"
 
 
 def integrations(path):
@@ -5897,8 +5941,8 @@ def main():
     op, a = sys.argv[1], sys.argv[2:]
     if op == "check":
         check(a[0], a[1], a[2], a[3], a[4:])
-    elif op == "ls":
-        ls(a[0], a[1], a[2], a[3], a[4])
+    elif op == "ls":                   # ls <kind> <custom dir> <built-in dir> <vexor file> <cache> [<overrides> <history dir> <master conf>]
+        ls(*a[:8])
     elif op == "history":
         history(a[0])
     elif op == "templates":
@@ -5909,8 +5953,74 @@ def main():
     elif op == "integ-get":            # integ-get <conf> <name> -> the managed integration as JSON (with the key), or {}
         items = [i for i in integrations(a[0]) if i["managed"] and i["name"] == a[1]]
         print(json.dumps(items[0] if items else {}))
-    elif op == "integ-raw-show":       # integ-raw-show <conf> -> the XML of the managed integrations block
-        print(block_body(read(a[0]), "integrations") or "")
+    elif op == "integ-raw-show":       # integ-raw-show <conf> -> custom-n8n first (when connected), then the managed integrations block
+        # custom-n8n lives in its own vexor:n8n block (vexor n8n connect/disconnect owns it). It is listed here so the code shows
+        # every card; its <api_key> line is deliberately NOT printed (the token stays N8N_HOOK_TOKEN and is never shown).
+        import textwrap
+        out = ""
+        for i in integrations(a[0]):
+            if i["n8n"]:
+                out += N8N_NOTE + "\n<integration>\n  <name>custom-n8n</name>\n"
+                for k, v in (("hook_url", i["hook_url"]), ("level", "" if i["level"] is None else str(i["level"])), ("group", i["group"]),
+                             ("rule_id", i["rule_id"]), ("alert_format", i["alert_format"])):
+                    if v:
+                        out += "  <%s>%s</%s>\n" % (k, v, k)      # the values are already XML-escaped (read as they are in ossec.conf)
+                out += "</integration>\n"
+                break
+        rest = textwrap.dedent(block_body(read(a[0]), "integrations") or "").strip("\n")
+        print((out + ("\n" if out and rest else "") + rest).rstrip("\n"))
+    elif op == "integ-raw-split":      # integ-raw-split <xml> <rest out> <n8n out (json)> <current n8n hook url>: custom-n8n apart from the other blocks
+        from urllib.parse import urlsplit
+        from xml.sax.saxutils import unescape
+        body = read(a[0])
+        if body.strip():
+            els, err = scan(body)
+            if err:
+                print("XML: " + err); sys.exit(1)
+        pat = re.compile(r"(<!--\s*custom-n8n is managed.*?-->\s*)?<integration>(.*?)</integration>[ \t]*\n?", re.S)
+        found, spans = [], []
+        for m in pat.finditer(body):
+            nm = child(m.group(2), "name") or ""
+            if nm == "custom-n8n":
+                found.append(m.group(2)); spans.append(m.span())
+            elif m.group(1):
+                print("the name of the n8n block must stay custom-n8n (found: %s)" % (nm or "none")); sys.exit(1)
+        if len(found) > 1:
+            print("custom-n8n is configured twice"); sys.exit(1)
+        rest = body
+        for s0, e0 in reversed(spans):
+            rest = rest[:s0] + rest[e0:]
+        rest = re.sub(r"<!--\s*custom-n8n is managed.*?-->[ \t]*\n?", "", rest, flags=re.S)       # a leftover note (its block was deleted)
+        open(a[1], "w").write(rest)
+        info = {"present": False}
+        if found:
+            b = found[0]
+            tags = set(re.findall(r"<([A-Za-z_][\w-]*)", re.sub(r"<!--.*?-->", "", b, flags=re.S)))
+            bad = sorted(tags - {"name", "hook_url", "api_key", "level", "group", "alert_format"})
+            if bad:
+                print("custom-n8n: <%s> is not supported (use hook_url, level and group; the API key and format are managed)" % bad[0]); sys.exit(1)
+            hook = unescape(child(b, "hook_url") or "")
+            cur = unescape(a[3]) if len(a) > 3 else ""
+            if not hook:
+                print("custom-n8n needs <hook_url>"); sys.exit(1)
+            if hook != cur:
+                if "://" in hook:
+                    u = urlsplit(hook)
+                    ok = (u.scheme == "http" and u.hostname == "n8n" and u.port == 5678 and not u.query and not u.fragment
+                          and re.fullmatch(r"/webhook(-test)?/[A-Za-z0-9._~/%-]{1,200}", u.path or ""))
+                else:
+                    ok = re.fullmatch(r"/?[A-Za-z0-9][A-Za-z0-9._~/%-]{0,200}/?", hook)
+                if not ok:
+                    print("custom-n8n <hook_url> must be the n8n webhook of this stack (http://n8n:5678/webhook/<path>) or just the path (found: %s)" % hook[:80])
+                    sys.exit(1)
+            lvl = (child(b, "level") or "").strip()
+            if not re.fullmatch(r"\d{1,2}", lvl) or int(lvl) > 15:
+                print("custom-n8n <level> must be a number from 0 to 15 (found: %s)" % (lvl or "none")); sys.exit(1)
+            grp = unescape(child(b, "group") or "").strip()
+            if grp and not re.fullmatch(r"[A-Za-z0-9_.,-]{1,256}", grp):
+                print("custom-n8n <group>: rule groups separated by commas (letters, digits, _ . -)"); sys.exit(1)
+            info = {"present": True, "hook": hook, "level": int(lvl), "groups": grp}
+        json.dump(info, open(a[2], "w"))
     elif op == "integ-raw-set":        # integ-raw-set <outdir> <xml file or ''> <conf..>: replace the managed block by hand-written XML
         body = read(a[1]) if a[1] else ""
         if body.strip():
@@ -5937,7 +6047,8 @@ def main():
                     if not child(b, "hook_url"):
                         print("%s needs <hook_url>" % nm); sys.exit(1)
                 seen.append(nm)
-            body = "".join("  " + ln + "\n" if ln.strip() else "\n" for ln in body.strip("\n").splitlines())
+            import textwrap
+            body = "".join("  " + ln + "\n" if ln.strip() else "\n" for ln in textwrap.dedent(body).strip("\n").splitlines())
         else:
             body = ""
         write_cands(a[0], a[2:], lambda f, s: set_block(s, "integrations", body))
@@ -5959,6 +6070,10 @@ def main():
                 return set_block(s, "lists", body.replace("    <list>", "  <list>"))
             return set_block(s, "lists", body.replace("    <list>", "  <list>"), where="</ruleset>")
         write_cands(a[0], a[2:], ed)
+    elif op == "excl-block":           # excl-block <outdir> <rule files (comma)> <decoder files (comma)> <conf..>: path-qualified excludes in <ruleset>
+        body = "".join(f"    <rule_exclude>ruleset/rules/{escape(n)}</rule_exclude>\n" for n in a[1].split(",") if n)
+        body += "".join(f"    <decoder_exclude>ruleset/decoders/{escape(n)}</decoder_exclude>\n" for n in a[2].split(",") if n)
+        write_cands(a[0], a[3:], lambda f, s: set_block(s, "excludes", body, where="</ruleset>"))
     elif op == "lists-declared":
         b = block_body(read(a[0]), "lists") or ""
         print("\n".join(re.findall(r"<list>etc/lists/([^<]+)</list>", b)))
@@ -5979,7 +6094,8 @@ def main():
                 print("XML: " + err); sys.exit(1)
             if re.search(r"<!--\s*vexor:|</?ossec_config", body):
                 print("the block may not contain <ossec_config> or vexor: markers"); sys.exit(1)
-            body = "".join("  " + ln + "\n" if ln.strip() else "\n" for ln in body.strip("\n").splitlines())
+            import textwrap
+            body = "".join("  " + ln + "\n" if ln.strip() else "\n" for ln in textwrap.dedent(body).strip("\n").splitlines())
         else:
             body = ""
         write_cands(a[0], a[2:], lambda f, s: set_block(s, "custom", body))
@@ -6059,18 +6175,41 @@ det_master() {                 # changes need a running master: Wazuh checks eve
   soc_wazuh || die "Wazuh is off (SOC=$(soc)) - vexor soc wazuh|both"
   is_running wazuh.master || die "wazuh.master is not running - start it first: vexor start"
 }
-det_name() {                   # det_name <kind> <name>: the file name (rules/decoders get .xml) or exit
+det_name() {                   # det_name <kind> <name>: the file name (rules/decoders get .xml) or exit; a built-in keeps its own name
   local k="$1" n="${2:-}"
   [ -n "$n" ] || die "usage: vexor wazuh $k <verb> <name>"
-  [ "$k" = lists ] || n="${n%.xml}"
-  [[ "$n" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || die "invalid name '$2': 1-64 letters, digits, _ or -, starting with a letter or digit"
-  [ "$k" = lists ] || n="$n.xml"
-  case "$k:$n" in
-    rules:vexor_tools_rules.xml) die "$n is generated by vexor (vexor tools) - read-only" ;;
-    lists:audit-keys|lists:security-eventchannel|lists:amazon|lists:malicious-ioc) die "$n is a Wazuh list - read-only" ;;
-  esac
-  [[ "$n" =~ ^[0-9]{4}- ]] && die "$n looks like a built-in Wazuh file name (NNNN-...) - pick another name"
-  echo "$n"
+  [ "$k" = lists ] || n="${n%.xml}.xml"
+  [ "$k:$n" = rules:vexor_tools_rules.xml ] && die "$n is generated by vexor (vexor tools) - read-only"
+  det_custom_ok "$k" "$n" && { echo "$n"; return 0; }
+  # not a custom name: only an existing built-in Wazuh file (the real listing, or one already edited) - no paths
+  if [[ "$n" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}(/[A-Za-z0-9][A-Za-z0-9_.-]{0,80})?$ ]] && [[ "$n" != *..* ]] \
+     && { [ "$k" = lists ] || [[ "$n" != */* ]]; } \
+     && { det_ovr_has "$k" "$n" || det_builtin_names "$k" | has -xF -- "$n"; }; then
+    echo "$n"; return 0
+  fi
+  [[ "$n" =~ ^[0-9]{4}- ]] && die "$n is not a built-in Wazuh file (vexor wazuh $k ls) - a custom file cannot use a built-in name (NNNN-...)"
+  case "$k:$n" in lists:audit-keys|lists:security-eventchannel|lists:amazon|lists:malicious-ioc) die "$n is not a Wazuh list file (vexor wazuh lists ls)" ;; esac
+  die "invalid name '$2': 1-64 letters, digits, _ or -, starting with a letter or digit (or a built-in file: vexor wazuh $k ls)"
+}
+det_custom_ok() {              # det_custom_ok <kind> <file name>: a custom file name (else it can only be a built-in Wazuh file)
+  local k="$1" n="$2"
+  [ "$k" = lists ] || { [[ "$n" == *.xml ]] || return 1; n="${n%.xml}"; }
+  [[ "$n" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] && [[ ! "$n" =~ ^[0-9]{4}- ]] || return 1
+  case "$k:$n" in lists:audit-keys|lists:security-eventchannel|lists:amazon|lists:malicious-ioc) return 1 ;; esac
+  return 0
+}
+det_builtin_names() {          # det_builtin_names <kind>: names of the built-in (source wazuh) files, edited or not
+  det_ls_json "$1" 2>/dev/null | python3 -I -c 'import json, sys
+print("\n".join(f["name"] for f in json.load(sys.stdin).get("files", []) if f.get("source") == "wazuh"))' 2>/dev/null
+  return 0
+}
+det_ovr_has() { grep -qxF -- "$1/$2" "$DET_OVR" 2>/dev/null; }
+det_ovr_list() { [ -f "$DET_OVR" ] && grep -E "^$1/" "$DET_OVR" | cut -d/ -f2-; return 0; }
+det_ovr_add() { det_ovr_has "$1" "$2" || { mkdir -p "$DET_DIR"; echo "$1/$2" >> "$DET_OVR"; }; }
+det_ovr_del() { [ -f "$DET_OVR" ] || return 0; grep -vxF -- "$1/$2" "$DET_OVR" > "$DET_OVR.tmp"; mv -f "$DET_OVR.tmp" "$DET_OVR"; }
+det_wazuh_orig() {             # det_wazuh_orig <kind> <name> <out>: the shipped file as the master has it now
+  local p="/var/ossec/ruleset/$1/$2"; [ "$1" = lists ] && p="/var/ossec/etc/lists/$2"
+  dc exec -T wazuh.master cat "$p" > "$3" 2>/dev/null && [ -s "$3" ]
 }
 det_conf_svc() {               # ossec.conf file -> manager service
   case "$1" in
@@ -6110,18 +6249,26 @@ det_api_upload() {             # det_api_upload <kind> <name> <file>: PUT /<kind
   curl -sk --connect-timeout 5 --max-time 60 -X PUT -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/octet-stream' \
        --data-binary @"$3" "https://$(local_ip):$(api_port)/$1/files/$2?overwrite=true"
 }
-det_exec_write() {             # det_exec_write <svc> <kind> <name> <file>: write a file into /var/ossec/etc/<kind> of a manager
-  dc exec -T "$1" sh -c "d=/var/ossec/etc/$2; cat > \"\$d/.$3.tmp\" && chown wazuh:wazuh \"\$d/.$3.tmp\" && chmod 660 \"\$d/.$3.tmp\" \
-    && mv -f \"\$d/.$3.tmp\" \"\$d/$3\"" < "$4"
+det_exec_write() {             # det_exec_write <svc> <kind> <name> <file>: write a file into /var/ossec/etc/<kind> of a manager (name may be dir/file for lists)
+  dc exec -T "$1" sh -c "f=/var/ossec/etc/$2/$3; t=\"\${f%/*}/.\${f##*/}.tmp\"; cat > \"\$t\" && chown wazuh:wazuh \"\$t\" && chmod 660 \"\$t\" \
+    && mv -f \"\$t\" \"\$f\"" < "$4"
 }
 det_push_master() {            # Wazuh API first (it is what the contract with the dashboard uses), docker exec when the API cannot
-  local r; r="$(det_api_upload "$1" "$2" "$3" 2>/dev/null)"
+  local r
+  det_custom_ok "$1" "$2" || { det_exec_write wazuh.master "$1" "$2" "$3"; return; }   # built-in names: straight into etc/<kind> (the API resolves names across the shipped ruleset too)
+  r="$(det_api_upload "$1" "$2" "$3" 2>/dev/null)"
   has -E '"error": ?0[,}]' <<<"$r" && return 0
   det_exec_write wazuh.master "$1" "$2" "$3"
 }
-det_push_workers() { local m; for m in $(det_running_managers); do [ "$m" = wazuh.master ] || det_exec_write "$m" "$1" "$2" "$3" || warn "$m: could not write $1/$2 (the cluster sync copies it)"; done; return 0; }
+det_push_workers() {           # lists: wazuh-analysisd -t compiles a CDB whose text is newer, so the reload finds it current (the master's runs in det_verify)
+  local m; for m in $(det_running_managers); do
+    [ "$m" = wazuh.master ] && continue
+    det_exec_write "$m" "$1" "$2" "$3" || { warn "$m: could not write $1/$2 (the cluster sync copies it)"; continue; }
+    [ "$1" = lists ] && dc exec -T "$m" /var/ossec/bin/wazuh-analysisd -t >/dev/null 2>&1
+  done; return 0
+}
 det_rm_remote() {              # det_rm_remote <kind> <name> [workers]: delete from the master (API, then rm for leftovers like .cdb) [and workers]
-  api DELETE "/$1/files/$2" >/dev/null 2>&1
+  det_custom_ok "$1" "$2" && api DELETE "/$1/files/$2" >/dev/null 2>&1   # a built-in name: only the copy in etc/<kind>, never the API (it could pick the shipped file)
   local m; for m in wazuh.master ${3:+$(det_running_managers)}; do
     is_running "$m" && dc exec -T "$m" rm -f "/var/ossec/etc/$1/$2" "/var/ossec/etc/$1/$2.cdb" >/dev/null 2>&1
   done
@@ -6198,6 +6345,7 @@ det_conf_apply() {             # det_conf_apply <candidate dir> <kind> <name> <a
   if [ -n "$fail" ]; then
     DET_ERR="$(dc exec -T "$fail" sh -c 'tail -n 300 /var/ossec/logs/ossec.log' 2>/dev/null | det_norm | tail -8)"
     for b in "${changed[@]}"; do cat "$bak/$b" > "$CLUSTER_DIR/$b"; done
+    [ -n "${DET_UNDO:-}" ] && eval "$DET_UNDO"   # the detection files that belong to the previous ossec.conf, back before it is loaded
     say "rolling back: recreating ${svcs[*]} with the previous ossec.conf ..."
     dc_restart "${svcs[@]}" >/dev/null 2>&1; API_TOKEN=""
     for svc in "${svcs[@]}"; do wait_daemon "$svc" wazuh-analysisd 240 || warn "$svc: still not running after the rollback - vexor logs ossec $svc"; done
@@ -6206,27 +6354,41 @@ det_conf_apply() {             # det_conf_apply <candidate dir> <kind> <name> <a
   ok "${svcs[*]} running with the new ossec.conf"
 }
 det_lists_sync_conf() {        # the <list> declarations (vexor:lists block in <ruleset>) follow config/wazuh_custom/lists -> candidates in $1
-  local names; names="$(ls -1 "$DET_DIR/lists" 2>/dev/null | grep -E '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$' | paste -sd, -)"
+  local names x                # edited built-in lists are declared by the shipped ossec.conf already: not here
+  names="$(ls -1 "$DET_DIR/lists" 2>/dev/null | grep -E '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$' \
+    | while read -r x; do [ -f "$DET_DIR/lists/$x" ] && ! det_ovr_has lists "$x" && echo "$x"; done | paste -sd, -)"
   det_py lists-block "$1" "$names" $(n8n_conf_files)
 }
+det_excl_sync_conf() {         # the excludes of the edited built-in rules/decoders (vexor:excludes block in <ruleset>) follow .overrides -> candidates in $1
+  det_py excl-block "$1" "$(det_ovr_list rules | paste -sd, -)" "$(det_ovr_list decoders | paste -sd, -)" $(n8n_conf_files)
+}
 det_save() {                   # det_save <kind> <name> <new file | ""> <action>: check, push, let Wazuh check, roll back or load, record
-  local k="$1" n="$2" new="$3" act="$4" host="$DET_DIR/$1/$2" prev="" base="$RUN_TMP/det-base" errs cd="$RUN_TMP/det-cand"
+  local k="$1" n="$2" new="$3" act="$4" host="$DET_DIR/$1/$2" prev="" base="$RUN_TMP/det-base" errs cd="$RUN_TMP/det-cand" wz=""
   det_master; take_lock; det_import
   mkdir -p "$DET_DIR/$k"
+  det_custom_ok "$k" "$n" || { wz=wazuh; mkdir -p "$(dirname "$host")"; }   # a built-in Wazuh file (det_name checked it against the listing)
   if [ -n "$new" ]; then
-    errs="$(det_py check "$k" "$new" "$n" "$DET_DIR/$k" "$([ "$k" = rules ] && echo "$TOOL_RULES")")" || {
+    errs="$(DET_SOURCE="$wz" det_py check "$k" "$new" "$n" "$DET_DIR/$k" "$([ "$k" = rules ] && echo "$TOOL_RULES")")" || {
       DET_ERR="$errs"; det_problem "$k" "$n" "$act" "$k/$n refused (nothing changed):"; }
   else
     [ -f "$host" ] || die "$k/$n does not exist (vexor wazuh $k ls)"
   fi
-  if [ -f "$host" ]; then prev="$RUN_TMP/det-prev"; cp "$host" "$prev"; fi
-  [ -n "$prev" ] && [ -z "$(ls -A "$DET_HIST/$k/$n" 2>/dev/null)" ] && det_hist_add "$k" "$n" "$prev"   # what was there before the first change
+  if [ -f "$host" ]; then prev="$RUN_TMP/det-prev"; cp "$host" "$prev"
+  elif [ -n "$wz" ]; then      # first change of a built-in: the override is recorded (the shipped file becomes the first version once saved)
+    det_wazuh_orig "$k" "$n" "$RUN_TMP/det-orig" || die "could not read the built-in $k/$n from wazuh.master"
+    if [ "$k" = lists ]; then   # the list file itself is replaced in etc/lists: keep the shipped one for reset (rollback writes it back)
+      mkdir -p "$(dirname "$DET_DIR/.originals/lists/$n")"; cp "$RUN_TMP/det-orig" "$DET_DIR/.originals/lists/$n"; prev="$RUN_TMP/det-orig"
+    fi
+    det_ovr_add "$k" "$n"; DET_OVR_NEW=1
+  fi
+  [ -n "$prev" ] && [ -z "${DET_OVR_NEW:-}" ] && [ -z "$(ls -A "$DET_HIST/$k/$n" 2>/dev/null)" ] && det_hist_add "$k" "$n" "$prev"   # what was there before the first change
+  [ -n "$wz" ] && DET_UNDO="$(printf 'det_rollback %q %q %q workers' "$k" "$n" "$prev")"
   det_rtest > "$base"
   if [ -n "$new" ]; then cp "$new" "$host.tmp" && chmod 644 "$host.tmp" && mv -f "$host.tmp" "$host"; det_push_master "$k" "$n" "$host" || { DET_ERR="could not write the file into wazuh.master"; det_rollback "$k" "$n" "$prev"; det_problem "$k" "$n" "$act" "$k/$n not saved:"; }
-  else rm -f "$host"; det_rm_remote "$k" "$n"; fi
+  else rm -f "$host"; [ -n "$wz" ] && det_ovr_del "$k" "$n"; det_rm_remote "$k" "$n"; fi
   rm -rf "$cd"; mkdir -p "$cd"
-  [ "$k" = lists ] && det_lists_sync_conf "$cd"
-  if [ -n "$(ls -A "$cd")" ]; then           # a list was added or removed: ossec.conf changes, the managers are recreated
+  if [ "$k" = lists ]; then det_lists_sync_conf "$cd"; else det_excl_sync_conf "$cd"; fi
+  if [ -n "$(ls -A "$cd")" ]; then           # a list was added or removed, a built-in rules/decoders file was (un)excluded: ossec.conf changes, the managers are recreated
     [ -n "$new" ] && det_push_workers "$k" "$n" "$host"
     ( DET_CBASE="$base" det_conf_apply "$cd" "$k" "$n" "$act" ) || { say "rolling back $k/$n ..."; det_rollback "$k" "$n" "$prev" workers; exit 1; }
     [ -z "$new" ] && det_rm_remote "$k" "$n" workers
@@ -6238,19 +6400,51 @@ det_save() {                   # det_save <kind> <name> <new file | ""> <action>
     if [ -n "$new" ]; then det_push_workers "$k" "$n" "$host"; else det_rm_remote "$k" "$n" workers; fi
     det_reload || { det_rec "$k" "$n" "$act" 0 "saved, but the reload failed"; exit 1; }
   fi
-  [ -n "$new" ] && det_hist_add "$k" "$n" "$host"
+  [ -n "${DET_OVR_NEW:-}" ] && [ -z "$(ls -A "$DET_HIST/$k/$n" 2>/dev/null)" ] && det_hist_add "$k" "$n" "$RUN_TMP/det-orig"   # the shipped file, before the first change
+  [ -n "$new" ] && [ "$act" != reset ] && det_hist_add "$k" "$n" "$host"
+  if [ "$act" = reset ] && [ -n "$new" ]; then   # a list's shipped content is back in etc/lists: forget the override
+    rm -f "$host" "$DET_DIR/.originals/$k/$n"; det_ovr_del "$k" "$n"
+    [[ "$n" == */* ]] && rmdir "${host%/*}" "$DET_DIR/.originals/$k/${n%/*}" 2>/dev/null   # amazon/, malicious-ioc/ when empty
+  fi
   det_rec "$k" "$n" "$act" 1 "$k/$n ${act}"
-  ok "$k/$n: $act done$([ -n "$new" ] && echo " ($(det_count "$k" "$host"))")"
+  if [ "$act" = reset ]; then ok "$k/$n: reset done - the shipped Wazuh file is active again (history kept)"
+  else ok "$k/$n: $act done$([ -n "$new" ] && echo " ($(det_count "$k" "$host"))")"; fi
 }
 det_count() { case "$1" in rules) echo "$(grep -c '<rule ' "$2") rules" ;; decoders) echo "$(grep -c '<decoder ' "$2") decoders" ;; *) echo "$(grep -c . "$2") entries" ;; esac; }
 det_rollback() {               # det_rollback <kind> <name> <previous file | ""> [workers]: host + master (+ workers) as before
   local k="$1" n="$2" host="$DET_DIR/$1/$2"
   if [ -n "$3" ]; then
     cp "$3" "$host"; det_push_master "$k" "$n" "$host" >/dev/null 2>&1; [ -n "${4:-}" ] && det_push_workers "$k" "$n" "$host"
+    det_custom_ok "$k" "$n" || [ -n "${DET_OVR_NEW:-}" ] || det_ovr_add "$k" "$n"   # a failed reset: the override stays
   else
     rm -f "$host"; det_rm_remote "$k" "$n" ${4:+workers}
   fi
+  if [ -n "${DET_OVR_NEW:-}" ]; then          # a failed first change of a built-in: no override (a list got its shipped content back above)
+    rm -f "$host" "$DET_DIR/.originals/$k/$n"; det_ovr_del "$k" "$n"
+    [[ "$n" == */* ]] && rmdir "${host%/*}" "$DET_DIR/.originals/$k/${n%/*}" 2>/dev/null
+  fi
   return 0
+}
+det_reset() {                  # det_reset <kind> <name>: drop the override of a built-in file, Wazuh's shipped file is loaded again
+  local k="$1" n="$2" o
+  det_custom_ok "$k" "$n" && die "$k/$n is a custom file - reset is for built-in Wazuh files (remove a custom file: vexor wazuh $k rm $n)"
+  if [ ! -f "$DET_DIR/$k/$n" ]; then
+    det_ovr_has "$k" "$n" || { ok "$k/$n is the shipped Wazuh file - nothing to reset"; return 0; }
+    det_master; take_lock; det_ovr_del "$k" "$n"   # a manifest entry without its file: only the exclude has to go
+    [ "$k" = lists ] && { ok "$k/$n: reset done"; return 0; }
+    rm -rf "$RUN_TMP/det-cand"; mkdir -p "$RUN_TMP/det-cand"; det_excl_sync_conf "$RUN_TMP/det-cand"
+    det_conf_apply "$RUN_TMP/det-cand" "$k" "$n" reset; det_rm_remote "$k" "$n" workers
+    det_rec "$k" "$n" reset 1 "$k/$n reset"; ok "$k/$n: reset done"; return 0
+  fi
+  if [ "$k" = lists ]; then    # the shipped content goes back through a normal save (checked, pushed, CDB rebuilt, reloaded)
+    o="$DET_DIR/.originals/lists/$n"
+    [ -f "$o" ] || o="$DET_HIST/lists/$n/$(ls -1 "$DET_HIST/lists/$n" 2>/dev/null | sort | head -1)"
+    [ -f "$o" ] || die "the shipped content of lists/$n is not known (config/wazuh_custom/.originals) - put it back by hand or restore a version (vexor wazuh lists history $n)"
+    cp "$o" "$RUN_TMP/det-reset"
+    det_save lists "$n" "$RUN_TMP/det-reset" reset
+  else                         # the copy in etc/<kind> and its exclude go, the managers are recreated
+    det_save "$k" "$n" "" reset
+  fi
 }
 det_read_from() {              # det_read_from <path|->: copy into a temp file, print its path
   local src="${1:-}" t="$RUN_TMP/det-new"
@@ -6270,12 +6464,11 @@ det_ls_json() {                # det_ls_json <kind>: {"files":[...]} (built-in f
   if { [ -z "$cache" ] || [ ! -s "$cache" ]; } && soc_wazuh && is_running wazuh.master; then
     bdir="$RUN_TMP/det-builtin-$k"; mkdir -p "$bdir"
     case "$k" in rules|decoders) dc exec -T wazuh.master tar -C "/var/ossec/ruleset/$k" -cf - . 2>/dev/null | tar -C "$bdir" -xf - 2>/dev/null ;;
-                 lists) dc exec -T wazuh.master tar -C /var/ossec/etc/lists -cf - . 2>/dev/null | tar -C "$bdir" -xf - 2>/dev/null
-                        local x; for x in $(ls -1 "$DET_HIST/lists" 2>/dev/null); do rm -f "${bdir:?}/$x"; done ;;   # ours, maybe deleted
+                 lists) dc exec -T wazuh.master tar -C /var/ossec/etc/lists -cf - . 2>/dev/null | tar -C "$bdir" -xf - 2>/dev/null ;;   # ours (with history) are dropped in ls
     esac
     mkdir -p "$STATE_DIR"
   fi
-  det_py ls "$k" "$DET_DIR/$k" "$bdir" "$vf" "$cache"
+  det_py ls "$k" "$DET_DIR/$k" "$bdir" "$vf" "$cache" "$DET_OVR" "$DET_HIST/$k" "$CLUSTER_DIR/wazuh_manager.conf"
 }
 det_files() {                  # vexor wazuh rules|decoders|lists <verb> ...
   local k="$1"; shift
@@ -6295,10 +6488,12 @@ print("  %-*s %-7s %6s  %-13s %8s  %s" % (w, "NAME", "SOURCE", "COUNT", "IDS", "
 import time
 for r in rows:
     ids = "%s-%s" % tuple(r["ids"]) if r.get("ids") else "-"
-    print("  %-*s %-7s %6s  %-13s %8s  %s%s" % (w, r["name"], r["source"], r["rules"], ids, r["size"],
+    print("  %-*s %-7s %6s  %-13s %8s  %s%s" % (w, r["name"], r["source"] + ("*" if r.get("modified") else ""), r["rules"], ids, r["size"],
           time.strftime("%Y-%m-%d %H:%M", time.localtime(r["mtime"])) if r["mtime"] else "-", "  ERROR " + r["error"] if r.get("error") else ""))
+if any(r.get("modified") for r in rows):
+    print("  wazuh* = built-in file edited here (vexor wazuh %s reset <name> brings back the shipped one)" % sys.argv[1])
 if not d.get("builtin"):
-    print("  (built-in files not shown: wazuh.master is not running)")' <<<"$t" ;;
+    print("  (built-in files not shown: wazuh.master is not running)")' "$k" <<<"$t" ;;
     show|cat)
       n="${1:-}"; [ -n "$n" ] || die "usage: vexor wazuh $k show <name>"
       [ "$k" = lists ] || [[ "$n" == *.xml ]] || n="$n.xml"
@@ -6318,7 +6513,11 @@ if not d.get("builtin"):
       det_save "$k" "$n" "$t" put ;;
     rm|remove|delete)
       n="$(det_name "$k" "${1:-}")" || exit 1
+      det_custom_ok "$k" "$n" || die "$k/$n is a built-in Wazuh file - it cannot be removed; undo your changes with: vexor wazuh $k reset $n"
       det_save "$k" "$n" "" rm ;;
+    reset)
+      n="$(det_name "$k" "${1:-}")" || exit 1
+      det_reset "$k" "$n" ;;
     history)
       n="$(det_name "$k" "${1:-}")" || exit 1
       t="$(det_py history "$DET_HIST/$k/$n")"
@@ -6338,7 +6537,9 @@ if not d.get("builtin"):
       n="$(det_name lists "${1:-}")" || exit 1
       local e="${2:-}"; [ -n "$e" ] || die "usage: vexor wazuh lists $verb <name> <key>[:<value>]"
       [[ "$e" =~ [[:cntrl:]] ]] && die "control characters are not allowed"
-      t="$RUN_TMP/det-new"; : > "$t"; [ -f "$DET_DIR/lists/$n" ] && cp "$DET_DIR/lists/$n" "$t"
+      t="$RUN_TMP/det-new"; : > "$t"
+      if [ -f "$DET_DIR/lists/$n" ]; then cp "$DET_DIR/lists/$n" "$t"
+      elif ! det_custom_ok lists "$n"; then det_master; det_wazuh_orig lists "$n" "$t" || die "could not read the built-in lists/$n from wazuh.master"; fi   # first edit of a built-in list
       python3 -I - "$t" "$verb" "$e" <<'PY' || exit 1
 import re, sys
 path, verb, entry = sys.argv[1:4]
@@ -6361,7 +6562,7 @@ else:
 open(path, "w").write("".join(l + "\n" for l in lines))
 PY
       det_save lists "$n" "$t" "$verb" ;;
-    *) die "usage: vexor wazuh $k ls|show|put|rm|history|restore|templates$([ "$k" = lists ] && echo '|add|del') ..." ;;
+    *) die "usage: vexor wazuh $k ls|show|put|rm|reset|history|restore|templates$([ "$k" = lists ] && echo '|add|del') ..." ;;
   esac
 }
 det_integ_script_missing() {   # det_integ_script_missing <custom-id>: prints the first running manager that lacks its script (a missing one stops integratord, and the change is rolled back)
@@ -6497,20 +6698,47 @@ PY
       case "$rv" in
         show) det_py integ-raw-show "$conf" ;;
         put)
-          local from="" f cd miss; while [ $# -gt 0 ]; do case "$1" in --from) from="${2:-}"; shift ;; *) die "unknown option $1" ;; esac; shift; done
+          # custom-n8n is owned by vexor n8n (its own marker block, the token in .env): it is split off here and applied with
+          # cmd_n8n connect / disconnect; everything else goes through integ-raw-set + det_conf_apply as before.
+          # Every check runs before the first change ("refused (nothing changed)").
+          local from="" f cd miss rest="$RUN_TMP/det-rest" nj="$RUN_TMP/det-n8n.json" conf_has=0 was=0 want=0 n8n_do="" nurl="" nlvl="" ngrp="" rest_changed=0
+          while [ $# -gt 0 ]; do case "$1" in --from) from="${2:-}"; shift ;; *) die "unknown option $1" ;; esac; shift; done
           t="$(det_read_from "$from")" || exit 1
           det_master; take_lock
-          rm -rf "$RUN_TMP/det-cand"; mkdir -p "$RUN_TMP/det-cand"; cd="$RUN_TMP/det-cand"
-          DET_ERR="$(det_py integ-raw-set "$cd" "$t" $(n8n_conf_files) 2>&1)" || det_problem integrations raw put "the integrations were refused (nothing changed):"
-          DET_WANT_INTEGRATORD=0; grep -q '<integration>' "$t" && DET_WANT_INTEGRATORD=1
-          [ -n "$(n8n_hook)" ] && DET_WANT_INTEGRATORD=1
-          if [ -z "$(ls -A "$cd")" ]; then ok "integrations unchanged"; return 0; fi
-          for f in $(grep -o '<name>custom-[A-Za-z0-9_-]*</name>' "$t" | sed -E 's/<[^>]*>//g'); do
+          rm -rf "$RUN_TMP/det-cand"; mkdir -p "$RUN_TMP/det-cand"; cd="$RUN_TMP/det-cand"; rm -f "$rest" "$nj"
+          grep -q 'vexor:n8n:begin' "$conf" && conf_has=1
+          [ "$conf_has" = 1 ] && [ -n "$(n8n_hook)" ] && was=1
+          DET_ERR="$(det_py integ-raw-split "$t" "$rest" "$nj" "$(n8n_hook)" 2>&1)" || det_problem integrations raw put "the integrations were refused (nothing changed):"
+          [ "$(pj 'print(1 if d.get("present") else 0)' < "$nj")" = 1 ] && want=1
+          if [ "$want" = 1 ]; then
+            nurl="$(n8n_hook_url "$(pj 'print(d["hook"])' < "$nj")")"; nlvl="$(pj 'print(d["level"])' < "$nj")"; ngrp="$(pj 'print(d["groups"])' < "$nj")"
+            if [ "$was" = 0 ] || [ "$nurl" != "$(n8n_hook)" ] || [ "$nlvl" != "$(n8n_level)" ] || [ "$ngrp" != "$(env_get N8N_ALERT_GROUPS)" ]; then
+              n8n_do=connect
+              [[ "$nurl" == http://n8n:5678/* ]] && ! tool_on n8n && { DET_ERR="N8N is not enabled: vexor n8n enable"; det_problem integrations raw put "the integrations were refused (nothing changed):"; }
+            fi
+          elif [ "$was" = 1 ]; then n8n_do=disconnect; fi
+          DET_ERR="$(det_py integ-raw-set "$cd" "$rest" $(n8n_conf_files) 2>&1)" || det_problem integrations raw put "the integrations were refused (nothing changed):"
+          for f in $(grep -o '<name>custom-[A-Za-z0-9_-]*</name>' "$rest" | sed -E 's/<[^>]*>//g'); do
             miss="$(det_integ_script_missing "$f")" && { DET_ERR="no script /var/ossec/integrations/$f in $miss"; det_problem integrations raw put "refused (nothing changed):"; }
           done
-          det_conf_apply "$cd" integrations raw put
-          det_rec integrations raw put 1 "integrations edited by hand"
-          ok "integrations: saved" ;;
+          [ -n "$(ls -A "$cd")" ] && rest_changed=1
+          if [ "$rest_changed" = 0 ] && [ -z "$n8n_do" ]; then ok "integrations unchanged"; return 0; fi
+          # 1) the other integrations (Wazuh checks the new ossec.conf, rolls back on failure)
+          if [ "$rest_changed" = 1 ]; then
+            DET_WANT_INTEGRATORD=0; { grep -q '<integration>' "$rest" || [ "$want" = 1 ]; } && DET_WANT_INTEGRATORD=1
+            det_conf_apply "$cd" integrations raw put
+            det_rec integrations raw put 1 "integrations edited by hand"
+            ok "integrations: saved"
+          fi
+          # 2) n8n: same code as the n8n card / vexor n8n (an own manager recreate only if its block changes)
+          case "$n8n_do" in
+            connect)
+              if ( cmd_n8n connect "$nurl" --level "$nlvl" --groups "$ngrp" ); then det_rec integrations custom-n8n raw 1 "n8n connected by hand: $nurl"
+              else det_rec integrations custom-n8n raw 0 "n8n change failed"; bad "n8n was not changed$([ "$rest_changed" = 1 ] && echo " (the other integrations are saved)")"; return 1; fi ;;
+            disconnect)
+              if ( cmd_n8n disconnect ); then det_rec integrations custom-n8n raw 1 "n8n disconnected by hand"
+              else det_rec integrations custom-n8n raw 0 "n8n disconnect failed"; bad "n8n was not disconnected$([ "$rest_changed" = 1 ] && echo " (the other integrations are saved)")"; return 1; fi ;;
+          esac ;;
         *) die "usage: vexor wazuh integrations raw show | put --from <path|->" ;;
       esac ;;
     test)
@@ -6685,12 +6913,12 @@ if not d["master_running"]:
     print("  wazuh.master is not running")' <<<"$out"
 }
 det_sums() {                   # det_sums <svc>: "md5  kind/name" of the files in /var/ossec/etc/{rules,decoders,lists}
-  dc exec -T "$1" sh -c 'cd /var/ossec/etc && md5sum rules/*.xml decoders/*.xml lists/* 2>/dev/null' 2>/dev/null | tr -d '\r'
+  dc exec -T "$1" sh -c 'cd /var/ossec/etc && md5sum rules/*.xml decoders/*.xml lists/* lists/*/* 2>/dev/null' 2>/dev/null | tr -d '\r'
 }
 det_out_of_sync() {            # det_out_of_sync <svc>: custom files (kind/name) whose copy in <svc> is missing or different
-  [ -d "$DET_DIR" ] || return 0
+  [ -d "$DET_DIR" ] || return 0  # edited built-ins too: same name in etc/<kind> (lists/<dir>/<file> for the shipped sub directories)
   local remote; remote="$(det_sums "$1")"
-  (cd "$DET_DIR" && md5sum rules/*.xml decoders/*.xml lists/* 2>/dev/null) | while read -r sum f; do
+  (cd "$DET_DIR" && md5sum rules/*.xml decoders/*.xml lists/* lists/*/* 2>/dev/null) | while read -r sum f; do
     grep -qxF "$sum  $f" <<<"$remote" || echo "$f"
   done
 }
@@ -6718,7 +6946,8 @@ detection_sync() {             # start / config apply: custom files back into ma
 det_doctor() {                 # doctor (Managers): custom detection files in every manager, custom-* integration scripts present
   local m miss n
   [ -d "$DET_DIR" ] || return 0
-  n="$(find "$DET_DIR/rules" "$DET_DIR/decoders" "$DET_DIR/lists" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | wc -l)"
+  n="$(find "$DET_DIR/rules" "$DET_DIR/decoders" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | wc -l)"
+  n=$((n + $(find "$DET_DIR/lists" -maxdepth 2 -type f ! -name '.*' 2>/dev/null | wc -l)))   # edited built-in lists can sit in a sub directory
   [ "$n" -gt 0 ] || return 0
   for m in $(det_running_managers); do
     miss="$(det_out_of_sync "$m" | tr '\n' ' ')"
@@ -6726,6 +6955,12 @@ det_doctor() {                 # doctor (Managers): custom detection files in ev
     else d_warn "$m misses or runs older custom detection files: $miss" "vexor doctor --fix   (pushes config/wazuh_custom and reloads)"
          d_fix "push the custom detection files + reload" && detection_sync; fi
   done
+  if [ -s "$DET_OVR" ]; then   # edited built-in rules/decoders need their path-qualified exclude in every ossec.conf (vexor:excludes)
+    local cd="$RUN_TMP/det-doc"; rm -rf "$cd"; mkdir -p "$cd"; det_excl_sync_conf "$cd" 2>/dev/null
+    if [ -z "$(ls -A "$cd" 2>/dev/null)" ]; then d_pass "edited built-in Wazuh files (rules/decoders/lists): $(det_ovr_list rules | wc -l)/$(det_ovr_list decoders | wc -l)/$(det_ovr_list lists | wc -l), ossec.conf excludes match"
+    else d_warn "the vexor:excludes block in $(ls "$cd" | paste -sd' ' -) does not match config/wazuh_custom/.overrides (a built-in file and its edited copy may both load, or neither)" \
+           "save the file again (vexor wazuh <kind> put <name>) or drop the edit (vexor wazuh <kind> reset <name>)"; fi
+  fi
   local i
   for i in $(det_py integ-names "$CLUSTER_DIR/wazuh_manager.conf" 2>/dev/null | grep '^custom-' | grep -vx custom-n8n); do
     for m in $(det_running_managers); do
@@ -7889,7 +8124,7 @@ _vexor() {
       proxy)   words="ls show add edit rm cert cert-file apply --json --tls local letsencrypt off --websocket --no-websocket --max-body --target --renew ca cert" ;;
       passwd)  words="admin kibanaserver api --generate" ;;
       agents)  words="list summary outdated remove enroll-cmd password linux rpm windows macos on off show --name --group" ;;
-      wazuh)   words="status alerts logtest rules decoders lists integrations config detection agents cluster ls show put rm history restore templates add del edit test set custom --from --json --format --location --hook-url --api-key --api-key-file --level --group --rule-id --scope -n --grep" ;;
+      wazuh)   words="status alerts logtest rules decoders lists integrations config detection agents cluster ls show put rm reset history restore templates add del edit test set custom --from --json --format --location --hook-url --api-key --api-key-file --level --group --rule-id --scope -n --grep" ;;
       console) words="status enable disable restart url password logs --generate" ;;
       n8n)     words="status enable disable connect disconnect test workflow credentials backup reset-owner logs --level --groups --srcip import file" ;;
       suricata) words="status enable disable alerts test update-rules logs -n --since" ;;
@@ -8575,11 +8810,14 @@ ${C_BD}Wazuh${C_0} (SOC=wazuh|both)
   wazuh alerts [-n N] [--level N] [--grep TEXT]   newest alerts of every manager
   wazuh logtest ["line"] [--format F] [--location L] [--json]
                                  run one line through the master's decoders and rules (no line: interactive)
-  wazuh rules|decoders ls|show|put|rm|history|restore|templates [--json]
+  wazuh rules|decoders ls|show|put|rm|reset|history|restore|templates [--json]
                                  custom files in config/wazuh_custom: put <name> --from <path|-> is checked by Wazuh
-                                 (wazuh-analysisd -t) and rolled back when refused, then loaded without a restart
-  wazuh lists ls|show|put|rm|history|restore | add <name> <key>[:<value>] | del <name> <key>
-                                 CDB lists; the <list> line in ossec.conf follows (the managers are recreated)
+                                 (wazuh-analysisd -t) and rolled back when refused, then loaded without a restart;
+                                 built-in files (NNNN-...xml) can be edited too (the shipped one is excluded), reset <name>
+                                 brings the shipped file back
+  wazuh lists ls|show|put|rm|reset|history|restore | add <name> <key>[:<value>] | del <name> <key>
+                                 CDB lists; the <list> line in ossec.conf follows (the managers are recreated);
+                                 built-in lists (audit-keys, amazon/aws-eventnames ...) are edited in place, reset undoes it
   wazuh integrations ls | add|edit <name> [--hook-url URL] [--api-key K|--api-key-file F] [--level N] [--group G]
                                  [--rule-id IDS] | rm <name> | test <name>   (slack pagerduty virustotal shuffle maltiverse custom-<id>;
                                  custom-n8n = vexor n8n connect: --hook-url is the webhook path or URL, no key needed)

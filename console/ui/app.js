@@ -6,7 +6,7 @@ let CSRF = "";
 let STATE = {};
 
 // ---------------------------------------------------------------- API
-const FRESH_OK = /^\/api\/(state|containers|disk|volumes|proxy)$/;   // endpoints the server caches; fresh=1 waits for new data
+const FRESH_OK = /^\/api\/(state|containers|disk|volumes|proxy|detection\/integrations)$/;   // endpoints the server caches; fresh=1 waits for new data
 async function api(path, opts = {}) {
   if (!opts.body && opts.fresh && FRESH_OK.test(path.split("?")[0])) path += (path.includes("?") ? "&" : "?") + "fresh=1";
   const r = await fetch(path, {
@@ -247,9 +247,9 @@ function paint(html) {
 }
 // GET for the current page: aborted when the page changes, kept as the page's last data for an instant repaint.
 const LAST = {};
-async function get(path) {
+async function get(path, fresh = false) {
   const pg = PAGE;
-  const r = await api(path, { signal: pg.ctl.signal, fresh: pg.fresh });
+  const r = await api(path, { signal: pg.ctl.signal, fresh: pg.fresh || fresh });
   if (pg.ctl.signal.aborted) throw new DOMException("page changed", "AbortError");
   if (r.status === 200) LAST[path] = r.data;
   return r;
@@ -1337,7 +1337,7 @@ function detShell(tab) {
 const detEmptyEditor = (tab) => `<div class="ed ed--empty"><p class="muted">Open a ${DET_KINDS[tab] || "file"} from the list to read or edit it, or create a new one.</p></div>`;
 async function vDetection() {
   const tab = DET_TABS.some(([k]) => k === PAGE.sub) ? PAGE.sub : "rules";
-  DET.tab = tab; DET.ed = null; DET.saving = false;
+  DET.tab = tab; DET.ed = null; DET.saving = false; DET.intCode = false;
   PAGE.cleanup = () => { DET.ed = null; };
   setTitle("Detection");
   paint(detShell(tab));
@@ -1352,13 +1352,14 @@ function detDrawList() {
   const el = $("[data-det-list]"), kind = detKind();
   if (!el || !kind) return;
   const open = DET.ed && !DET.ed.isNew ? DET.ed.name : null;
-  const files = [...detFiles(kind)].sort((a, b) => (b.editable !== false) - (a.editable !== false) || String(a.name).localeCompare(b.name));
+  const srcOf = (f) => f.source || (f.editable === false ? "wazuh" : "custom");
+  const files = [...detFiles(kind)].sort((a, b) => (srcOf(b) === "custom") - (srcOf(a) === "custom") || String(a.name).localeCompare(b.name));
   const rows = files.map((f) => {
     const n = f.rules ?? f.decoders ?? f.entries ?? f.count, ids = Array.isArray(f.ids) && f.ids.length ? `${f.ids[0]}${f.ids[1] != null && f.ids[1] !== f.ids[0] ? "-" + f.ids[1] : ""}` : "";
-    const src = f.source || (f.editable === false ? "wazuh" : "custom");
+    const src = srcOf(f), mod = src === "wazuh" && f.modified;
     const bits = [n != null ? `${n} ${kind === "lists" ? "entries" : kind}` : "", ids ? "ids " + ids : "", detWhen(f.mtime)].filter(Boolean);
     return `<li data-key="${esc(f.name)}"><button type="button" class="det-file${open === f.name ? " is-open" : ""}" data-det-open="${esc(f.name)}"${open === f.name ? ' aria-current="true"' : ""}>
-      <span class="det-file__name mono">${esc(f.name)}</span>${pill(src, src === "custom" ? "accent" : "")}${f.error ? pill("error", "bad") : ""}
+      <span class="det-file__name mono">${esc(f.name)}</span>${pill(mod ? "wazuh · modified" : src, mod ? "warn" : src === "custom" ? "accent" : "")}${f.error ? pill("error", "bad") : ""}
       <span class="det-file__meta muted small">${esc(bits.join(" · "))}</span></button></li>`;
   });
   const html = rows.join("") || `<li class="muted small">${DET.data ? `No ${kind} yet.` : SK}</li>`;
@@ -1381,26 +1382,30 @@ async function detReload() {
 
 // ---- editor
 function detEditorHtml(ed) {
-  const ro = !ed.editable, cfg = ed.kind === "config" || ed.kind === "integrations", ext = ed.kind === "lists" ? "" : ".xml";
+  const ro = !ed.editable, builtin = !ro && ed.source === "wazuh" && !ed.isNew && !!DET_KINDS[ed.kind], cfg = ed.kind === "config" || ed.kind === "integrations", ext = ed.kind === "lists" ? "" : ".xml";
   return `<div class="ed" data-ed>
     <div class="ed__bar">
       <div class="ed__title">
         ${ed.isNew ? `<label class="vh" for="ed-name">Name of the new ${esc(DET_KINDS[ed.kind] || "file")}</label><input id="ed-name" class="in ed__name" data-ed-name value="${esc(ed.name)}" placeholder="my-${esc(DET_KINDS[ed.kind] || "file")}" autocomplete="off" spellcheck="false" autocapitalize="off"><span class="muted mono small">${ext}</span>`
           : `<b class="mono ed__fname">${esc(ed.kind === "integrations" ? "ossec.conf · integrations" : cfg ? "ossec.conf · custom block" : ed.name)}</b>`}
-        ${ro ? pill("read-only", "warn") : ""}${ed.source && !ed.isNew && !cfg ? pill(ed.source, ed.source === "custom" ? "accent" : "") : ""}
+        ${ro ? pill("read-only", "warn") : ""}${ed.source && !ed.isNew && !cfg ? (ed.source === "wazuh" && ed.modified ? pill("wazuh · modified", "warn") : pill(ed.source, ed.source === "custom" ? "accent" : "")) : ""}
         <span class="ed__dirty" data-ed-dirty hidden>● unsaved</span>
       </div>
       <div class="actions">
         ${ed.kind === "config" ? '<label class="ed__scope muted small">Scope <select class="in" data-cc-scope><option value="master">master only</option><option value="all">all managers</option></select></label>' : ""}
         ${ro ? (ed.kind !== "config" ? '<button type="button" class="btn btn--sm" data-ed-copy>Copy to a new file</button>' : "") : '<button type="button" class="btn btn--sm btn--primary" data-ed-save>Save</button>'}
-        ${!ro && !ed.isNew && !cfg ? '<button type="button" class="btn btn--sm" data-ed-hist aria-expanded="false">History</button><button type="button" class="btn btn--sm btn--danger-ghost" data-ed-del>Delete</button>' : ""}
+        ${!ro && !ed.isNew && !cfg && (!builtin || ed.modified) ? '<button type="button" class="btn btn--sm" data-ed-hist aria-expanded="false">History</button>' : ""}
+        ${builtin ? '<button type="button" class="btn btn--sm" data-ed-copy>Copy to a new file</button>' : ""}${builtin && ed.modified ? '<button type="button" class="btn btn--sm btn--danger-ghost" data-ed-reset>Reset to original</button>' : ""}
+        ${!ro && !ed.isNew && !cfg && !builtin ? '<button type="button" class="btn btn--sm btn--danger-ghost" data-ed-del>Delete</button>' : ""}
+        ${ed.kind === "integrations" ? '<button type="button" class="btn btn--sm btn--ghost" data-int-back>Back to cards</button>' : ""}
         ${cfg ? "" : '<button type="button" class="btn btn--sm btn--ghost" data-ed-close>Close</button>'}
       </div>
     </div>
     ${ed.note ? `<p class="ed__banner">${esc(ed.note)}</p>` : ""}
+    ${builtin && !ed.modified ? '<p class="ed__banner">Built-in Wazuh file: saving creates a persistent override; Reset to original restores the shipped file.</p>' : ""}
     <p class="ed__banner ed__banner--ver" data-ed-banner hidden></p>
     <div class="ed__box"><pre class="ed__gutter" data-ed-gutter aria-hidden="true">1</pre><textarea class="ed__ta" data-ed-ta aria-label="Contents of ${esc(ed.kind === "integrations" ? "the integrations XML" : cfg ? "the custom config block" : ed.name || "the new file")}" wrap="off" spellcheck="false" autocomplete="off" autocapitalize="off"${ro ? " readonly" : ""}></textarea></div>
-    <p class="muted small ed__hint">${ro ? "Built-in or Vexor-generated: read-only. Copy it to a new file to change it." : "Ctrl/Cmd+S saves · Tab indents, Shift+Tab outdents · Esc then Tab leaves the editor."}</p>
+    <p class="muted small ed__hint">${ro ? "Vexor-generated: read-only. Copy it to a new file to change it." : "Ctrl/Cmd+S saves · Tab indents, Shift+Tab outdents · Esc then Tab leaves the editor."}</p>
     ${ed.kind === "lists" && !ro && !ed.isNew ? `<form class="mini" data-list-add><label class="grow">Key <input class="in" name="key" autocomplete="off" spellcheck="false" placeholder="203.0.113.9" required></label><label class="grow">Value (optional) <input class="in" name="value" autocomplete="off" spellcheck="false" placeholder="blocked"></label><button class="btn btn--sm" type="submit">Add entry</button></form>` : ""}
     <div class="ed__extra" data-ed-extra></div>
   </div>`;
@@ -1430,7 +1435,7 @@ async function detOpen(kind, name) {
   const { status, data } = await get(`/api/detection/file?kind=${kind}&name=${encodeURIComponent(name)}`);
   if (status !== 200) { box.innerHTML = `<p class="err">${esc(data.error || "The file could not be read.")}</p>`; return; }
   const meta = detFiles(kind).find((f) => f.name === name) || {};
-  detEdMount({ kind, name, orig: data.content ?? "", editable: data.editable !== false && meta.editable !== false, source: meta.source, isNew: false, version: null, stash: "" }, data.content ?? "");
+  detEdMount({ kind, name, orig: data.content ?? "", editable: data.editable !== false && meta.editable !== false, source: data.source ?? meta.source, modified: !!(data.modified ?? meta.modified), isNew: false, version: null, stash: "" }, data.content ?? "");
   detDrawList(); detScrollTo();
 }
 async function detNew(name = "", content = "", note = "") {
@@ -1462,7 +1467,7 @@ async function detSave() {
   if (cfg) body.scope = $("[data-cc-scope]").value;
   const btn = $("[data-ed-save]");
   DET.saving = true; if (btn) btn.disabled = true;
-  const job = await postConfirm("/api/detection/file", body, { text: raw ? "Replaces the integrations Vexor manages in ossec.conf on every manager, lets Wazuh check them and restarts the managers. A failing change is rolled back." : cfg ? "Replaces the custom block in ossec.conf, checks it and applies it. A failing block is rolled back." : "Saves the file on the host, pushes it to the manager and lets Wazuh check it. A file that fails the check is rolled back; a good one is loaded." }).catch(() => null);
+  const job = await postConfirm("/api/detection/file", body, { text: raw ? "Replaces the integrations in ossec.conf on every manager, lets Wazuh check them and restarts the managers. A failing change is rolled back. Changing the custom-n8n block reconnects n8n (alerts go to the new webhook/level/group); removing it disconnects n8n; the n8n API key is kept." : cfg ? "Replaces the custom block in ossec.conf, checks it and applies it. A failing block is rolled back." : "Saves the file on the host, pushes it to the manager and lets Wazuh check it. A file that fails the check is rolled back; a good one is loaded." }).catch(() => null);
   if (!job) { DET.saving = false; if (btn) btn.disabled = false; return; }
   openJob(job, (code) => detSaved(ed, name, content, code));
 }
@@ -1474,8 +1479,9 @@ function detSaved(ed, name, content, code) {
   if (code !== 0) return toast("Not saved - the output shows why. Your text is still in the editor.", "bad");
   toast("Saved.");
   ed.orig = content;
-  if (ed.kind === "integrations") { detDirtyUi(); return detIntLoad(); }
-  if (ed.isNew) { const cur = $("[data-ed-ta]").value; ed.isNew = false; ed.name = name; ed.source = "custom"; detEdMount(ed, cur); detDrawList(); } else detDirtyUi();
+  if (ed.kind === "integrations") { detDirtyUi(); return detIntLoad(true); }
+  if (ed.isNew) { const cur = $("[data-ed-ta]").value; ed.isNew = false; ed.name = name; ed.source = "custom"; detEdMount(ed, cur); detDrawList(); }
+  else if (ed.source === "wazuh" && !ed.modified) { const cur = $("[data-ed-ta]").value; ed.modified = true; detEdMount(ed, cur); detDrawList(); } else detDirtyUi();
 }
 // Tab / Shift+Tab / Enter in the editor
 function detEditKey(e) {
@@ -1549,7 +1555,7 @@ async function detReopen(history = false) {
   if (!ed || PAGE.key !== "detection") return;
   const { status, data } = await get(`/api/detection/file?kind=${ed.kind}&name=${encodeURIComponent(ed.name)}`);
   if (status !== 200) return;
-  detEdMount({ ...ed, orig: data.content ?? "", version: null, stash: "" }, data.content ?? "");
+  detEdMount({ ...ed, orig: data.content ?? "", modified: !!(data.modified ?? ed.modified), version: null, stash: "" }, data.content ?? "");
   if (history) detHist(true);
 }
 function detDelete() {
@@ -1560,12 +1566,20 @@ function detDelete() {
     onEnd: (code) => { if (code === 0 && DET.ed === ed) { DET.ed = null; $("[data-det-editor]").innerHTML = detEmptyEditor(DET.tab); detDirtyUi(); } },
   });
 }
+function detReset() {
+  const ed = DET.ed;
+  if (!ed) return;
+  run(["wazuh", ed.kind, "reset", ed.name], {
+    text: `Removes your override of ${ed.name} and restores the shipped Wazuh file, then reloads. Unsaved edits in the editor are lost.`,
+    onEnd: (code) => { if (code === 0 && DET.ed === ed) { ed.modified = false; detReopen().catch(detErr); } },
+  });
+}
 async function detCopy() {
   const ed = DET.ed, ta = $("[data-ed-ta]");
   if (!ed || !ta) return;
   const text = ta.value, base = ed.name.replace(/\.xml$/, "").replace(/^0+/, "");
   DET.ed = null;   // the read-only file holds no unsaved text, so no guard
-  await detNew(`custom-${base}`.slice(0, 64), text, "A copy of a read-only file. Change the rule IDs to 100000-199999 and give it a name before saving.");
+  await detNew(`custom-${base}`.slice(0, 64), text, "A copy of a built-in file. Change the rule IDs to 100000-199999 and give it a name before saving.");
 }
 function detListAdd(form) {
   const ed = DET.ed, v = Object.fromEntries(new FormData(form)), key = (v.key || "").trim(), val = (v.value || "").trim();
@@ -1612,16 +1626,34 @@ async function detTplPick(id) {
 const INT_TYPES = ["n8n", "slack", "pagerduty", "virustotal", "shuffle", "maltiverse", "custom"];
 const intIsN8n = (i) => i && (i.n8n || i.name === "custom-n8n");
 const intN8nPath = (u) => String(u || "").replace(/^http:\/\/n8n:5678\/webhook\//, "") || "vexor-alerts";
-async function detIntLoad() {
+// code view (DET.intCode): the whole tab is the XML editor; refreshes only reload it when it holds no edits
+// fresh: wait for new data instead of the server's 30 s cache (after a save, and when switching between cards and code)
+async function detIntLoad(force = false, fresh = force) {
   if (DET.ints && !detPanel().dataset.ready) detIntDraw();
-  const { status, data } = await get("/api/detection/integrations");
-  if (status !== 200) { detPanel().innerHTML = `<p class="err">${esc(data.error || "The integrations could not be read.")}</p>`; return; }
+  const { status, data } = await get("/api/detection/integrations", fresh);
+  if (status !== 200) { if (!DET.intCode) detPanel().innerHTML = `<p class="err">${esc(data.error || "The integrations could not be read.")}</p>`; return; }
   DET.ints = data.integrations || [];
+  if (DET.intCode) { if (force ? !detEdDirty() : !DET.ed || DET.ed.kind !== "integrations") await detIntRawLoad(); return; }
   detIntDraw();
-  if (!DET.ed || !detEdDirty()) await detIntRawLoad();
+}
+async function detIntCode() {
+  if (!(await detLeaveOk())) return;
+  const p = detPanel();
+  DET.intCode = true; DET.ed = null; p.dataset.mode = "code"; p.dataset.ready = "1";
+  p.innerHTML = `<p class="muted">The same integrations as the cards, written as <code>&lt;integration&gt;</code> blocks. Wazuh checks them before they stay and a failing change is rolled back. n8n (<code>custom-n8n</code>) is included: change its <code>hook_url</code>, <code>level</code> or <code>group</code>, or delete the block to disconnect it. Its API key is managed automatically and never shown.</p>
+    <div data-det-editor><p class="muted">Loading…</p></div>`;
+  await detIntRawLoad();
+  detDirtyUi();
+}
+async function detIntBack() {
+  if (!(await detLeaveOk())) return;
+  DET.intCode = false; DET.ed = null;
+  detDirtyUi();
+  await detIntLoad(false, true);
 }
 async function detIntRawLoad() {
   const r = await get("/api/detection/file?kind=integrations&name=raw");
+  if (!DET.intCode) return;
   if (r.status !== 200) { const b = $("[data-det-editor]"); if (b) b.innerHTML = `<p class="err">${esc(r.data.error || "The integrations XML could not be read.")}</p>`; return; }
   const content = r.data.content ?? "";
   if (!$("[data-det-editor]")) return;
@@ -1629,15 +1661,13 @@ async function detIntRawLoad() {
 }
 const hostOf = (u) => { try { return new URL(u).origin + "/…"; } catch { return u ? String(u).slice(0, 40) + "…" : ""; } };
 function detIntDraw() {
+  if (DET.intCode) return;
   const list = DET.ints || [], p = detPanel();
   p.dataset.ready = "1";
-  if (!$("[data-int-cards]", p)) p.innerHTML = `<div data-int-cards></div>
-    <section class="block" id="sec-raw"><h2>Advanced: edit as XML</h2>
-      <p class="muted">The same integrations as the cards, written as <code>&lt;integration&gt;</code> blocks, like the rule and decoder editors. Wazuh checks them before they stay and a failing change is rolled back. n8n is not listed here: use the n8n card.</p>
-      <div data-det-editor><p class="muted">Loading…</p></div></section>`;
+  if (p.dataset.mode !== "cards" || !$("[data-int-cards]", p)) { p.innerHTML = "<div data-int-cards></div>"; p.dataset.mode = "cards"; }
   morphInto($("[data-int-cards]", p), `
     <p class="lede">Send Wazuh alerts to other tools. Vexor writes these into <code>ossec.conf</code> on the master and every worker, between its own markers. API keys are kept on the manager and never shown again.</p>
-    <div class="actions"><button type="button" class="btn btn--sm btn--primary" data-int-add>Add integration</button></div>
+    <div class="actions"><button type="button" class="btn btn--sm btn--primary" data-int-add>Add integration</button><button type="button" class="btn btn--sm" data-int-code>Edit as code</button></div>
     <div class="ints">${list.map((i) => {
       const ro = i.managed === false && !intIsN8n(i);
       return `<article class="int${ro ? " int--ro" : ""}" data-key="${esc(i.name)}"><header><h3 class="mono">${esc(i.name)}</h3>${ro ? pill("written by hand", "warn") : ""}${intIsN8n(i) ? pill("n8n", "accent") : i.api_key_set ? pill("API key set", "ok") : pill("no API key")}</header>
@@ -1822,6 +1852,9 @@ function detLtHtml(r) {
     if (at("data-ed-hist")) return detHist();
     if (at("data-ed-del")) return detDelete();
     if (at("data-ed-copy")) return detCopy();
+    if (at("data-ed-reset")) return detReset();
+    if (at("data-int-code")) return detIntCode();
+    if (at("data-int-back")) return detIntBack();
     if (at("data-ed-close")) return detClose();
     if ((b = at("data-hist-view"))) return detView(b.dataset.histView);
     if ((b = at("data-hist-restore"))) return detRestore(b.dataset.histRestore);
@@ -1829,7 +1862,7 @@ function detLtHtml(r) {
     if (at("data-int-add")) return detIntForm(null);
     if ((b = at("data-int-edit"))) return detIntForm((DET.ints || []).find((i) => i.name === b.dataset.intEdit));
     if ((b = at("data-int-test"))) return run(["wazuh", "integrations", "test", b.dataset.intTest], { text: "Sends a sample alert through this integration." });
-    if ((b = at("data-int-rm"))) return run(["wazuh", "integrations", "rm", b.dataset.intRm], { text: b.dataset.intRm === "custom-n8n" ? "Stops sending alerts to n8n: removes the integration from ossec.conf on every manager and restarts them." : `Removes ${b.dataset.intRm} from ossec.conf on every manager and restarts them.` });
+    if ((b = at("data-int-rm"))) return run(["wazuh", "integrations", "rm", b.dataset.intRm], { text: b.dataset.intRm === "custom-n8n" ? "Stops sending alerts to n8n: removes the integration from ossec.conf on every manager and restarts them." : `Removes ${b.dataset.intRm} from ossec.conf on every manager and restarts them.`, onEnd: () => { if (PAGE.key === "detection") detIntLoad(true); } });
     if ((b = at("data-cfg-addrow"))) { b.insertAdjacentHTML("beforebegin", detCfgItem()); $$("[data-cfg-item]", b.parentElement).at(-1).focus(); return detDirtyUi(); }
     if ((b = at("data-cfg-del"))) { b.closest(".cfg-item").remove(); return detDirtyUi(); }
     if (at("data-cfg-reset")) return detCfgLoad();
