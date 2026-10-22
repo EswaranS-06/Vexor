@@ -91,11 +91,11 @@ Available when `SOC` is `wazuh` or `both`.
 | `wazuh lists ls \| show \| put \| rm \| history \| restore` | The same for CDB lists in `config/wazuh_custom/lists/`. |
 | `wazuh lists add <name> <key>[:<value>]` / `wazuh lists del <name> <key>` | Add or remove one entry without editing the file. |
 | `wazuh integrations ls [--json]` | Integrations in the manager config: hook URL, whether an API key is set (the key is never shown), level, group, rule IDs, format. The n8n block is read-only here. |
-| `wazuh integrations add <name> [--hook-url URL] [--api-key K] [--level N] [--group G] [--rule-id IDS] [--format json]` | Add `slack`, `pagerduty`, `virustotal`, `shuffle`, `maltiverse` or `custom-<id>`. Written to the master and every worker. |
+| `wazuh integrations add <name> [--hook-url URL] [--api-key K \| --api-key-file F] [--level N] [--group G] [--rule-id IDS] [--format json]` | Add `slack`, `pagerduty`, `virustotal`, `shuffle`, `maltiverse` or `custom-<id>`. Written to the master and every worker, then the managers are recreated. A `custom-<id>` needs its script in `/var/ossec/integrations/` first. `--api-key-file` keeps the key out of the process list. |
 | `wazuh integrations edit <name> [same options]` / `wazuh integrations rm <name>` / `wazuh integrations test <name>` | Change or remove one / send a sample alert through it. |
 | `wazuh config ls [--json]` | Curated manager settings (alert log level, email, logall, syscheck, localfile, active response, enrollment password) with their scope (`all` or `master`). |
-| `wazuh config set <key> <value>` | Change one of them. |
-| `wazuh config custom show` / `wazuh config custom put --from <path\|-> [--scope master\|all]` | The raw XML block between the `vexor:custom` markers. Vexor's own blocks are never touched. |
+| `wazuh config set <key> <value> [<key> <value> ..]` | Change one or more of them in one go (one check, one restart). List values are comma-separated or a JSON array. |
+| `wazuh config custom show` / `wazuh config custom put --from <path\|-> [--scope master\|all]` / `wazuh config custom rm` | The raw XML block between the `vexor:custom` markers. Wazuh checks it first; a block it refuses changes nothing. Vexor's own blocks are never touched. |
 | `wazuh detection status --json` | Counts of rules, decoders and lists, the last change and the last error. The Detection page header shows the same. |
 | `agents list \| summary \| outdated` | Agents with status, node, version and OS / counts by status / agents older than the manager. |
 | `agents enroll-cmd [linux\|rpm\|windows\|macos] [--name N] [--group G]` | Copy-paste install commands, including the enrollment password and non-default ports. |
