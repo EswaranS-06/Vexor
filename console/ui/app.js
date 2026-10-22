@@ -65,17 +65,19 @@ $("[data-pw-form]").addEventListener("submit", async (e) => {
 });
 
 // ---------------------------------------------------------------- confirm dialog
-function confirmDialog({ cmd, level, word, text }) {
+function confirmDialog({ cmd, level, word, text, title, ok: okLabel, destructive }) {
   const d = $("[data-confirm]");
-  $("[data-confirm-title]").textContent = level === "danger" ? "This can stop services or delete data" : "Run this command?";
-  $("[data-confirm-cmd]").textContent = cmd;
+  $("[data-confirm-title]").textContent = title || (level === "danger" ? "This can stop services or delete data" : "Run this command?");
+  $("[data-confirm-cmd]").textContent = cmd || "";
+  $("[data-confirm-cmd]").hidden = !cmd;
   $("[data-confirm-text]").textContent = text || (level === "danger" ? "Read the command carefully. Volumes and backups are kept unless the command says otherwise." : "It changes the running stack.");
   const box = $("[data-confirm-wordbox]"), input = $("[data-confirm-input]"), ok = $("[data-confirm-ok]");
   box.hidden = level !== "danger";
   input.value = "";
   $("[data-confirm-word]").textContent = word || "";
   ok.disabled = level === "danger";
-  ok.classList.toggle("btn--danger", level === "danger");
+  ok.textContent = okLabel || "Run";
+  ok.classList.toggle("btn--danger", level === "danger" || !!destructive);
   input.oninput = () => (ok.disabled = input.value !== word);
   d.showModal();
   (level === "danger" ? input : ok).focus();
@@ -152,18 +154,23 @@ $("[data-copy-out]").addEventListener("click", (e) => copyText($("[data-out-body
 $("[data-out-close]").addEventListener("click", () => { es?.close(); $("[data-out]").hidden = true; document.body.classList.remove("has-out"); });
 $("[data-out-stop]").addEventListener("click", () => currentJob && api(`/api/jobs/${currentJob.id}/stop`, { body: {} }));
 
-async function run(args, { onEnd, text } = {}) {
-  let body = { args };
-  let r = await api("/api/run", { body });
+// POST that may answer 409 "confirm": ask, then send it again with the confirmation. Resolves with the job summary.
+// mask: secret strings (an API key) that are replaced by dots wherever the command is shown.
+const maskCmd = (s, mask) => (mask || []).filter(Boolean).reduce((a, m) => a.split(m).join("••••••"), s || "");
+async function postConfirm(path, body, { text, mask } = {}) {
+  let r = await api(path, { body });
   if (r.status === 409) {
-    const ans = await confirmDialog({ cmd: r.data.cmd, level: r.data.confirm, word: r.data.word, text });
+    const ans = await confirmDialog({ cmd: maskCmd(r.data.cmd, mask), level: r.data.confirm, word: r.data.word, text });
     if (!ans) return null;
-    body = r.data.confirm === "danger" ? { args, confirmWord: ans } : { args, confirmed: true };
-    r = await api("/api/run", { body });
+    r = await api(path, { body: r.data.confirm === "danger" ? { ...body, confirmWord: ans } : { ...body, confirmed: true } });
   }
   if (r.status !== 200) { toast(r.data.error || "The command was refused.", "bad"); return null; }
-  openJob(r.data, onEnd);
   return r.data;
+}
+async function run(args, { onEnd, text, mask } = {}) {
+  const job = await postConfirm("/api/run", { args }, { text, mask });
+  if (job) openJob({ ...job, cmd: maskCmd(job.cmd, mask) }, onEnd);
+  return job;
 }
 function toast(msg, kind = "") {
   let t = $(".toast");
@@ -1236,7 +1243,601 @@ function proxyPaint(d) {
     </dialog>`);
 }
 
-const ROUTES = { overview: vOverview, map: vMap, containers: vContainers, stacks: vStacks, storage: vStorage, proxy: vProxy, logins: vLogins, settings: vSettings, terminal: vTerminal };
+// ---------------------------------------------------------------- Detection page
+// Wazuh rules, decoders, CDB lists, integrations and manager config (vexor wazuh ...). Tabs live in the URL
+// (#detection/rules ...). The page never refreshes on its own: a file list or form is re-read only after a command ends,
+// and an editor holding unsaved text is never repainted.
+const DET_TABS = [["rules", "Rules"], ["decoders", "Decoders"], ["lists", "Lists"], ["integrations", "Integrations"], ["config", "Manager config"], ["test", "Test"]];
+const DET_KINDS = { rules: "rule", decoders: "decoder", lists: "list" };
+const DET_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const DET = { data: null, ed: null, tab: "rules", ints: null, cfg: null, templates: {}, saving: false };
+const detKind = () => (DET_KINDS[DET.tab] ? DET.tab : "");
+const detFiles = (kind) => { const x = DET.data?.[kind]; return Array.isArray(x) ? x : x?.files || []; };
+const detPanel = () => $("[data-det-panel]");
+function detWhen(x) {
+  if (x == null || x === "") return "";
+  const s = typeof x === "string" ? x.replace(/^(\d{4})(\d{2})(\d{2})[T-]?(\d{2})(\d{2})(\d{2})Z?$/, "$1-$2-$3T$4:$5:$6Z") : x;
+  const d = new Date(typeof s === "number" ? (s < 1e12 ? s * 1000 : s) : s);
+  return isNaN(d) ? String(x) : d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+const detErr = (e) => { if (e?.name !== "AbortError" && e?.message !== "login required") toast(e?.message || "Something went wrong.", "bad"); };
+
+// A read-only vexor command run through the console; resolves with its whole output.
+async function readCmd(args) {
+  const r = await api("/api/run", { body: { args } });
+  if (r.status !== 200) throw new Error(r.data.error || "The command was refused.");
+  return new Promise((res, rej) => {
+    const lines = [], src = new EventSource(`/api/jobs/${r.data.id}/stream`);
+    src.onmessage = (e) => lines.push(...JSON.parse(e.data).lines);
+    src.addEventListener("end", (e) => { src.close(); res({ code: JSON.parse(e.data).code, text: lines.join("\n") }); });
+    src.onerror = () => { src.close(); rej(new Error("The command output was interrupted.")); };
+  });
+}
+const readJson = async (args) => {
+  const { code, text } = await readCmd(args), i = text.indexOf("{");
+  if (code !== 0 || i < 0) throw new Error(text.split("\n").filter(Boolean).pop() || "The command failed.");
+  return JSON.parse(text.slice(i));
+};
+// start a command and wait for it: {code}, or null when the confirmation was cancelled
+function runWait(args, opts = {}) {
+  return new Promise((res) => { run(args, { ...opts, onEnd: (code) => res({ code }) }).then((j) => { if (!j) res(null); }); });
+}
+
+// ---- unsaved-changes tracking
+const detText = () => { const e = DET.ed, ta = $("[data-ed-ta]"); return !e || !ta ? "" : e.version ? e.stash : ta.value; };
+const detEdDirty = () => { const e = DET.ed; return !!(e && e.editable && $("[data-ed-ta]") && detText() !== e.orig); };
+function detCfgChanges() {
+  const form = $("[data-cfg-form]"), out = {};
+  if (!form) return out;
+  $$("[data-cfg], [data-cfg-list]", form).forEach((el) => {
+    const orig = JSON.parse(el.dataset.orig);
+    if (el.hasAttribute("data-cfg-list")) {
+      const cur = $$("[data-cfg-item]", el).map((i) => i.value.trim()).filter(Boolean);
+      if (JSON.stringify(cur) !== JSON.stringify(orig)) out[el.dataset.cfgList] = cur;
+    } else if (el.value !== String(orig ?? "")) out[el.dataset.cfg] = el.value;
+  });
+  return out;
+}
+const detDirty = () => PAGE.key === "detection" && (detEdDirty() || Object.keys(detCfgChanges()).length > 0);
+const detDiscard = () => confirmDialog({ title: "Discard unsaved changes?", level: "change", text: "Some changes on this page are not saved. They are lost if you continue.", ok: "Discard changes", destructive: true });
+const detLeaveOk = async () => !detDirty() || !!(await detDiscard());
+function detDirtyUi() {
+  const d = $("[data-ed-dirty]");
+  if (d) d.hidden = !detEdDirty();
+  document.title = `${detDirty() ? "• " : ""}Detection · Vexor Console`;
+  const ch = Object.keys(detCfgChanges()), f = $("[data-cfg-form]");
+  if (f) {
+    $("[data-cfg-save]").disabled = !ch.length; $("[data-cfg-reset]").disabled = !ch.length;
+    $("[data-cfg-msg]").textContent = ch.length ? `${ch.length} change${ch.length > 1 ? "s" : ""}: ${ch.join(", ")}` : "No changes.";
+    $$("[data-cfg-row]", f).forEach((r) => r.classList.toggle("is-changed", ch.includes(r.dataset.cfgRow)));
+  }
+}
+window.addEventListener("beforeunload", (e) => { if (detDirty()) { e.preventDefault(); e.returnValue = ""; } });
+
+// ---- page
+function detShell(tab) {
+  const list = DET_KINDS[tab];
+  return `
+    <div class="det-tabs" role="tablist" aria-label="Detection sections">${DET_TABS.map(([k, l]) =>
+      `<a role="tab" id="det-tab-${k}" href="#detection/${k}" aria-selected="${k === tab}" aria-controls="det-panel" tabindex="${k === tab ? 0 : -1}" class="det-tab">${esc(l)}</a>`).join("")}</div>
+    <div class="det-panel" id="det-panel" role="tabpanel" aria-labelledby="det-tab-${tab}" data-det-panel>
+      ${list ? `<div class="det-split">
+        <section class="det-files" aria-label="${esc(tab)} files">
+          <div class="actions det-files__bar">
+            <button type="button" class="btn btn--sm btn--primary" data-det-new>New ${DET_KINDS[tab]}</button>
+            ${tab !== "lists" ? '<button type="button" class="btn btn--sm" data-det-tpl>From template…</button>' : ""}
+          </div>
+          <ul class="det-list" data-det-list><li class="muted small">${SK} loading</li></ul>
+        </section>
+        <section class="det-editor" data-det-editor aria-label="Editor">${detEmptyEditor(tab)}</section>
+      </div>` : '<p class="muted">Loading…</p>'}
+    </div>
+    <dialog class="confirm px-dialog" data-det-dialog><div class="confirm__box" data-det-dialog-body></div></dialog>`;
+}
+const detEmptyEditor = (tab) => `<div class="ed ed--empty"><p class="muted">Open a ${DET_KINDS[tab] || "file"} from the list to read or edit it, or create a new one.</p></div>`;
+async function vDetection() {
+  const tab = DET_TABS.some(([k]) => k === PAGE.sub) ? PAGE.sub : "rules";
+  DET.tab = tab; DET.ed = null; DET.saving = false;
+  PAGE.cleanup = () => { DET.ed = null; };
+  setTitle("Detection");
+  paint(detShell(tab));
+  await detTabLoad();
+}
+const detTabLoad = () => ({ integrations: detIntLoad, config: detCfgLoad, test: async () => detTestDraw() }[DET.tab] || detReload)();
+// re-read the data of the current tab without touching an editor that holds text
+const detRefresh = () => (DET_KINDS[DET.tab] ? detReload() : DET.tab === "integrations" ? detIntLoad() : DET.tab === "config" ? detCfgLoad(true) : Promise.resolve());
+
+// ---- file lists
+function detDrawList() {
+  const el = $("[data-det-list]"), kind = detKind();
+  if (!el || !kind) return;
+  const open = DET.ed && !DET.ed.isNew ? DET.ed.name : null;
+  const files = [...detFiles(kind)].sort((a, b) => (b.editable !== false) - (a.editable !== false) || String(a.name).localeCompare(b.name));
+  const rows = files.map((f) => {
+    const n = f.rules ?? f.decoders ?? f.entries ?? f.count, ids = Array.isArray(f.ids) && f.ids.length ? `${f.ids[0]}${f.ids[1] != null && f.ids[1] !== f.ids[0] ? "-" + f.ids[1] : ""}` : "";
+    const src = f.source || (f.editable === false ? "wazuh" : "custom");
+    const bits = [n != null ? `${n} ${kind === "lists" ? "entries" : kind}` : "", ids ? "ids " + ids : "", detWhen(f.mtime)].filter(Boolean);
+    return `<li data-key="${esc(f.name)}"><button type="button" class="det-file${open === f.name ? " is-open" : ""}" data-det-open="${esc(f.name)}"${open === f.name ? ' aria-current="true"' : ""}>
+      <span class="det-file__name mono">${esc(f.name)}</span>${pill(src, src === "custom" ? "accent" : "")}${f.error ? pill("error", "bad") : ""}
+      <span class="det-file__meta muted small">${esc(bits.join(" · "))}</span></button></li>`;
+  });
+  const html = rows.join("") || `<li class="muted small">${DET.data ? `No ${kind} yet.` : SK}</li>`;
+  morphInto(el, html);
+}
+function detMeta() {
+  const d = DET.data || {};
+  const custom = (k) => detFiles(k).filter((f) => f.editable !== false).length;
+  const err = d.last_error ?? d.status?.last_error;
+  setMeta([pill(`${custom("rules")} custom rule files`), pill(`${custom("decoders")} decoder files`), pill(`${custom("lists")} lists`), err ? pill("last error", "bad") : ""].join(" "));
+}
+async function detReload() {
+  if (!DET.data && LAST["/api/detection"]) { DET.data = LAST["/api/detection"]; detDrawList(); }
+  const { status, data } = await get("/api/detection");
+  const el = $("[data-det-list]");
+  if (status !== 200) { if (el && !DET.data) el.innerHTML = `<li class="err small">${esc(data.error || "The detection data could not be read.")}</li>`; throw new Error(data.error || "The detection data could not be read."); }
+  DET.data = data;
+  detDrawList(); detMeta();
+}
+
+// ---- editor
+function detEditorHtml(ed) {
+  const ro = !ed.editable, cfg = ed.kind === "config", ext = ed.kind === "lists" ? "" : ".xml";
+  return `<div class="ed" data-ed>
+    <div class="ed__bar">
+      <div class="ed__title">
+        ${ed.isNew ? `<label class="vh" for="ed-name">Name of the new ${esc(DET_KINDS[ed.kind] || "file")}</label><input id="ed-name" class="in ed__name" data-ed-name value="${esc(ed.name)}" placeholder="my-${esc(DET_KINDS[ed.kind] || "file")}" autocomplete="off" spellcheck="false" autocapitalize="off"><span class="muted mono small">${ext}</span>`
+          : `<b class="mono ed__fname">${esc(cfg ? "ossec.conf · custom block" : ed.name)}</b>`}
+        ${ro ? pill("read-only", "warn") : ""}${ed.source && !ed.isNew && !cfg ? pill(ed.source, ed.source === "custom" ? "accent" : "") : ""}
+        <span class="ed__dirty" data-ed-dirty hidden>● unsaved</span>
+      </div>
+      <div class="actions">
+        ${cfg ? '<label class="ed__scope muted small">Scope <select class="in" data-cc-scope><option value="master">master only</option><option value="all">all managers</option></select></label>' : ""}
+        ${ro ? (ed.kind !== "config" ? '<button type="button" class="btn btn--sm" data-ed-copy>Copy to a new file</button>' : "") : '<button type="button" class="btn btn--sm btn--primary" data-ed-save>Save</button>'}
+        ${!ro && !ed.isNew && !cfg ? '<button type="button" class="btn btn--sm" data-ed-hist aria-expanded="false">History</button><button type="button" class="btn btn--sm btn--danger-ghost" data-ed-del>Delete</button>' : ""}
+        ${cfg ? "" : '<button type="button" class="btn btn--sm btn--ghost" data-ed-close>Close</button>'}
+      </div>
+    </div>
+    ${ed.note ? `<p class="ed__banner">${esc(ed.note)}</p>` : ""}
+    <p class="ed__banner ed__banner--ver" data-ed-banner hidden></p>
+    <div class="ed__box"><pre class="ed__gutter" data-ed-gutter aria-hidden="true">1</pre><textarea class="ed__ta" data-ed-ta aria-label="Contents of ${esc(cfg ? "the custom config block" : ed.name || "the new file")}" wrap="off" spellcheck="false" autocomplete="off" autocapitalize="off"${ro ? " readonly" : ""}></textarea></div>
+    <p class="muted small ed__hint">${ro ? "Built-in or Vexor-generated: read-only. Copy it to a new file to change it." : "Ctrl/Cmd+S saves · Tab indents, Shift+Tab outdents · Esc then Tab leaves the editor."}</p>
+    ${ed.kind === "lists" && !ro && !ed.isNew ? `<form class="mini" data-list-add><label class="grow">Key <input class="in" name="key" autocomplete="off" spellcheck="false" placeholder="203.0.113.9" required></label><label class="grow">Value (optional) <input class="in" name="value" autocomplete="off" spellcheck="false" placeholder="blocked"></label><button class="btn btn--sm" type="submit">Add entry</button></form>` : ""}
+    <div class="ed__extra" data-ed-extra></div>
+  </div>`;
+}
+function detEdMount(ed, text) {
+  DET.ed = ed;
+  const box = $("[data-det-editor]");
+  box.innerHTML = detEditorHtml(ed);
+  $("[data-ed-ta]", box).value = text;
+  detGutter(); detDirtyUi();
+}
+function detGutter() {
+  const ta = $("[data-ed-ta]"), g = $("[data-ed-gutter]");
+  if (!ta || !g) return;
+  const n = ta.value.split("\n").length;
+  if (g.dataset.n !== String(n)) { g.dataset.n = n; g.textContent = Array.from({ length: n }, (_, i) => i + 1).join("\n"); }
+  g.scrollTop = ta.scrollTop;
+}
+function detScrollTo() { if (matchMedia("(max-width: 1000px)").matches) $("[data-det-editor]")?.scrollIntoView({ block: "start", behavior: "smooth" }); }
+async function detOpen(kind, name) {
+  if (DET.ed && DET.ed.kind === kind && DET.ed.name === name && !DET.ed.isNew) return detScrollTo();
+  if (!(await detLeaveOk())) return;
+  DET.ed = null;
+  const box = $("[data-det-editor]");
+  box.innerHTML = '<p class="muted">Loading…</p>';
+  detDrawList();
+  const { status, data } = await get(`/api/detection/file?kind=${kind}&name=${encodeURIComponent(name)}`);
+  if (status !== 200) { box.innerHTML = `<p class="err">${esc(data.error || "The file could not be read.")}</p>`; return; }
+  const meta = detFiles(kind).find((f) => f.name === name) || {};
+  detEdMount({ kind, name, orig: data.content ?? "", editable: data.editable !== false && meta.editable !== false, source: meta.source, isNew: false, version: null, stash: "" }, data.content ?? "");
+  detDrawList(); detScrollTo();
+}
+async function detNew(name = "", content = "", note = "") {
+  if (!(await detLeaveOk())) return;
+  detEdMount({ kind: detKind(), name, orig: "", editable: true, isNew: true, version: null, stash: "", note }, content);
+  detDrawList(); detScrollTo();
+  $("[data-ed-name]").focus();
+}
+async function detClose() {
+  if (!(await detLeaveOk())) return;
+  DET.ed = null;
+  $("[data-det-editor]").innerHTML = detEmptyEditor(DET.tab);
+  detDrawList(); detDirtyUi();
+}
+async function detSave() {
+  const ed = DET.ed, ta = $("[data-ed-ta]");
+  if (!ed || !ed.editable || DET.saving || !ta) return;
+  if (ed.version) return toast("Go back to the current version before saving.", "bad");
+  let name = ed.name;
+  if (ed.isNew) {
+    const inp = $("[data-ed-name]"), base = inp.value.trim().replace(/\.xml$/i, "");
+    if (!DET_NAME.test(base)) { toast("Name: letters, digits, - and _ (up to 64), starting with a letter or digit.", "bad"); inp.focus(); return; }
+    name = ed.kind === "lists" ? base : base + ".xml";
+    if (detFiles(ed.kind).some((f) => f.name === name)) { toast(`${name} already exists - open it from the list to edit it.`, "bad"); inp.focus(); return; }
+  }
+  const content = ta.value;
+  if (!content.trim()) return toast("The file is empty.", "bad");
+  const cfg = ed.kind === "config", body = { kind: ed.kind, name: cfg ? "custom" : name, content };
+  if (cfg) body.scope = $("[data-cc-scope]").value;
+  const btn = $("[data-ed-save]");
+  DET.saving = true; if (btn) btn.disabled = true;
+  const job = await postConfirm("/api/detection/file", body, { text: cfg ? "Replaces the custom block in ossec.conf, checks it and applies it. A failing block is rolled back." : "Saves the file on the host, pushes it to the manager and lets Wazuh check it. A file that fails the check is rolled back; a good one is loaded." }).catch(() => null);
+  if (!job) { DET.saving = false; if (btn) btn.disabled = false; return; }
+  openJob(job, (code) => detSaved(ed, name, content, code));
+}
+function detSaved(ed, name, content, code) {
+  DET.saving = false;
+  const btn = $("[data-ed-save]");
+  if (btn) btn.disabled = false;
+  if (PAGE.key !== "detection" || DET.ed !== ed) return;
+  if (code !== 0) return toast("Not saved - the output shows why. Your text is still in the editor.", "bad");
+  toast("Saved.");
+  ed.orig = content;
+  if (ed.isNew) { const cur = $("[data-ed-ta]").value; ed.isNew = false; ed.name = name; ed.source = "custom"; detEdMount(ed, cur); detDrawList(); } else detDirtyUi();
+}
+// Tab / Shift+Tab / Enter in the editor
+function detEditKey(e) {
+  const ta = e.target;
+  if (ta.readOnly) return;
+  if (e.key === "Escape") { ta.dataset.free = "1"; return; }
+  if (e.key !== "Tab" && e.key !== "Shift") delete ta.dataset.free;
+  if (e.key === "Enter" && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey && ta.selectionStart === ta.selectionEnd) {
+    const before = ta.value.slice(0, ta.selectionStart), indent = /^[ \t]*/.exec(before.slice(before.lastIndexOf("\n") + 1))[0];
+    if (indent) { e.preventDefault(); detInsert(ta, "\n" + indent); }
+    return;
+  }
+  if (e.key !== "Tab" || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (ta.dataset.free) { delete ta.dataset.free; return; }      // Esc was pressed: let focus leave
+  e.preventDefault();
+  const { selectionStart: s, selectionEnd: en, value: v } = ta;
+  if (s === en && !e.shiftKey) return detInsert(ta, "  ");
+  const a = v.lastIndexOf("\n", s - 1) + 1, bEnd = en > s && v[en - 1] === "\n" ? en - 1 : en, nl = v.indexOf("\n", bEnd), b = nl < 0 ? v.length : nl;
+  const lines = v.slice(a, b).split("\n"), out = lines.map((l) => (e.shiftKey ? l.replace(/^( {1,2}|\t)/, "") : "  " + l)).join("\n");
+  ta.setSelectionRange(a, b);
+  detInsert(ta, out);
+  ta.setSelectionRange(a, a + out.length);
+}
+function detInsert(ta, text) {
+  if (!document.execCommand("insertText", false, text)) { ta.setRangeText(text, ta.selectionStart, ta.selectionEnd, "end"); ta.dispatchEvent(new Event("input", { bubbles: true })); }   // execCommand keeps the undo stack and fires input itself
+}
+
+// ---- history, delete, copy
+async function detHist(force = false) {
+  const ed = DET.ed, x = $("[data-ed-extra]"), b = $("[data-ed-hist]");
+  if (!ed || ed.isNew || !x) return;
+  if (!force && x.dataset.mode === "hist") { x.dataset.mode = ""; x.innerHTML = ""; b?.setAttribute("aria-expanded", "false"); return; }
+  x.dataset.mode = "hist"; b?.setAttribute("aria-expanded", "true");
+  x.innerHTML = '<p class="muted small">Loading history…</p>';
+  let vers;
+  try { vers = (await readJson(["wazuh", ed.kind, "history", ed.name, "--json"])).versions || []; } catch (e) { x.innerHTML = `<p class="err small">${esc(e.message)}</p>`; return; }
+  x.innerHTML = `<h3 class="sub3">History - last ${vers.length} version${vers.length === 1 ? "" : "s"}</h3>` + (vers.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>When</th><th>Size</th><th><span class="vh">Actions</span></th></tr></thead><tbody>${vers.map((v) =>
+    `<tr data-key="${esc(v.id)}"${ed.version === v.id ? ' class="is-sel"' : ""}><td class="small">${esc(detWhen(v.when || v.id))}<div class="muted mono small">${esc(v.id)}</div></td><td class="num small">${esc(fmtBytes(v.size))}</td>
+    <td class="row-actions"><button type="button" class="btn btn--xs" data-hist-view="${esc(v.id)}">View</button><button type="button" class="btn btn--xs" data-hist-restore="${esc(v.id)}">Restore</button></td></tr>`).join("")}</tbody></table></div>` : '<p class="muted small">No earlier versions yet.</p>');
+}
+async function detView(id) {
+  const ed = DET.ed, ta = $("[data-ed-ta]");
+  if (!ed || !ta) return;
+  const { status, data } = await get(`/api/detection/file?kind=${ed.kind}&name=${encodeURIComponent(ed.name)}&version=${encodeURIComponent(id)}`);
+  if (status !== 200) return toast(data.error || "That version could not be read.", "bad");
+  if (!ed.version) ed.stash = ta.value;
+  ed.version = id; ta.value = data.content ?? ""; ta.readOnly = true; ta.scrollTop = 0;
+  const bn = $("[data-ed-banner]");
+  bn.hidden = false; bn.innerHTML = `Viewing version <b class="mono">${esc(id)}</b> (read-only). <button type="button" class="link-btn" data-hist-back>Back to the current text</button>`;
+  const s = $("[data-ed-save]"); if (s) s.disabled = true;
+  detGutter(); detDirtyUi();
+}
+function detBack() {
+  const ed = DET.ed, ta = $("[data-ed-ta]");
+  if (!ed || !ed.version) return;
+  ed.version = null; ta.value = ed.stash; ta.readOnly = !ed.editable; ed.stash = "";
+  $("[data-ed-banner]").hidden = true;
+  const s = $("[data-ed-save]"); if (s) s.disabled = false;
+  detGutter(); detDirtyUi();
+}
+async function detRestore(id) {
+  const ed = DET.ed;
+  if (!ed || (detEdDirty() && !(await detDiscard()))) return;
+  await run(["wazuh", ed.kind, "restore", ed.name, id], {
+    text: "Puts this version back, lets Wazuh check it and reloads. A version that fails the check is rolled back.",
+    onEnd: (code) => { if (code === 0) detReopen(true).catch(detErr); },
+  });
+}
+async function detReopen(history = false) {
+  const ed = DET.ed;
+  if (!ed || PAGE.key !== "detection") return;
+  const { status, data } = await get(`/api/detection/file?kind=${ed.kind}&name=${encodeURIComponent(ed.name)}`);
+  if (status !== 200) return;
+  detEdMount({ ...ed, orig: data.content ?? "", version: null, stash: "" }, data.content ?? "");
+  if (history) detHist(true);
+}
+function detDelete() {
+  const ed = DET.ed;
+  if (!ed) return;
+  run(["wazuh", ed.kind, "rm", ed.name], {
+    text: `Deletes ${ed.name} on the host and in the manager, then reloads. Check History first if you may want it back.`,
+    onEnd: (code) => { if (code === 0 && DET.ed === ed) { DET.ed = null; $("[data-det-editor]").innerHTML = detEmptyEditor(DET.tab); detDirtyUi(); } },
+  });
+}
+async function detCopy() {
+  const ed = DET.ed, ta = $("[data-ed-ta]");
+  if (!ed || !ta) return;
+  const text = ta.value, base = ed.name.replace(/\.xml$/, "").replace(/^0+/, "");
+  DET.ed = null;   // the read-only file holds no unsaved text, so no guard
+  await detNew(`custom-${base}`.slice(0, 64), text, "A copy of a read-only file. Change the rule IDs to 100000-199999 and give it a name before saving.");
+}
+function detListAdd(form) {
+  const ed = DET.ed, v = Object.fromEntries(new FormData(form)), key = (v.key || "").trim(), val = (v.value || "").trim();
+  if (!ed || !key) return;
+  if (key.includes(":")) return toast("The key cannot contain a colon; put the part after it in Value.", "bad");
+  if (detEdDirty()) return toast("Save or discard your edits to the text first.", "bad");
+  run(["wazuh", "lists", "add", ed.name, val ? `${key}:${val}` : key], { text: "Adds the entry to the list, checks it and reloads.", onEnd: (code) => { if (code === 0) { form.reset(); detReopen().catch(detErr); } } });
+}
+
+// ---- templates
+async function detTplOpen() {
+  const kind = detKind(), dlg = $("[data-det-dialog]"), body = $("[data-det-dialog-body]");
+  if (!DET.templates[kind]) {
+    const t = DET.data?.templates, all = Array.isArray(t) ? t : t?.templates || [];
+    let list = all.filter((x) => x.kind === kind);
+    if (!list.length) { try { list = (await readJson(["wazuh", kind, "templates", "--json"])).templates || []; } catch { list = []; } }
+    DET.templates[kind] = list;
+  }
+  const list = DET.templates[kind];
+  body.innerHTML = `<h2>New ${DET_KINDS[kind]} from a template</h2><p class="muted small">Templates are examples. Change the rule IDs (custom IDs are 100000-199999) before you save.</p>
+    <ul class="tpl-list">${list.map((t) => `<li><button type="button" class="tpl" data-tpl-pick="${esc(t.id)}"><b>${esc(t.title || t.id)}</b><span class="muted small">${esc(t.description || "")}</span></button></li>`).join("") || '<li class="muted">No templates found.</li>'}</ul>
+    <div class="confirm__actions"><button type="button" class="btn btn--ghost" data-dlg-close>Cancel</button></div>`;
+  dlg.showModal();
+  ($("[data-tpl-pick]", body) || $("[data-dlg-close]", body)).focus();
+}
+async function detTplPick(id) {
+  const kind = detKind(), t = (DET.templates[kind] || []).find((x) => x.id === id);
+  if (!t) return;
+  let content = t.content;
+  if (content == null) {
+    const r = await get(`/api/detection/template?kind=${kind}&id=${encodeURIComponent(id)}`);
+    if (r.status !== 200) return toast(r.data.error || "The template text could not be read.", "bad");
+    content = r.data.content ?? "";
+  }
+  $("[data-det-dialog]").close();
+  const name = String(t.id).toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+/, "").slice(0, 60) || "custom";
+  let n = 1;
+  const taken = (x) => detFiles(kind).some((f) => f.name === x + ".xml");
+  while (taken(n > 1 ? `${name}-${n}` : name)) n++;
+  await detNew(n > 1 ? `${name}-${n}` : name, content, `From template: ${t.title || t.id}. Review it and change the IDs before saving.`);
+}
+
+// ---- integrations
+const INT_TYPES = ["slack", "pagerduty", "virustotal", "shuffle", "maltiverse", "custom"];
+async function detIntLoad() {
+  if (DET.ints && !detPanel().dataset.ready) detIntDraw();
+  const { status, data } = await get("/api/detection/integrations");
+  if (status !== 200) { detPanel().innerHTML = `<p class="err">${esc(data.error || "The integrations could not be read.")}</p>`; return; }
+  DET.ints = data.integrations || [];
+  detIntDraw();
+}
+const hostOf = (u) => { try { return new URL(u).origin + "/…"; } catch { return u ? String(u).slice(0, 40) + "…" : ""; } };
+function detIntDraw() {
+  const list = DET.ints || [], p = detPanel();
+  p.dataset.ready = "1";
+  morphInto(p, `
+    <p class="lede">Send Wazuh alerts to other tools. Vexor writes these into <code>ossec.conf</code> on the master and every worker, between its own markers. API keys are kept on the manager and never shown again.</p>
+    <div class="actions"><button type="button" class="btn btn--sm btn--primary" data-int-add>Add integration</button></div>
+    <div class="ints">${list.map((i) => {
+      const ro = i.managed === false;
+      return `<article class="int${ro ? " int--ro" : ""}" data-key="${esc(i.name)}"><header><h3 class="mono">${esc(i.name)}</h3>${ro ? pill("managed by Vexor", "warn") : ""}${i.api_key_set ? pill("API key set", "ok") : pill("no API key")}</header>
+        <dl class="kv">${[["Hook URL", i.hook_url ? `<span class="mono" title="The full URL is in the edit form">${esc(hostOf(i.hook_url))}</span>` : ""], ["Level", i.level != null && i.level !== "" ? "≥ " + esc(i.level) : ""], ["Groups", esc(i.group || "")], ["Rule IDs", esc(i.rule_id || "")], ["Format", esc(i.alert_format || "")]]
+          .filter(([, v]) => v).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
+        <div class="actions">${ro ? '<a class="btn btn--sm" href="#stacks">Manage in Stacks</a>' : `<button type="button" class="btn btn--sm" data-int-edit="${esc(i.name)}">Edit</button><button type="button" class="btn btn--sm" data-int-test="${esc(i.name)}">Send test</button><button type="button" class="btn btn--sm btn--danger-ghost" data-int-rm="${esc(i.name)}">Remove</button>`}</div></article>`;
+    }).join("") || '<p class="muted">No integrations yet.</p>'}</div>`);
+}
+function detIntForm(int) {
+  const edit = !!int, custom = edit && /^custom-/.test(int.name), type = !edit ? "slack" : custom ? "custom" : int.name;
+  const body = $("[data-det-dialog-body]");
+  body.innerHTML = `<form class="int-form" data-int-form data-mode="${edit ? "edit" : "add"}" novalidate>
+    <h2>${edit ? "Edit " + esc(int.name) : "Add an integration"}</h2>
+    <div class="px-form px-form--stack">
+      <label class="px-field"><span>Type</span><select class="in" name="type" data-int-type ${edit ? "disabled" : ""}>${INT_TYPES.map((t) => `<option ${t === type ? "selected" : ""}>${t}</option>`).join("")}</select></label>
+      <label class="px-field" data-int-idbox ${type === "custom" ? "" : "hidden"}><span>Custom id</span><input class="in" name="cid" value="${esc(custom ? int.name.slice(7) : "")}" ${edit ? "readonly" : ""} placeholder="my-tool" autocomplete="off" spellcheck="false"><small class="field-err" data-int-err="cid"></small></label>
+      <label class="px-field"><span>Hook URL</span><input class="in" type="url" name="hook_url" value="${esc(int?.hook_url || "")}" placeholder="https://hooks.example.com/…" autocomplete="off" spellcheck="false"></label>
+      <label class="px-field"><span>API key</span><input class="in" type="password" name="api_key" autocomplete="new-password" spellcheck="false" placeholder="${edit && int.api_key_set ? "Leave empty to keep the current key" : "optional"}"><small class="muted">${edit && int.api_key_set ? "The stored key is never shown." : "Stored on the manager."}</small></label>
+      <label class="px-field"><span>Minimum alert level</span><input class="in" type="number" min="0" max="16" name="level" value="${esc(int?.level ?? "")}" placeholder="7"></label>
+      <label class="px-field"><span>Rule groups (comma separated)</span><input class="in" name="group" value="${esc(int?.group || "")}" placeholder="authentication_failed,syscheck" autocomplete="off" spellcheck="false"></label>
+      <label class="px-field"><span>Rule IDs (comma separated)</span><input class="in" name="rule_id" value="${esc(int?.rule_id || "")}" placeholder="100100,100101" autocomplete="off" spellcheck="false"></label>
+      <label class="px-check"><input type="checkbox" name="json" ${(int?.alert_format || "") === "json" ? "checked" : ""}> <span>Send the alert as JSON</span></label>
+    </div>
+    <div class="confirm__actions"><button type="button" class="btn btn--ghost" data-dlg-close>Cancel</button><button class="btn btn--primary" type="submit">${edit ? "Save" : "Add"}</button></div></form>`;
+  $("[data-det-dialog]").showModal();
+  $(edit ? "[name=hook_url]" : "[name=type]", body).focus();
+}
+async function detIntSubmit(f) {
+  const v = Object.fromEntries(new FormData(f)), edit = f.dataset.mode === "edit";
+  const type = edit ? $("[name=type]", f).value : v.type;
+  let name = type;
+  if (type === "custom") {
+    const cid = (v.cid || "").trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$/.test(cid)) { $("[data-int-err=cid]", f).textContent = "Letters, digits, - and _."; return; }
+    name = "custom-" + cid;
+  }
+  const args = ["wazuh", "integrations", edit ? "edit" : "add", name];
+  const opt = (flag, val) => { if (val != null && String(val).trim() !== "") args.push(flag, String(val).trim()); };
+  opt("--hook-url", v.hook_url); opt("--api-key", v.api_key); opt("--level", v.level); opt("--group", v.group); opt("--rule-id", v.rule_id);
+  if (v.json) args.push("--format", "json");
+  $("[data-det-dialog]").close();
+  await run(args, { mask: [v.api_key], text: `${edit ? "Updates" : "Adds"} the integration in ossec.conf on every manager, checks it and restarts the managers to load it.` });
+}
+
+// ---- manager config
+async function detCfgLoad(soft = false) {
+  const { status, data } = await get("/api/detection/config");
+  if (status !== 200) { if (!soft || !detPanel().dataset.ready) detPanel().innerHTML = `<p class="err">${esc(data.error || "The manager settings could not be read.")}</p>`; return; }
+  DET.cfg = data.settings || [];
+  if (soft && detDirty()) return;      // never replace a form or editor that holds changes
+  const p = detPanel();
+  p.dataset.ready = "1";
+  p.innerHTML = detCfgHtml(DET.cfg);
+  await detCustomLoad();
+  detDirtyUi();
+}
+function detCfgRow(s) {
+  const id = "cfg-" + s.key, orig = esc(JSON.stringify(s.value ?? ""));
+  let ctl;
+  if (Array.isArray(s.value)) {
+    ctl = `<div class="cfg-listbox" data-cfg-list="${esc(s.key)}" data-orig="${orig}" role="group" aria-labelledby="${id}-l">${s.value.map((x) => detCfgItem(x)).join("")}<button type="button" class="btn btn--xs" data-cfg-addrow>Add row</button></div>`;
+  } else if (s.choices?.length) {
+    const ch = s.choices.map(String), cur = String(s.value ?? "");
+    ctl = `<select class="in" id="${id}" data-cfg="${esc(s.key)}" data-orig="${orig}">${(ch.includes(cur) ? ch : [cur, ...ch]).map((c) => `<option ${c === cur ? "selected" : ""}>${esc(c)}</option>`).join("")}</select>`;
+  } else ctl = `<input class="in" id="${id}" data-cfg="${esc(s.key)}" data-orig="${orig}" value="${esc(s.value ?? "")}" autocomplete="off" spellcheck="false">`;
+  return `<div class="cfg-row" data-key="${esc(s.key)}" data-cfg-row="${esc(s.key)}"><div class="cfg-meta"><label for="${id}" id="${id}-l" class="mono">${esc(s.key)}</label> ${pill(s.scope === "master" ? "master only" : "all managers")}<p class="muted small">${esc(s.help || "")}</p></div><div class="cfg-ctl">${ctl}</div></div>`;
+}
+const detCfgItem = (x = "") => `<div class="cfg-item"><input class="in" data-cfg-item value="${esc(x)}" aria-label="Entry" autocomplete="off" spellcheck="false"><button type="button" class="btn btn--sm btn--ghost" data-cfg-del aria-label="Remove this row">Remove</button></div>`;
+function detCfgHtml(rows) {
+  return `<p class="lede">The common manager settings. Each changed setting is written to <code>ossec.conf</code> and applied with its own confirmation. Vexor's own blocks are never touched.</p>
+    <form class="cfg" data-cfg-form novalidate>
+      <div class="cfg-grid">${rows.map(detCfgRow).join("") || '<p class="muted">No settings were returned.</p>'}</div>
+      <div class="actions sticky-bar"><button type="submit" class="btn btn--sm btn--primary" data-cfg-save disabled>Apply changes</button><button type="button" class="btn btn--sm btn--ghost" data-cfg-reset disabled>Discard</button><span class="muted small" data-cfg-msg>No changes.</span></div>
+    </form>
+    <section class="block" id="sec-raw"><h2>Advanced: raw XML block</h2>
+      <p class="muted">Anything the form does not cover: your own XML elements, written between the <code>vexor:custom</code> markers in <code>ossec.conf</code>. Pick whether it goes to the master only or to every manager.</p>
+      <div data-det-editor><p class="muted">Loading…</p></div></section>`;
+}
+async function detCustomLoad() {
+  let content = "";
+  const r = await get("/api/detection/file?kind=config&name=custom");
+  if (r.status === 200) content = r.data.content ?? "";
+  else { const c = await readCmd(["wazuh", "config", "custom", "show"]).catch(() => null); if (c?.code === 0) content = c.text; }
+  detEdMount({ kind: "config", name: "custom", orig: content, editable: true, isNew: false, version: null, stash: "" }, content);
+}
+async function detCfgApply() {
+  const ch = detCfgChanges(), keys = Object.keys(ch);
+  if (!keys.length) return;
+  let all = true;
+  for (const k of keys) {
+    const res = await runWait(["wazuh", "config", "set", k, Array.isArray(ch[k]) ? ch[k].join(",") : String(ch[k])], { text: "Writes the setting into ossec.conf, checks it and applies it (managers restart if needed)." });
+    if (!res || res.code !== 0) { all = false; break; }
+  }
+  if (all) { toast("Settings applied."); await detCfgLoad(); }
+}
+
+// ---- test
+const DET_FORMATS = ["syslog", "json", "apache", "audit", "eventchannel", "iis", "command", "full_command", "snort-full", "squid", "mysql_log", "postgresql_log"];
+const DET_SAMPLES = [
+  ["SSH failed login", "syslog", "Oct 22 10:15:01 web01 sshd[2211]: Failed password for invalid user admin from 203.0.113.9 port 51234 ssh2"],
+  ["sudo to root", "syslog", "Oct 22 10:20:11 web01 sudo: alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/bin/cat /etc/shadow"],
+  ["JSON event", "json", '{"event":"login","user":"bob","src_ip":"198.51.100.7","status":"failed"}'],
+];
+function detTestDraw() {
+  const p = detPanel();
+  p.dataset.ready = "1";
+  p.innerHTML = `<p class="lede">Run one log line through the decoders and rules on the manager, the way a log from an agent would be. Nothing is stored and no alert is sent.</p>
+    <form class="lt" data-lt-form>
+      <label class="px-field"><span>Log line</span><textarea class="in lt__line" name="line" rows="4" spellcheck="false" autocomplete="off" placeholder="Paste a log line…" required></textarea></label>
+      <div class="lt__opts">
+        <label class="px-field"><span>Format</span><select class="in" name="format">${DET_FORMATS.map((f) => `<option>${f}</option>`).join("")}</select></label>
+        <label class="px-field"><span>Location</span><input class="in" name="location" value="/var/log/test.log" autocomplete="off" spellcheck="false"></label>
+        <button class="btn btn--primary" type="submit" data-lt-run>Test</button>
+      </div>
+      <p class="muted small">Ctrl/Cmd+Enter runs the test. Samples: ${DET_SAMPLES.map(([l], i) => `<button type="button" class="chip" data-lt-sample="${i}">${esc(l)}</button>`).join(" ")}</p>
+    </form>
+    <div data-lt-result aria-live="polite"></div>`;
+}
+async function detTestRun() {
+  const f = $("[data-lt-form]"), v = Object.fromEntries(new FormData(f)), line = (v.line || "").trim(), btn = $("[data-lt-run]");
+  if (!line) return toast("Paste a log line first.", "bad");
+  btn.disabled = true; btn.textContent = "Testing…";
+  const out = $("[data-lt-result]");
+  try {
+    const { status, data } = await api("/api/detection/logtest", { body: { line, format: v.format, location: v.location } });
+    out.innerHTML = status === 200 && !data.error ? detLtHtml(data) : `<p class="err">${esc(data.error || "The test failed.")}</p>`;
+  } catch (e) { detErr(e); } finally { btn.disabled = false; btn.textContent = "Test"; }
+}
+function detLtHtml(r) {
+  const d = r.decoder || {}, rule = r.rule, fields = Object.entries(r.fields || {});
+  const lvl = rule ? (rule.level >= 12 ? "bad" : rule.level >= 7 ? "warn" : "ok") : "";
+  const val = (x) => (x !== null && typeof x === "object" ? JSON.stringify(x) : String(x));
+  return `<section class="lt-res ${r.alert ? "lt-res--alert" : ""}">
+    <header><h2>Result</h2>${r.alert ? pill("would alert: yes", "warn") : pill("would alert: no")}</header>
+    <div class="lt-grid">
+      <div><h3 class="sub3">Decoder</h3>${d.name ? `<p><b class="mono">${esc(d.name)}</b>${d.parent ? ` <span class="muted small">parent ${esc(d.parent)}</span>` : ""}</p>` : '<p class="muted">No decoder matched.</p>'}</div>
+      <div><h3 class="sub3">Rule</h3>${rule ? `<p><b class="mono">${esc(rule.id)}</b> ${pill("level " + rule.level, lvl)}</p><p>${esc(rule.description || "")}</p>${(rule.groups || []).length ? `<p class="chips">${rule.groups.map((g) => pill(g)).join("")}</p>` : ""}` : '<p class="muted">No rule matched.</p>'}</div>
+    </div>
+    <h3 class="sub3">Extracted fields</h3>
+    ${fields.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>${fields.map(([k, x]) => `<tr><td class="mono small">${esc(k)}</td><td class="mono small">${esc(val(x))}</td></tr>`).join("")}</tbody></table></div>` : '<p class="muted small">No fields were extracted.</p>'}
+    ${(r.messages || []).length ? `<h3 class="sub3">Messages</h3><pre class="audit">${esc(r.messages.join("\n"))}</pre>` : ""}</section>`;
+}
+
+// ---- events (one set for the page; each handler checks it is on the Detection page)
+{
+  const v = view(), on = (ev, fn) => v.addEventListener(ev, (e) => {
+    if (PAGE.key !== "detection") return;
+    let r;
+    try { r = fn(e); } catch (x) { detErr(x); }       // fn runs at once so it can still preventDefault
+    Promise.resolve(r).catch(detErr);
+  });
+  on("click", (e) => {
+    const t = e.target, at = (a) => t.closest(`[${a}]`);
+    let b;
+    if ((b = at("data-det-open"))) return detOpen(detKind(), b.dataset.detOpen);
+    if (at("data-det-new")) return detNew();
+    if (at("data-det-tpl")) return detTplOpen();
+    if ((b = at("data-tpl-pick"))) return detTplPick(b.dataset.tplPick);
+    if (at("data-dlg-close")) return $("[data-det-dialog]").close();
+    if (at("data-ed-save")) return detSave();
+    if (at("data-ed-hist")) return detHist();
+    if (at("data-ed-del")) return detDelete();
+    if (at("data-ed-copy")) return detCopy();
+    if (at("data-ed-close")) return detClose();
+    if ((b = at("data-hist-view"))) return detView(b.dataset.histView);
+    if ((b = at("data-hist-restore"))) return detRestore(b.dataset.histRestore);
+    if (at("data-hist-back")) return detBack();
+    if (at("data-int-add")) return detIntForm(null);
+    if ((b = at("data-int-edit"))) return detIntForm((DET.ints || []).find((i) => i.name === b.dataset.intEdit));
+    if ((b = at("data-int-test"))) return run(["wazuh", "integrations", "test", b.dataset.intTest], { text: "Sends a sample alert through this integration." });
+    if ((b = at("data-int-rm"))) return run(["wazuh", "integrations", "rm", b.dataset.intRm], { text: `Removes ${b.dataset.intRm} from ossec.conf on every manager and restarts them.` });
+    if ((b = at("data-cfg-addrow"))) { b.insertAdjacentHTML("beforebegin", detCfgItem()); $$("[data-cfg-item]", b.parentElement).at(-1).focus(); return detDirtyUi(); }
+    if ((b = at("data-cfg-del"))) { b.closest(".cfg-item").remove(); return detDirtyUi(); }
+    if (at("data-cfg-reset")) return detCfgLoad();
+    if ((b = at("data-lt-sample"))) { const [, fmt, line] = DET_SAMPLES[+b.dataset.ltSample], f = $("[data-lt-form]"); f.line.value = line; f.format.value = fmt; f.line.focus(); }
+  });
+  on("input", (e) => {
+    const t = e.target;
+    if (t.matches("[data-ed-ta]")) detGutter();
+    if (t.closest("[data-ed], [data-cfg-form]")) detDirtyUi();
+  });
+  on("change", (e) => {
+    if (e.target.matches("[data-int-type]")) $("[data-int-idbox]").hidden = e.target.value !== "custom";
+    if (e.target.closest("[data-cfg-form]")) detDirtyUi();
+  });
+  on("submit", (e) => {
+    const f = e.target;
+    e.preventDefault();
+    if (f.matches("[data-int-form]")) return detIntSubmit(f);
+    if (f.matches("[data-cfg-form]")) return detCfgApply();
+    if (f.matches("[data-list-add]")) return detListAdd(f);
+    if (f.matches("[data-lt-form]")) return detTestRun();
+  });
+  on("keydown", (e) => {
+    const t = e.target;
+    if (t.matches("[data-ed-ta]")) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); return detSave(); }
+      return detEditKey(e);
+    }
+    if (t.matches("[data-ed-name]") && e.key === "Enter") { e.preventDefault(); return $("[data-ed-ta]").focus(); }
+    if (t.matches("[data-lt-form] textarea") && e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); return detTestRun(); }
+    if (t.matches('[role="tab"]') && /^(ArrowLeft|ArrowRight|Home|End)$/.test(e.key)) {
+      const tabs = $$('[role="tab"]', t.parentElement), i = tabs.indexOf(t);
+      const n = e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : (i + (e.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+      e.preventDefault(); tabs[n].focus();
+    }
+  });
+  // Ctrl/Cmd+S anywhere on the page saves the open editor (and keeps the browser's own save dialog away)
+  document.addEventListener("keydown", (e) => {
+    if (PAGE.key === "detection" && DET.ed && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s" && !e.target.matches?.("[data-ed-ta]")) { e.preventDefault(); detSave().catch(detErr); }
+  });
+  v.addEventListener("scroll", (e) => { if (e.target.matches?.("[data-ed-ta]")) $("[data-ed-gutter]").scrollTop = e.target.scrollTop; }, true);
+}
+
+const ROUTES = { overview: vOverview, map: vMap, containers: vContainers, stacks: vStacks, detection: vDetection, storage: vStorage, proxy: vProxy, logins: vLogins, settings: vSettings, terminal: vTerminal };
 // Pages that were merged into others: the old address opens the new page at the matching section.
 const MOVED = { health: ["overview", "sec-health"], ports: ["settings", "sec-ports"], volumes: ["storage", "sec-volumes"], activity: ["terminal", "sec-activity"], reset: ["settings", "sec-remove"] };
 // Scroll a section of the page on screen into view (below the sticky bar on phones) and move focus there for keyboards.
@@ -1249,16 +1850,19 @@ function jumpTo(id) {
   return true;
 }
 // The page on screen: its fetches share one AbortController, aborted as soon as another page opens.
+let lastHash = "";
 let PAGE = { key: "", ctl: new AbortController(), soft: false, fresh: false };
 async function route() {
   closeMenu(false);
-  let key = (location.hash || "#overview").slice(1), jump = "";
+  const [seg, sub = ""] = (location.hash || "#overview").slice(1).split("/");     // #detection/rules: page / tab
+  let key = seg, jump = "";
+  lastHash = location.hash;
   if (MOVED[key]) { [key, jump] = MOVED[key]; history.replaceState(null, "", "#" + key); }
   if (!ROUTES[key]) key = "overview";
   PAGE.ctl.abort();
   PAGE.cleanup?.();
   clearTimeout(liveTimer);
-  const pg = (PAGE = { key, ctl: new AbortController(), soft: false, fresh: false });
+  const pg = (PAGE = { key, sub, ctl: new AbortController(), soft: false, fresh: false });
   const v = view();
   v.onclick = v.onchange = v.onsubmit = v.oninput = null;
   v.dataset.page = "";
@@ -1332,6 +1936,7 @@ async function liveTick() {
 function afterJob() {
   const pg = PAGE;
   if (pg.key === "terminal") { setTimeout(() => termActivity().catch(() => {}), 400); return; }
+  if (pg.key === "detection") { setTimeout(() => { if (PAGE === pg) detRefresh().catch(() => {}); }, 400); return; }
   if (!AFTER_JOB.has(pg.key)) return;
   let tries = 0;
   const go = () => {
@@ -1361,6 +1966,12 @@ function liveShow(spin = !!liveRun) {
 }
 setInterval(() => { if (!document.hidden) liveShow(); }, 1000);
 
-window.addEventListener("hashchange", () => route());
-$("[data-refresh]").addEventListener("click", () => (AFTER_JOB.has(PAGE.key) ? refresh({ fresh: true, force: true }) : PAGE.key === "terminal" ? termActivity().catch(() => {}) : route()));
+window.addEventListener("hashchange", async () => {
+  if (PAGE.key === "detection" && location.hash !== lastHash && detDirty() && !(await detDiscard())) {
+    history.replaceState(null, "", lastHash || location.pathname + location.search);       // stay: put the address back
+    return;
+  }
+  route();
+});
+$("[data-refresh]").addEventListener("click", () => (PAGE.key === "detection" ? detRefresh().catch(detErr) : AFTER_JOB.has(PAGE.key) ? refresh({ fresh: true, force: true }) : PAGE.key === "terminal" ? termActivity().catch(() => {}) : route()));
 boot();
