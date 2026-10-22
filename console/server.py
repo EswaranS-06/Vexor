@@ -110,7 +110,49 @@ DANGER_EXACT = {
     "images": [["images", "prune", "--yes"]],
     "volumes": [["volumes", "prune", "--yes"], ["volumes", "prune"]],
 }
-BLOCKED = {"shell", "exec", "install", "reset purge", "config edit", "wazuh logtest", "completion", "motd"}
+BLOCKED = {"shell", "exec", "install", "reset purge", "config edit", "completion", "motd"}
+# vexor wazuh <area> <verb>: detection files, integrations and manager config (Detection page)
+WAZUH_VERBS = {
+    "read": {"ls", "list", "show", "cat", "history", "templates", ""},
+    "change": {"put", "save", "restore", "add", "edit", "set", "test"},
+    "danger": {"rm", "remove", "delete", "del"},
+}
+SECRET_OPTS = {"--api-key"}       # their value never reaches the confirm text, job list or audit log
+
+
+def mask_args(args):
+    out, hide = [], False
+    for a in args:
+        out.append("****" if hide else a)
+        hide = a in SECRET_OPTS
+    return out
+
+
+def classify_wazuh(args):
+    area = args[1] if len(args) > 1 else ""
+    verb = args[2] if len(args) > 2 else ""
+    if area == "logtest":
+        return ("read", None) if len(args) > 2 else (None, "'wazuh logtest' without a line is interactive - run it over SSH")
+    if area == "agents":
+        return classify(["agents", *args[2:]])
+    if area in ("rules", "decoders", "lists", "integrations", "integration"):
+        if area.startswith("integration") and verb == "test":
+            return "change", None
+        for level, verbs in WAZUH_VERBS.items():
+            if verb in verbs:
+                return level, None
+        return None, f"'wazuh {area} {verb}' is not a known command"
+    if area == "config":
+        if verb in ("ls", "list", "show", "") or args[2:4] == ["custom", "show"] or args[2:] == ["custom"]:
+            return "read", None
+        if args[2:4] == ["custom", "rm"]:
+            return "danger", None
+        if verb == "set" or args[2:4] == ["custom", "put"]:
+            return "change", None
+        return None, f"'wazuh config {verb}' is not a known command"
+    if area == "detection":
+        return "read", None
+    return "read", None
 ARG_RE = re.compile(r"^[^\x00-\x1f\x7f]{0,300}$")
 
 
@@ -131,6 +173,8 @@ def classify(args):
     for a in args:
         if not ARG_RE.match(a):
             return None, "arguments may not contain control characters"
+    if cmd == "wazuh":
+        return classify_wazuh(args)
     if cmd in ("indexer", "api") and sub.upper() != "GET":
         return None, f"only GET requests through '{cmd}' in the console"
     if cmd == "logs" and ("-f" in args or "--follow" in args):
@@ -161,6 +205,7 @@ class Job:
         self.lines = []
         self.cond = threading.Condition()
         self.proc = None
+        self.cleanup = []          # temp files (detection content, API keys) removed when the job ends
 
     def run(self):
         env = dict(os.environ, VEXOR_NO_SUDO="1", TERM="dumb")
@@ -184,14 +229,19 @@ class Job:
             self.cond.notify_all()
         if self.level != "read":
             invalidate()     # the stack changed: the next read waits for fresh data
-        audit(self.user, f"job {self.id} exit {self.code}: vexor {shlex.join(self.args)}")
+        audit(self.user, f"job {self.id} exit {self.code}: vexor {shlex.join(mask_args(self.args))}")
+        for f in self.cleanup:
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
 
     def summary(self):
-        return {"id": self.id, "cmd": "vexor " + shlex.join(self.args), "started": self.started, "ended": self.ended,
+        return {"id": self.id, "cmd": "vexor " + shlex.join(mask_args(self.args)), "started": self.started, "ended": self.ended,
                 "code": self.code, "lines": len(self.lines), "user": self.user}
 
 
@@ -199,8 +249,9 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 
 
-def start_job(args, user, level="change"):
+def start_job(args, user, level="change", cleanup=()):
     job = Job(args, user, level)
+    job.cleanup = list(cleanup)
     with JOBS_LOCK:
         JOBS[job.id] = job
         if len(JOBS) > MAX_JOBS:
@@ -209,6 +260,16 @@ def start_job(args, user, level="change"):
                     JOBS.pop(old.id, None)
     threading.Thread(target=job.run, daemon=True).start()
     return job
+
+
+def run_rc(args, timeout=60):
+    """-> (exit code, stdout) of a vexor command; (124, "") on timeout."""
+    try:
+        r = subprocess.run(args, cwd=str(ROOT), capture_output=True, text=True, timeout=timeout,
+                           env=dict(os.environ, VEXOR_NO_SUDO="1", TERM="dumb"), errors="replace")
+        return r.returncode, r.stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return 124, ""
 
 
 def run_quick(args, timeout=60):
@@ -234,7 +295,7 @@ _gen = 0
 WARM_FOR = 45           # keep refreshing a key this long after its last read
 # seconds a value stays current; just under the browser's poll (Overview 15 s, Containers 10 s) so each poll finds a
 # value the warmer has just refreshed, and the host runs about one refresh per poll, not more
-TTL = {"state": 12, "containers": 8, "stats": 8, "disk": 60, "proxy": 30, "volumes": 300, "map": 2.5}
+TTL = {"state": 12, "containers": 8, "stats": 8, "disk": 60, "proxy": 30, "volumes": 300, "map": 2.5, "detection": 30}
 
 
 def invalidate():
@@ -513,6 +574,58 @@ def pending():
             old[m.group(1)] = (v[: c.start()] if c and not v.startswith("#") else v).strip().strip('"').strip("'")
     keys = sorted(k for k in set(cur) | set(old) if cur.get(k) != old.get(k) and k not in ("COMPOSE_PROFILES", "COMPOSE_FILE"))
     return {"known": True, "keys": keys}
+
+
+# ---------------------------------------------------------------- detection (custom rules, decoders, lists, integrations, config)
+DET_DIR = ROOT / "config" / "wazuh_custom"
+DET_HIST = STATE / "detection-history"
+DET_KINDS = ("rules", "decoders", "lists")
+DET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+DET_SHOW = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}(/[A-Za-z0-9][A-Za-z0-9_.-]{0,80})?$")
+DET_VERSION = re.compile(r"^[0-9]{8}T[0-9]{6}Z(-[0-9]+)?$")
+DET_MAX = 256 * 1024
+DET_BODY_MAX = 6 * DET_MAX + 4096          # JSON escaping of the content (\uXXXX) at worst
+LOG_FORMATS = {"syslog", "json", "snort-full", "squid", "eventlog", "eventchannel", "audit", "mysql_log", "postgresql_log",
+               "nmapg", "iis", "command", "full_command", "djb-multilog", "multi-line"}
+
+
+def vexor_json(args, timeout=60, default=None):
+    out = run_quick([str(VEXOR), "--no-color", *args], timeout=timeout)
+    try:
+        return json.loads(out.strip().splitlines()[-1]) if out.strip() else default
+    except (ValueError, IndexError):
+        return default
+
+
+def detection():
+    """Status, the rules/decoders/lists listings and the templates in one vexor call."""
+    d = vexor_json(["wazuh", "detection", "status", "--all"], timeout=90, default=None)
+    if not isinstance(d, dict):
+        return {"error": "vexor wazuh detection status failed", "rules": {"files": []}, "decoders": {"files": []},
+                "lists": {"files": []}, "templates": [], "status": {}, "last_error": None}
+    return d
+
+
+def det_name(kind, name):
+    """Validated file name (rules/decoders get .xml) or None."""
+    if kind not in DET_KINDS or not isinstance(name, str):
+        return None
+    base = name[:-4] if kind != "lists" and name.endswith(".xml") else name
+    if not DET_NAME.match(base):
+        return None
+    return base if kind == "lists" else base + ".xml"
+
+
+def det_tmp(content, prefix):
+    """0600 file under .state/tmp for one job; the job removes it when it ends."""
+    d = STATE / "tmp"
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    path = d / f"{prefix}-{secrets.token_hex(8)}"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(content)
+    return str(path)
 
 
 # ---------------------------------------------------------------- map: containers, networks, live traffic
@@ -962,9 +1075,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          "default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
                          "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
-    def body_json(self):
+    def body_json(self, limit=65536):
         n = int(self.headers.get("Content-Length") or 0)
-        if n > 65536:
+        if n > limit:
             self.close_connection = True      # the unread body would be taken for the next request
             return None
         try:
@@ -1097,6 +1210,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p == "/api/logins":           # list without secrets; passwords come one at a time from /reveal
             rows = logins().get("logins", [])
             return self.send_json([{k: v for k, v in r.items() if k != "password"} | {"hasPassword": bool(r.get("password"))} for r in rows])
+        if p == "/api/detection":
+            return self.send_json(cached("detection", TTL["detection"], detection, fresh=fresh))
+        if p == "/api/detection/integrations":
+            return self.send_json(cached("det-integrations", TTL["detection"], lambda: vexor_json(
+                ["wazuh", "integrations", "ls", "--json"], default={"integrations": [], "error": "vexor wazuh integrations ls failed"}), fresh=fresh))
+        if p == "/api/detection/config":
+            return self.send_json(cached("det-config", TTL["detection"], lambda: vexor_json(
+                ["wazuh", "config", "ls", "--json"], default={"settings": [], "error": "vexor wazuh config ls failed"}), fresh=fresh))
+        if p == "/api/detection/file":
+            return self.det_file_get(q)
+        if p == "/api/detection/template":
+            kind, tid = (q.get("kind") or [""])[0], (q.get("id") or [""])[0]
+            if kind not in DET_KINDS:
+                return self.send_json({"error": "kind must be rules, decoders or lists"}, 400)
+            t = next((t for t in (vexor_json(["wazuh", kind, "templates", "--json"], default={}) or {}).get("templates", []) if t.get("id") == tid), None)
+            return self.send_json({"id": tid, "content": t["content"]} if t else {"error": "no such template"}, 200 if t else 404)
         if p == "/api/catalog":
             return self.send_json({"commands": CATALOG, "read": {k: sorted(v) for k, v in READ_SUBS.items()},
                                    "danger": {k: sorted(v) for k, v in DANGER_SUBS.items()}, "blocked": sorted(BLOCKED)})
@@ -1154,7 +1283,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = urllib.parse.urlsplit(self.path).path
-        data = self.body_json()     # read the body first: on a kept-alive connection it must not be left unread
+        data = self.body_json(DET_BODY_MAX if p == "/api/detection/file" else 65536)   # read the body first: on a kept-alive connection it must not be left unread
         if p == "/api/login":
             return self.login(data)
         if p == "/api/logout":
@@ -1186,10 +1315,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if err:
                 return self.send_json({"error": err}, 400)
             if level == "change" and not data.get("confirmed"):
-                return self.send_json({"confirm": "change", "cmd": "vexor " + shlex.join(args)}, 409)
+                return self.send_json({"confirm": "change", "cmd": "vexor " + shlex.join(mask_args(args))}, 409)
             if level == "danger" and data.get("confirmWord") != args[0]:
-                return self.send_json({"confirm": "danger", "word": args[0], "cmd": "vexor " + shlex.join(args)}, 409)
-            audit(s["user"], f"run: vexor {shlex.join(args)}")
+                return self.send_json({"confirm": "danger", "word": args[0], "cmd": "vexor " + shlex.join(mask_args(args))}, 409)
+            audit(s["user"], f"run: vexor {shlex.join(mask_args(args))}")
             if level != "read":
                 invalidate()
             return self.send_json(start_job(args, s["user"], level).summary())
@@ -1209,6 +1338,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             changes = {str(k): str(v) for k, v in (data.get("changes") or {}).items()
                        if re.fullmatch(r"[A-Z][A-Z0-9_]*", str(k)) and not SECRET_RE.search(str(k))}
             return self.send_json(plan(changes))
+        if p == "/api/detection/file":
+            return self.det_file_post(s, data)
+        if p == "/api/detection/logtest":
+            return self.det_logtest(s, data)
+        if p == "/api/detection/integration":
+            return self.det_integration(s, data)
         if p == "/api/logins/reveal":
             lid = str(data.get("id", ""))
             row = next((r for r in logins().get("logins", []) if r["id"] == lid), None)
@@ -1217,6 +1352,114 @@ class Handler(http.server.BaseHTTPRequestHandler):
             audit(s["user"], f"revealed the password of '{row['name']}' ({row['user'] or row['key']})")
             return self.send_json({"id": lid, "password": row.get("password", "")})
         self.send_json({"error": "not found"}, 404)
+
+    # -- detection page
+    def det_file_get(self, q):
+        kind, name, ver = ((q.get(k) or [""])[0] for k in ("kind", "name", "version"))
+        if kind == "config":
+            if name != "custom":
+                return self.send_json({"error": "only the custom block can be read here"}, 400)
+            code, out = run_rc([str(VEXOR), "--no-color", "wazuh", "config", "custom", "show"], timeout=30)
+            return self.send_json({"name": "custom", "content": out, "editable": True} if code == 0 else {"error": "could not read the custom block"}, 200 if code == 0 else 500)
+        if kind not in DET_KINDS:
+            return self.send_json({"error": "kind must be rules, decoders, lists or config"}, 400)
+        if ver:
+            fname = det_name(kind, name)
+            f = DET_HIST / kind / fname / ver if fname and DET_VERSION.match(ver) else None
+            if not f or not f.is_file():
+                return self.send_json({"error": "no such version"}, 404)
+            return self.send_json({"name": fname, "version": ver, "content": f.read_text(errors="replace"), "editable": False})
+        fname = det_name(kind, name)
+        if fname and (DET_DIR / kind / fname).is_file():
+            f = DET_DIR / kind / fname
+            if f.stat().st_size > 4 * DET_MAX:
+                return self.send_json({"error": "file too large to edit here"}, 413)
+            return self.send_json({"name": fname, "content": f.read_text(errors="replace"), "editable": True})
+        if not DET_SHOW.match(name or "") or ".." in name:
+            return self.send_json({"error": "invalid name"}, 400)
+        code, out = run_rc([str(VEXOR), "--no-color", "wazuh", kind, "show", name], timeout=30)
+        if code != 0:
+            return self.send_json({"error": f"no such file: {kind}/{name}"}, 404)
+        return self.send_json({"name": name, "content": out, "editable": False})
+
+    def det_file_post(self, s, data):
+        kind, name, content = data.get("kind"), data.get("name"), data.get("content")
+        if not isinstance(content, str):
+            return self.send_json({"error": "content must be text"}, 400)
+        if len(content.encode()) > DET_MAX:
+            return self.send_json({"error": f"content larger than {DET_MAX // 1024} KB"}, 413)
+        if "\x00" in content:
+            return self.send_json({"error": "content may not contain NUL bytes"}, 400)
+        if kind == "config":
+            scope = data.get("scope") or "master"
+            if name != "custom" or scope not in ("master", "all"):
+                return self.send_json({"error": "config: name must be custom, scope master or all"}, 400)
+            args, label = ["wazuh", "config", "custom", "put", "--from", "", "--scope", scope], "config/custom block"
+        else:
+            fname = det_name(kind, name)
+            if not fname:
+                return self.send_json({"error": "kind must be rules, decoders or lists; name: 1-64 letters, digits, _ or -"}, 400)
+            args, label = ["wazuh", kind, "put", fname, "--from", ""], f"{kind}/{fname}"
+        i = args.index("--from") + 1
+        if not data.get("confirmed"):
+            shown = list(args)
+            shown[i] = "<the editor content>"
+            return self.send_json({"confirm": "change", "cmd": "vexor " + shlex.join(shown)}, 409)
+        try:
+            args[i] = det_tmp(content, "detection")
+        except OSError as e:
+            return self.send_json({"error": f"could not write a temp file: {e}"}, 500)
+        audit(s["user"], f"detection: save {label} ({len(content.encode())} bytes)")
+        invalidate()
+        return self.send_json(start_job(args, s["user"], "change", cleanup=[args[i]]).summary())
+
+    def det_logtest(self, s, data):
+        line, fmt, loc = data.get("line"), data.get("format") or "syslog", data.get("location") or "console"
+        if not isinstance(line, str) or not line.strip() or len(line) > 65536 or re.search(r"[\x00\r\n]", line):
+            return self.send_json({"error": "one log line (no line breaks, up to 64 KB)"}, 400)
+        if fmt not in LOG_FORMATS:
+            return self.send_json({"error": "format must be one of: " + ", ".join(sorted(LOG_FORMATS))}, 400)
+        if not isinstance(loc, str) or not ARG_RE.match(loc) or len(loc) > 256:
+            return self.send_json({"error": "location: up to 256 printable characters"}, 400)
+        code, out = run_rc([str(VEXOR), "--no-color", "wazuh", "logtest", line, "--format", fmt, "--location", loc, "--json"], timeout=30)
+        try:
+            res = json.loads(out.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return self.send_json({"error": "logtest did not answer (is wazuh.master running?)" if code == 124 or not out else out[-500:]}, 502)
+        return self.send_json(res, 200 if not res.get("error") else 502)
+
+    def det_integration(self, s, data):
+        act, name = data.get("action"), data.get("name")
+        if act not in ("add", "edit") or not isinstance(name, str) or not re.fullmatch(r"slack|pagerduty|virustotal|shuffle|maltiverse|custom-[A-Za-z0-9_-]{1,40}", name):
+            return self.send_json({"error": "action add|edit; name slack, pagerduty, virustotal, shuffle, maltiverse or custom-<id>"}, 400)
+        args = ["wazuh", "integrations", act, name]
+        for key, opt in (("hook_url", "--hook-url"), ("level", "--level"), ("group", "--group"), ("rule_id", "--rule-id"), ("format", "--format")):
+            v = data.get(key)
+            if v is None:
+                continue
+            v = str(v)
+            if not ARG_RE.match(v):
+                return self.send_json({"error": f"{key} may not contain control characters"}, 400)
+            args += [opt, v]
+        key = data.get("api_key")
+        if key is not None and not isinstance(key, str):
+            return self.send_json({"error": "api_key must be text"}, 400)
+        if key and (len(key) > 4096 or re.search(r"[\x00-\x1f]", key)):
+            return self.send_json({"error": "api_key: one line, up to 4096 characters"}, 400)
+        shown = args + (["--api-key-file", "<hidden>"] if key else [])
+        if not data.get("confirmed"):
+            return self.send_json({"confirm": "change", "cmd": "vexor " + shlex.join(shown)}, 409)
+        cleanup = []
+        if key:                      # never in argv: a 0600 file the job deletes
+            try:
+                cleanup.append(det_tmp(key, "apikey"))
+            except OSError as e:
+                return self.send_json({"error": f"could not write a temp file: {e}"}, 500)
+            args += ["--api-key-file", cleanup[0]]
+        audit(s["user"], f"detection: integration {act} {name}" + (" (new API key)" if key else ""))
+        invalidate()
+        job = start_job(args, s["user"], "change", cleanup=cleanup)
+        return self.send_json(dict(job.summary(), cmd="vexor " + shlex.join(shown)))
 
     def change_password(self, s, data):
         ip = self.client_address[0]

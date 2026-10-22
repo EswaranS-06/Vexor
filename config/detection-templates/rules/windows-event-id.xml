@@ -1,0 +1,17 @@
+<!-- vexor-template: id=windows-event-id; title=Match a Windows event ID; description=Alert on a Windows event ID (4720, a user account was created) from any Windows agent -->
+<!-- Wazuh ruleset. Change the IDs if you use several templates: custom IDs are 100100-100199. -->
+<!--
+  Windows events decoded by the agent carry the ID in win.system.eventID.
+  Change 4720 to the ID you need. Many common IDs already have built-in rules
+  (4625 failed logon is rule 60122), so check with vexor wazuh logtest first.
+-->
+<group name="vexor,windows,">
+  <rule id="100104" level="8">
+    <if_group>windows</if_group>
+    <field name="win.system.eventID">^4720$</field>
+    <description>Windows: a user account was created ($(win.eventdata.targetUserName))</description>
+    <mitre>
+      <id>T1136</id>
+    </mitre>
+  </rule>
+</group>

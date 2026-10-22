@@ -1,0 +1,15 @@
+<!-- vexor-template: id=json-field-match; title=Match a JSON field; description=Alert when a JSON field from a custom app decoder has a given value (pair with decoders/json-app-logs.xml) -->
+<!-- Wazuh ruleset. Change the IDs if you use several templates: custom IDs are 100100-100199. -->
+<!--
+  decoded_as names the decoder that handled the event. Here it is the custom
+  JSON decoder vexor-json-app from decoders/json-app-logs.xml. Use the decoder
+  name from your own decoder file.
+  JSON keys are fields: action below matches the JSON key "action".
+-->
+<group name="vexor,json,">
+  <rule id="100105" level="8">
+    <decoded_as>vexor-json-app</decoded_as>
+    <field name="action" type="pcre2">^(delete|purge)$</field>
+    <description>App: destructive action $(action) by $(user)</description>
+  </rule>
+</group>

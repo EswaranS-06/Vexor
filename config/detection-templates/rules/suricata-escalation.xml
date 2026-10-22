@@ -1,0 +1,18 @@
+<!-- vexor-template: id=suricata-escalation; title=Escalate Suricata alerts by category; description=Raise the level of Suricata trojan and exploit alerts from any rule in the suricata group -->
+<!-- Wazuh ruleset. Change the IDs if you use several templates: custom IDs are 100100-100199. -->
+<!--
+  if_group matches every rule in the suricata group, so this covers any
+  Suricata alert. The field matches the category text Suricata gives each
+  alert (alert.category). Edit the pattern to pick other categories.
+  It does not replace the Vexor rules 100720 and 100721 (by severity); a
+  trojan alert of severity 1 then matches both, so remove one of them if you
+  use this template.
+-->
+<group name="vexor,suricata,ids,">
+  <rule id="100106" level="12">
+    <if_group>suricata</if_group>
+    <field name="alert.category" type="pcre2">Trojan|Exploit</field>
+    <description>Suricata escalation: $(alert.signature)</description>
+    <group>attack,</group>
+  </rule>
+</group>

@@ -1,0 +1,16 @@
+<!-- vexor-template: id=key-value-logs; title=Key=value logs; description=Decode lines like action=login user=alice src=192.0.2.10 from one syslog program -->
+<!--
+  Wazuh has no generic key=value parser, so each log shape gets its own regex.
+  The regex lists the keys in the order they appear on the line. order names
+  the captures in the same order. Change the keys, the regex and the order
+  together. A line with the keys in another order will not match.
+-->
+<decoder name="vexor-kv">
+  <program_name>^vexor-kv$</program_name>
+</decoder>
+
+<decoder name="vexor-kv-fields">
+  <parent>vexor-kv</parent>
+  <regex>action=(\S+) user=(\S+) src=(\S+)</regex>
+  <order>action,dstuser,srcip</order>
+</decoder>

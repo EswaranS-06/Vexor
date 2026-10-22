@@ -1,0 +1,10 @@
+<!-- vexor-template: id=json-app-logs; title=JSON application logs; description=Decode one-line JSON logs from an app, found by a fixed text in the line -->
+<!--
+  Change the prematch to text that every line of this app contains. The
+  JSON_Decoder then turns each key into a field (action becomes data.action).
+  Rules reach this decoder with decoded_as vexor-json-app (see rules/json-field-match.xml).
+-->
+<decoder name="vexor-json-app">
+  <prematch>"app":"billing"</prematch>
+  <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>

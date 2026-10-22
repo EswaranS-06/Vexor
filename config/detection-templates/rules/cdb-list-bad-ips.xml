@@ -1,0 +1,19 @@
+<!-- vexor-template: id=cdb-list-bad-ips; title=Match a source IP against a list; description=Alert when the source IP is on the bad-ips list (save lists/bad-ips.example as bad-ips first) -->
+<!-- Wazuh ruleset. Change the IDs if you use several templates: custom IDs are 100100-100199. -->
+<!--
+  Before this works:
+  1. Save the list as bad-ips: vexor wazuh lists put bad-ips with the file
+     config/detection-templates/lists/bad-ips.example as its source. Or add
+     entries one by one with vexor wazuh lists add bad-ips 203.0.113.7
+  2. The manager must know the list. Declare it in the ruleset section of
+     ossec.conf: <list>etc/lists/bad-ips</list>. Check this on your manager.
+  The lookup compares IP addresses (address_match_key). A list entry is a key
+  with no value, one per line.
+-->
+<group name="vexor,threat_intel,">
+  <rule id="100102" level="10">
+    <if_group>authentication_failed</if_group>
+    <list field="srcip" lookup="address_match_key">etc/lists/bad-ips</list>
+    <description>Login attempt from a listed bad IP: $(srcip)</description>
+  </rule>
+</group>

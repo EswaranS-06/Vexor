@@ -1,0 +1,15 @@
+<!-- vexor-template: id=ignore-event; title=Ignore an event; description=Silence one known-noisy event from one source (level 0 means no alert) -->
+<!-- Wazuh ruleset. Change the IDs if you use several templates: custom IDs are 100100-100199. -->
+<!--
+  Level 0 means the event creates no alert. It still reaches the archives when
+  logall is on. Keep the match narrow: name the parent (if_sid), the source
+  (srcip accepts an address or CIDR) and anything else that identifies the
+  noise. Replace 192.0.2.10 with the source to silence.
+-->
+<group name="vexor,noise,">
+  <rule id="100103" level="0">
+    <if_sid>5710</if_sid>
+    <srcip>192.0.2.10</srcip>
+    <description>Ignored: invalid user logins from 192.0.2.10</description>
+  </rule>
+</group>

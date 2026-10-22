@@ -16,6 +16,7 @@ config/nginx/routes-certs/
 config/nginx/acme/
 config/tools/
 config/elk/
+config/wazuh_custom/
 docker-compose.override.yml
 # staging folders used while building the repo
 _src/

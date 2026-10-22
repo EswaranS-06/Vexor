@@ -1,0 +1,18 @@
+<!-- vexor-template: id=brute-force-frequency; title=Brute force by frequency; description=Alert when one source IP causes 10 invalid user logins within 2 minutes -->
+<!-- Wazuh ruleset. Change the IDs if you use several templates: custom IDs are 100100-100199. -->
+<!--
+  frequency and timeframe (seconds) count matches of if_matched_sid, which is
+  the rule whose alerts are counted (5710 invalid user). same_source_ip counts
+  only the matches that share the source IP of the newest one.
+  Lower frequency for a stricter alert, raise timeframe for slow attacks.
+-->
+<group name="vexor,authentication_failures,">
+  <rule id="100101" level="12" frequency="10" timeframe="120">
+    <if_matched_sid>5710</if_matched_sid>
+    <same_source_ip />
+    <description>sshd: brute force, 10 invalid user logins from $(srcip) in 2 minutes</description>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+  </rule>
+</group>
