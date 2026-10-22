@@ -5700,7 +5700,7 @@ def integrations(path):
             out.append({"name": child(b, "name") or "", "hook_url": child(b, "hook_url") or "",
                         "api_key_set": bool(child(b, "api_key")), "level": int(lvl) if lvl and lvl.isdigit() else None,
                         "group": child(b, "group") or "", "rule_id": child(b, "rule_id") or "",
-                        "alert_format": child(b, "alert_format") or "", "managed": src == "managed",
+                        "alert_format": child(b, "alert_format") or "", "managed": src == "managed", "n8n": src == "n8n",
                         "_api_key": child(b, "api_key") or "", "_options": child(b, "options") or ""})
     return out
 
@@ -5909,6 +5909,38 @@ def main():
     elif op == "integ-get":            # integ-get <conf> <name> -> the managed integration as JSON (with the key), or {}
         items = [i for i in integrations(a[0]) if i["managed"] and i["name"] == a[1]]
         print(json.dumps(items[0] if items else {}))
+    elif op == "integ-raw-show":       # integ-raw-show <conf> -> the XML of the managed integrations block
+        print(block_body(read(a[0]), "integrations") or "")
+    elif op == "integ-raw-set":        # integ-raw-set <outdir> <xml file or ''> <conf..>: replace the managed block by hand-written XML
+        body = read(a[1]) if a[1] else ""
+        if body.strip():
+            els, err = scan(body)
+            if err:
+                print("XML: " + err); sys.exit(1)
+            if re.search(r"<!--\s*vexor:|</?ossec_config", body):
+                print("the block may not contain <ossec_config> or vexor: markers"); sys.exit(1)
+            rest = re.sub(r"<integration>.*?</integration>|<!--.*?-->", "", body, flags=re.S)
+            if rest.strip():
+                print("only <integration> blocks (and comments) belong here; found: " + rest.strip()[:60]); sys.exit(1)
+            conf = read(a[2])
+            elsewhere = [i["name"] for i in integrations(a[2]) if not i["managed"]]
+            seen = []
+            for b in re.findall(r"<integration>(.*?)</integration>", body, re.S):
+                nm = child(b, "name") or ""
+                if not re.fullmatch(r"slack|pagerduty|virustotal|shuffle|maltiverse|custom-[A-Za-z0-9_-]{1,40}", nm):
+                    print("<name> must be slack, pagerduty, virustotal, shuffle, maltiverse or custom-<id> (found: %s)" % (nm or "none")); sys.exit(1)
+                if nm == "custom-n8n":
+                    print("custom-n8n is set up with the n8n form (Add integration > n8n), not by hand"); sys.exit(1)
+                if nm in seen or nm in elsewhere:
+                    print("%s is configured twice" % nm); sys.exit(1)
+                if nm.startswith("custom-") or nm in ("slack", "shuffle", "maltiverse"):
+                    if not child(b, "hook_url"):
+                        print("%s needs <hook_url>" % nm); sys.exit(1)
+                seen.append(nm)
+            body = "".join("  " + ln + "\n" if ln.strip() else "\n" for ln in body.strip("\n").splitlines())
+        else:
+            body = ""
+        write_cands(a[0], a[2:], lambda f, s: set_block(s, "integrations", body))
     elif op == "integ-names":          # every integration name in the config (managed or not)
         print("\n".join(i["name"] for i in integrations(a[0])))
     elif op == "integ-write":          # integ-write <outdir> <json list of managed integrations> <conf..>
@@ -6332,7 +6364,28 @@ PY
     *) die "usage: vexor wazuh $k ls|show|put|rm|history|restore|templates$([ "$k" = lists ] && echo '|add|del') ..." ;;
   esac
 }
-det_integrations() {           # vexor wazuh integrations ls|add|edit|rm|test
+det_integ_n8n() {              # det_integ_n8n add|edit|rm [--hook-url PATH|URL] [--level N] [--group G]: custom-n8n is owned by vexor n8n
+  local act="$1"; shift
+  if [ "$act" = rm ] || [ "$act" = remove ]; then cmd_n8n disconnect; det_rec integrations custom-n8n rm 1 "n8n disconnected"; return; fi
+  local hook="" lvl="" grp="" have=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --hook-url) hook="${2-}"; shift ;; --level) lvl="${2-}"; shift ;; --group|--groups) grp="${2-}"; have=1; shift ;;
+      --api-key|--api-key-file) shift ;;                 # the token is generated (N8N_HOOK_TOKEN)
+      --rule-id|--rule-ids|--format) shift ;;
+      *) die "unknown option $1" ;;
+    esac; shift
+  done
+  if [ "$act" = add ] && [ -n "$(n8n_hook)" ]; then die "n8n is already connected - change it with: vexor wazuh integrations edit custom-n8n"; fi
+  if [ "$act" = edit ] && [ -z "$(n8n_hook)" ]; then die "n8n is not connected - add it: vexor wazuh integrations add custom-n8n"; fi
+  local args=()
+  if [ "$act" = edit ]; then args=("${hook:-$(n8n_hook)}"); else args=("${hook:-vexor-alerts}"); fi
+  [ -n "$lvl" ] && args+=(--level "$lvl")
+  if [ "$have" = 1 ]; then args+=(--groups "$grp"); else args+=(--groups "$(env_get N8N_ALERT_GROUPS)"); fi
+  cmd_n8n connect "${args[@]}" || return 1
+  det_rec integrations custom-n8n "$act" 1 "n8n connected: $(n8n_hook)"
+}
+det_integrations() {           # vexor wazuh integrations ls|add|edit|rm|raw|test
   local verb="${1:-ls}"; shift || true
   local json=0 a rest=() t
   for a in "$@"; do [ "$a" = --json ] && json=1 || rest+=("$a"); done
@@ -6355,7 +6408,7 @@ if not rows:
       local n="${1:-}"; shift || true
       [[ "$n" =~ ^(slack|pagerduty|virustotal|shuffle|maltiverse|custom-[A-Za-z0-9_-]{1,40})$ ]] \
         || die "usage: vexor wazuh integrations $verb <slack|pagerduty|virustotal|shuffle|maltiverse|custom-<id>> [options]"
-      [ "$n" = custom-n8n ] && die "custom-n8n belongs to vexor n8n (connect / disconnect)"
+      if [ "$n" = custom-n8n ]; then det_integ_n8n "$verb" "$@"; return; fi     # same thing as vexor n8n connect / disconnect
       local hook="-" key="-" lvl="-" grp="-" rid="-" fmt="-"
       while [ $# -gt 0 ]; do
         case "$1" in
@@ -6430,8 +6483,30 @@ PY
       det_conf_apply "$cd" integrations "$n" "$act"
       det_rec integrations "$n" "$act" 1 "integration $n: $act"
       ok "integration $n: $act done" ;;
+    raw)                         # raw show | raw put --from <path|->: the managed integrations as XML, edited by hand
+      local rv="${1:-show}"; shift || true
+      case "$rv" in
+        show) det_py integ-raw-show "$conf" ;;
+        put)
+          local from="" f cd; while [ $# -gt 0 ]; do case "$1" in --from) from="${2:-}"; shift ;; *) die "unknown option $1" ;; esac; shift; done
+          t="$(det_read_from "$from")" || exit 1
+          det_master; take_lock
+          rm -rf "$RUN_TMP/det-cand"; mkdir -p "$RUN_TMP/det-cand"; cd="$RUN_TMP/det-cand"
+          DET_ERR="$(det_py integ-raw-set "$cd" "$t" $(n8n_conf_files) 2>&1)" || det_problem integrations raw put "the integrations were refused (nothing changed):"
+          DET_WANT_INTEGRATORD=0; grep -q '<integration>' "$t" && DET_WANT_INTEGRATORD=1
+          [ -n "$(n8n_hook)" ] && DET_WANT_INTEGRATORD=1
+          if [ -z "$(ls -A "$cd")" ]; then ok "integrations unchanged"; return 0; fi
+          for f in $(grep -o '<name>custom-[A-Za-z0-9_-]*</name>' "$t" | sed -E 's/<[^>]*>//g'); do
+            dc exec -T wazuh.master test -x "/var/ossec/integrations/$f" || { DET_ERR="no script /var/ossec/integrations/$f in wazuh.master"; det_problem integrations raw put "refused (nothing changed):"; }
+          done
+          det_conf_apply "$cd" integrations raw put
+          det_rec integrations raw put 1 "integrations edited by hand"
+          ok "integrations: saved" ;;
+        *) die "usage: vexor wazuh integrations raw show | put --from <path|->" ;;
+      esac ;;
     test)
       local n="${1:-}"; [ -n "$n" ] || die "usage: vexor wazuh integrations test <name>"
+      [ "$n" = custom-n8n ] && { n8n_test; return; }
       det_master
       t="$(det_py integ-get "$conf" "$n")"
       [ "$t" != "{}" ] || die "$n is not a Vexor-managed integration (vexor wazuh integrations ls; n8n: vexor n8n test)"
@@ -6452,7 +6527,7 @@ print(json.dumps({"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000+0000", time.
       [ -n "$out" ] && printf '%s\n' "$out" | tail -n 15 | sed 's/^/      /'
       if [ "$rc" = 0 ]; then ok "$n accepted the sample alert (exit 0) - check the target"
       else bad "$n failed (exit $rc) - see above and: vexor exec master tail /var/ossec/logs/integrations.log"; return 1; fi ;;
-    *) die "usage: vexor wazuh integrations ls [--json] | add|edit <name> [--hook-url URL] [--api-key K] [--level N] [--group G] [--rule-id IDS] [--format json] | rm <name> | test <name>" ;;
+    *) die "usage: vexor wazuh integrations ls [--json] | add|edit <name> [--hook-url URL] [--api-key K] [--level N] [--group G] [--rule-id IDS] [--format json] | rm <name> | test <name> | raw show|put" ;;
   esac
 }
 det_config() {                 # vexor wazuh config ls|set|custom
@@ -8497,7 +8572,9 @@ ${C_BD}Wazuh${C_0} (SOC=wazuh|both)
   wazuh lists ls|show|put|rm|history|restore | add <name> <key>[:<value>] | del <name> <key>
                                  CDB lists; the <list> line in ossec.conf follows (the managers are recreated)
   wazuh integrations ls | add|edit <name> [--hook-url URL] [--api-key K|--api-key-file F] [--level N] [--group G]
-                                 [--rule-id IDS] | rm <name> | test <name>   (slack pagerduty virustotal shuffle maltiverse custom-<id>)
+                                 [--rule-id IDS] | rm <name> | test <name>   (slack pagerduty virustotal shuffle maltiverse custom-<id>;
+                                 custom-n8n = vexor n8n connect: --hook-url is the webhook path or URL, no key needed)
+  wazuh integrations raw show | put --from <path|->     the managed integrations as XML, edited by hand
   wazuh config ls | set <key> <value> [<key> <value> ..] | custom show | custom put --from <f> [--scope master|all] | custom rm
                                  curated ossec.conf settings / a raw XML block; checked by Wazuh first, managers recreated
   wazuh detection status [--json]  custom file counts, last change, last error

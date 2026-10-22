@@ -180,7 +180,7 @@ Every save is checked by Wazuh before it stays. If the check fails, the previous
 
 `config/detection-templates/` has starting points: rules for level changes, brute force, list lookups, Windows event IDs and Suricata escalation, and decoders for JSON, syslog, key=value and web access logs. Start from one with "New from template" or `vexor wazuh rules templates`. The Test tab (or `vexor wazuh logtest`) shows which decoder and rule match a line, so check a change there before you rely on it.
 
-Integrations cover Slack, PagerDuty, VirusTotal, Shuffle, Maltiverse and your own. API keys are never shown again. The n8n forwarding stays under [Stacks](#vexor-console).
+Integrations cover n8n, Slack, PagerDuty, VirusTotal, Shuffle, Maltiverse and your own. The n8n card asks only for the webhook path, level and groups (same as `vexor n8n connect`), and "Advanced: edit as XML" edits the other integrations as `<integration>` blocks, like the rule and decoder editors. API keys are never shown again. The n8n forwarding stays under [Stacks](#vexor-console).
 
 ```bash
 vexor wazuh rules ls                          # custom, Vexor and built-in rule files

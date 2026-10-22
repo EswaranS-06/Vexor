@@ -138,6 +138,8 @@ def classify_wazuh(args):
     if area in ("rules", "decoders", "lists", "integrations", "integration"):
         if area.startswith("integration") and verb == "test":
             return "change", None
+        if area.startswith("integration") and verb == "raw":
+            return ("change" if args[3:4] == ["put"] else "read"), None
         for level, verbs in WAZUH_VERBS.items():
             if verb in verbs:
                 return level, None
@@ -1361,6 +1363,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json({"error": "only the custom block can be read here"}, 400)
             code, out = run_rc([str(VEXOR), "--no-color", "wazuh", "config", "custom", "show"], timeout=30)
             return self.send_json({"name": "custom", "content": out, "editable": True} if code == 0 else {"error": "could not read the custom block"}, 200 if code == 0 else 500)
+        if kind == "integrations":
+            if name != "raw":
+                return self.send_json({"error": "only the raw XML can be read here"}, 400)
+            code, out = run_rc([str(VEXOR), "--no-color", "wazuh", "integrations", "raw", "show"], timeout=30)
+            return self.send_json({"name": "raw", "content": out, "editable": True} if code == 0 else {"error": "could not read the integrations"}, 200 if code == 0 else 500)
         if kind not in DET_KINDS:
             return self.send_json({"error": "kind must be rules, decoders, lists or config"}, 400)
         if ver:
@@ -1395,6 +1402,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if name != "custom" or scope not in ("master", "all"):
                 return self.send_json({"error": "config: name must be custom, scope master or all"}, 400)
             args, label = ["wazuh", "config", "custom", "put", "--from", "", "--scope", scope], "config/custom block"
+        elif kind == "integrations":
+            if name != "raw":
+                return self.send_json({"error": "integrations: name must be raw"}, 400)
+            args, label = ["wazuh", "integrations", "raw", "put", "--from", ""], "integrations (XML)"
         else:
             fname = det_name(kind, name)
             if not fname:

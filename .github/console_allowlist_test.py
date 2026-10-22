@@ -8,7 +8,7 @@ spec.loader.exec_module(srv)
 READ = [["status"], ["suricata", "alerts", "-n", "5"], ["logs", "nginx", "-f"], ["doctor"], ["volumes", "ls"], ["disk", "--json"],
         ["proxy", "ls", "--json"], ["proxy"], ["proxy", "show", "soc.example.com"], ["proxy", "cert-file", "soc.example.com", "ca"],
         ["wazuh"], ["wazuh", "alerts", "-n", "5"], ["wazuh", "rules", "ls", "--json"], ["wazuh", "decoders", "show", "x.xml"],
-        ["wazuh", "lists", "history", "bad-ips", "--json"], ["wazuh", "rules", "templates", "--json"], ["wazuh", "integrations", "ls"],
+        ["wazuh", "lists", "history", "bad-ips", "--json"], ["wazuh", "rules", "templates", "--json"], ["wazuh", "integrations", "ls"], ["wazuh", "integrations", "raw", "show"],
         ["wazuh", "config", "ls", "--json"], ["wazuh", "config", "custom", "show"], ["wazuh", "logtest", "sshd[1]: test", "--json"],
         ["wazuh", "detection", "status", "--json"], ["wazuh", "agents", "list"]]
 REFUSED = [["shell"], ["exec", "nginx", "id"], ["api", "DELETE", "/agents"], ["install"], ["config", "edit"],
@@ -21,11 +21,12 @@ CHANGE = [["doctor", "--fix"], ["tools", "enable", "zeek"], ["n8n", "test"], ["r
           ["wazuh", "rules", "put", "my", "--from", "/x"], ["wazuh", "decoders", "restore", "my.xml", "20261022T020000Z"],
           ["wazuh", "lists", "add", "bad-ips", "1.2.3.4"], ["wazuh", "integrations", "add", "slack", "--hook-url", "https://h"],
           ["wazuh", "integrations", "edit", "slack", "--level", "9"], ["wazuh", "integrations", "test", "slack"],
+          ["wazuh", "integrations", "raw", "put", "--from", "/x"], ["wazuh", "integrations", "add", "custom-n8n", "--hook-url", "vexor-alerts"],
           ["wazuh", "config", "set", "logall", "yes"], ["wazuh", "config", "custom", "put", "--from", "/x", "--scope", "all"]]
 DANGER = [["reset", "full"], ["volumes", "rm", "x"], ["soc", "elk"], ["node-type", "multi"], ["passwd", "admin"],
           ["uninstall", "--keep-data", "--yes"], ["uninstall", "--yes"], ["volumes", "prune", "--yes"], ["images", "prune", "--yes"],
           ["proxy", "rm", "soc.example.com"], ["wazuh", "rules", "rm", "my"], ["wazuh", "lists", "del", "bad-ips", "1.2.3.4"],
-          ["wazuh", "integrations", "rm", "slack"], ["wazuh", "config", "custom", "rm"], ["wazuh", "agents", "remove", "001"]]
+          ["wazuh", "integrations", "rm", "slack"], ["wazuh", "integrations", "rm", "custom-n8n"], ["wazuh", "config", "custom", "rm"], ["wazuh", "agents", "remove", "001"]]
 
 for a in READ:
     assert srv.classify(a) == ("read", None), (a, srv.classify(a))

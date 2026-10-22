@@ -1381,17 +1381,17 @@ async function detReload() {
 
 // ---- editor
 function detEditorHtml(ed) {
-  const ro = !ed.editable, cfg = ed.kind === "config", ext = ed.kind === "lists" ? "" : ".xml";
+  const ro = !ed.editable, cfg = ed.kind === "config" || ed.kind === "integrations", ext = ed.kind === "lists" ? "" : ".xml";
   return `<div class="ed" data-ed>
     <div class="ed__bar">
       <div class="ed__title">
         ${ed.isNew ? `<label class="vh" for="ed-name">Name of the new ${esc(DET_KINDS[ed.kind] || "file")}</label><input id="ed-name" class="in ed__name" data-ed-name value="${esc(ed.name)}" placeholder="my-${esc(DET_KINDS[ed.kind] || "file")}" autocomplete="off" spellcheck="false" autocapitalize="off"><span class="muted mono small">${ext}</span>`
-          : `<b class="mono ed__fname">${esc(cfg ? "ossec.conf · custom block" : ed.name)}</b>`}
+          : `<b class="mono ed__fname">${esc(ed.kind === "integrations" ? "ossec.conf · integrations" : cfg ? "ossec.conf · custom block" : ed.name)}</b>`}
         ${ro ? pill("read-only", "warn") : ""}${ed.source && !ed.isNew && !cfg ? pill(ed.source, ed.source === "custom" ? "accent" : "") : ""}
         <span class="ed__dirty" data-ed-dirty hidden>● unsaved</span>
       </div>
       <div class="actions">
-        ${cfg ? '<label class="ed__scope muted small">Scope <select class="in" data-cc-scope><option value="master">master only</option><option value="all">all managers</option></select></label>' : ""}
+        ${ed.kind === "config" ? '<label class="ed__scope muted small">Scope <select class="in" data-cc-scope><option value="master">master only</option><option value="all">all managers</option></select></label>' : ""}
         ${ro ? (ed.kind !== "config" ? '<button type="button" class="btn btn--sm" data-ed-copy>Copy to a new file</button>' : "") : '<button type="button" class="btn btn--sm btn--primary" data-ed-save>Save</button>'}
         ${!ro && !ed.isNew && !cfg ? '<button type="button" class="btn btn--sm" data-ed-hist aria-expanded="false">History</button><button type="button" class="btn btn--sm btn--danger-ghost" data-ed-del>Delete</button>' : ""}
         ${cfg ? "" : '<button type="button" class="btn btn--sm btn--ghost" data-ed-close>Close</button>'}
@@ -1399,7 +1399,7 @@ function detEditorHtml(ed) {
     </div>
     ${ed.note ? `<p class="ed__banner">${esc(ed.note)}</p>` : ""}
     <p class="ed__banner ed__banner--ver" data-ed-banner hidden></p>
-    <div class="ed__box"><pre class="ed__gutter" data-ed-gutter aria-hidden="true">1</pre><textarea class="ed__ta" data-ed-ta aria-label="Contents of ${esc(cfg ? "the custom config block" : ed.name || "the new file")}" wrap="off" spellcheck="false" autocomplete="off" autocapitalize="off"${ro ? " readonly" : ""}></textarea></div>
+    <div class="ed__box"><pre class="ed__gutter" data-ed-gutter aria-hidden="true">1</pre><textarea class="ed__ta" data-ed-ta aria-label="Contents of ${esc(ed.kind === "integrations" ? "the integrations XML" : cfg ? "the custom config block" : ed.name || "the new file")}" wrap="off" spellcheck="false" autocomplete="off" autocapitalize="off"${ro ? " readonly" : ""}></textarea></div>
     <p class="muted small ed__hint">${ro ? "Built-in or Vexor-generated: read-only. Copy it to a new file to change it." : "Ctrl/Cmd+S saves · Tab indents, Shift+Tab outdents · Esc then Tab leaves the editor."}</p>
     ${ed.kind === "lists" && !ro && !ed.isNew ? `<form class="mini" data-list-add><label class="grow">Key <input class="in" name="key" autocomplete="off" spellcheck="false" placeholder="203.0.113.9" required></label><label class="grow">Value (optional) <input class="in" name="value" autocomplete="off" spellcheck="false" placeholder="blocked"></label><button class="btn btn--sm" type="submit">Add entry</button></form>` : ""}
     <div class="ed__extra" data-ed-extra></div>
@@ -1458,11 +1458,11 @@ async function detSave() {
   }
   const content = ta.value;
   if (!content.trim()) return toast("The file is empty.", "bad");
-  const cfg = ed.kind === "config", body = { kind: ed.kind, name: cfg ? "custom" : name, content };
+  const cfg = ed.kind === "config", raw = ed.kind === "integrations", body = { kind: ed.kind, name: cfg ? "custom" : raw ? "raw" : name, content };
   if (cfg) body.scope = $("[data-cc-scope]").value;
   const btn = $("[data-ed-save]");
   DET.saving = true; if (btn) btn.disabled = true;
-  const job = await postConfirm("/api/detection/file", body, { text: cfg ? "Replaces the custom block in ossec.conf, checks it and applies it. A failing block is rolled back." : "Saves the file on the host, pushes it to the manager and lets Wazuh check it. A file that fails the check is rolled back; a good one is loaded." }).catch(() => null);
+  const job = await postConfirm("/api/detection/file", body, { text: raw ? "Replaces the integrations Vexor manages in ossec.conf on every manager, lets Wazuh check them and restarts the managers. A failing change is rolled back." : cfg ? "Replaces the custom block in ossec.conf, checks it and applies it. A failing block is rolled back." : "Saves the file on the host, pushes it to the manager and lets Wazuh check it. A file that fails the check is rolled back; a good one is loaded." }).catch(() => null);
   if (!job) { DET.saving = false; if (btn) btn.disabled = false; return; }
   openJob(job, (code) => detSaved(ed, name, content, code));
 }
@@ -1474,6 +1474,7 @@ function detSaved(ed, name, content, code) {
   if (code !== 0) return toast("Not saved - the output shows why. Your text is still in the editor.", "bad");
   toast("Saved.");
   ed.orig = content;
+  if (ed.kind === "integrations") { detDirtyUi(); return detIntLoad(); }
   if (ed.isNew) { const cur = $("[data-ed-ta]").value; ed.isNew = false; ed.name = name; ed.source = "custom"; detEdMount(ed, cur); detDrawList(); } else detDirtyUi();
 }
 // Tab / Shift+Tab / Enter in the editor
@@ -1608,52 +1609,85 @@ async function detTplPick(id) {
 }
 
 // ---- integrations
-const INT_TYPES = ["slack", "pagerduty", "virustotal", "shuffle", "maltiverse", "custom"];
+const INT_TYPES = ["n8n", "slack", "pagerduty", "virustotal", "shuffle", "maltiverse", "custom"];
+const intIsN8n = (i) => i && (i.n8n || i.name === "custom-n8n");
+const intN8nPath = (u) => String(u || "").replace(/^http:\/\/n8n:5678\/webhook\//, "") || "vexor-alerts";
 async function detIntLoad() {
   if (DET.ints && !detPanel().dataset.ready) detIntDraw();
   const { status, data } = await get("/api/detection/integrations");
   if (status !== 200) { detPanel().innerHTML = `<p class="err">${esc(data.error || "The integrations could not be read.")}</p>`; return; }
   DET.ints = data.integrations || [];
   detIntDraw();
+  if (!DET.ed || !detEdDirty()) await detIntRawLoad();
+}
+async function detIntRawLoad() {
+  const r = await get("/api/detection/file?kind=integrations&name=raw");
+  if (r.status !== 200) { const b = $("[data-det-editor]"); if (b) b.innerHTML = `<p class="err">${esc(r.data.error || "The integrations XML could not be read.")}</p>`; return; }
+  const content = r.data.content ?? "";
+  if (!$("[data-det-editor]")) return;
+  detEdMount({ kind: "integrations", name: "raw", orig: content, editable: true, isNew: false, version: null, stash: "" }, content);
 }
 const hostOf = (u) => { try { return new URL(u).origin + "/…"; } catch { return u ? String(u).slice(0, 40) + "…" : ""; } };
 function detIntDraw() {
   const list = DET.ints || [], p = detPanel();
   p.dataset.ready = "1";
-  morphInto(p, `
+  if (!$("[data-int-cards]", p)) p.innerHTML = `<div data-int-cards></div>
+    <section class="block" id="sec-raw"><h2>Advanced: edit as XML</h2>
+      <p class="muted">The same integrations as the cards, written as <code>&lt;integration&gt;</code> blocks, like the rule and decoder editors. Wazuh checks them before they stay and a failing change is rolled back. n8n is not listed here: use the n8n card.</p>
+      <div data-det-editor><p class="muted">Loading…</p></div></section>`;
+  morphInto($("[data-int-cards]", p), `
     <p class="lede">Send Wazuh alerts to other tools. Vexor writes these into <code>ossec.conf</code> on the master and every worker, between its own markers. API keys are kept on the manager and never shown again.</p>
     <div class="actions"><button type="button" class="btn btn--sm btn--primary" data-int-add>Add integration</button></div>
     <div class="ints">${list.map((i) => {
-      const ro = i.managed === false;
-      return `<article class="int${ro ? " int--ro" : ""}" data-key="${esc(i.name)}"><header><h3 class="mono">${esc(i.name)}</h3>${ro ? pill("managed by Vexor", "warn") : ""}${i.api_key_set ? pill("API key set", "ok") : pill("no API key")}</header>
+      const ro = i.managed === false && !intIsN8n(i);
+      return `<article class="int${ro ? " int--ro" : ""}" data-key="${esc(i.name)}"><header><h3 class="mono">${esc(i.name)}</h3>${ro ? pill("written by hand", "warn") : ""}${intIsN8n(i) ? pill("n8n", "accent") : i.api_key_set ? pill("API key set", "ok") : pill("no API key")}</header>
         <dl class="kv">${[["Hook URL", i.hook_url ? `<span class="mono" title="The full URL is in the edit form">${esc(hostOf(i.hook_url))}</span>` : ""], ["Level", i.level != null && i.level !== "" ? "≥ " + esc(i.level) : ""], ["Groups", esc(i.group || "")], ["Rule IDs", esc(i.rule_id || "")], ["Format", esc(i.alert_format || "")]]
           .filter(([, v]) => v).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
-        <div class="actions">${ro ? '<a class="btn btn--sm" href="#stacks">Manage in Stacks</a>' : `<button type="button" class="btn btn--sm" data-int-edit="${esc(i.name)}">Edit</button><button type="button" class="btn btn--sm" data-int-test="${esc(i.name)}">Send test</button><button type="button" class="btn btn--sm btn--danger-ghost" data-int-rm="${esc(i.name)}">Remove</button>`}</div></article>`;
+        <div class="actions">${ro ? '<span class="muted small">Edit it in ossec.conf (Manager config)</span>' : `<button type="button" class="btn btn--sm" data-int-edit="${esc(i.name)}">Edit</button><button type="button" class="btn btn--sm" data-int-test="${esc(i.name)}">Send test</button><button type="button" class="btn btn--sm btn--danger-ghost" data-int-rm="${esc(i.name)}">${intIsN8n(i) ? "Disconnect" : "Remove"}</button>`}</div></article>`;
     }).join("") || '<p class="muted">No integrations yet.</p>'}</div>`);
 }
 function detIntForm(int) {
-  const edit = !!int, custom = edit && /^custom-/.test(int.name), type = !edit ? "slack" : custom ? "custom" : int.name;
+  const edit = !!int, n8n = edit && intIsN8n(int), custom = edit && !n8n && /^custom-/.test(int.name), type = !edit ? ((DET.ints || []).some(intIsN8n) ? "slack" : "n8n") : n8n ? "n8n" : custom ? "custom" : int.name;
+  const types = INT_TYPES.filter((t) => t !== "n8n" || n8n || !(DET.ints || []).some(intIsN8n));
   const body = $("[data-det-dialog-body]");
   body.innerHTML = `<form class="int-form" data-int-form data-mode="${edit ? "edit" : "add"}" novalidate>
     <h2>${edit ? "Edit " + esc(int.name) : "Add an integration"}</h2>
     <div class="px-form px-form--stack">
-      <label class="px-field"><span>Type</span><select class="in" name="type" data-int-type ${edit ? "disabled" : ""}>${INT_TYPES.map((t) => `<option ${t === type ? "selected" : ""}>${t}</option>`).join("")}</select></label>
+      <label class="px-field"><span>Type</span><select class="in" name="type" data-int-type ${edit ? "disabled" : ""}>${types.map((t) => `<option ${t === type ? "selected" : ""}>${t}</option>`).join("")}</select></label>
       <label class="px-field" data-int-idbox ${type === "custom" ? "" : "hidden"}><span>Custom id</span><input class="in" name="cid" value="${esc(custom ? int.name.slice(7) : "")}" ${edit ? "readonly" : ""} placeholder="my-tool" autocomplete="off" spellcheck="false"><small class="field-err" data-int-err="cid"></small></label>
-      <label class="px-field"><span>Hook URL</span><input class="in" type="url" name="hook_url" value="${esc(int?.hook_url || "")}" placeholder="https://hooks.example.com/…" autocomplete="off" spellcheck="false"></label>
-      <label class="px-field"><span>API key</span><input class="in" type="password" name="api_key" autocomplete="new-password" spellcheck="false" placeholder="${edit && int.api_key_set ? "Leave empty to keep the current key" : "optional"}"><small class="muted">${edit && int.api_key_set ? "The stored key is never shown." : "Stored on the manager."}</small></label>
+      <label class="px-field" data-int-n8n><span>n8n webhook path or URL</span><input class="in" name="n8n_hook" value="${esc(n8n ? intN8nPath(int.hook_url) : "vexor-alerts")}" placeholder="vexor-alerts" autocomplete="off" spellcheck="false"><small class="muted">A path like <code>vexor-alerts</code> uses the n8n of this stack; a full URL sends to another n8n. The secret token is generated and sent as <code>X-Vexor-Token</code>. Import the starter workflow with Stacks &rarr; n8n &rarr; Import workflow.</small></label>
+      <label class="px-field" data-int-std><span>Hook URL</span><input class="in" type="url" name="hook_url" value="${esc(int?.hook_url || "")}" placeholder="https://hooks.example.com/…" autocomplete="off" spellcheck="false"></label>
+      <label class="px-field" data-int-std><span>API key</span><input class="in" type="password" name="api_key" autocomplete="new-password" spellcheck="false" placeholder="${edit && int.api_key_set ? "Leave empty to keep the current key" : "optional"}"><small class="muted">${edit && int.api_key_set ? "The stored key is never shown." : "Stored on the manager."}</small></label>
       <label class="px-field"><span>Minimum alert level</span><input class="in" type="number" min="0" max="16" name="level" value="${esc(int?.level ?? "")}" placeholder="7"></label>
       <label class="px-field"><span>Rule groups (comma separated)</span><input class="in" name="group" value="${esc(int?.group || "")}" placeholder="authentication_failed,syscheck" autocomplete="off" spellcheck="false"></label>
-      <label class="px-field"><span>Rule IDs (comma separated)</span><input class="in" name="rule_id" value="${esc(int?.rule_id || "")}" placeholder="100100,100101" autocomplete="off" spellcheck="false"></label>
-      <label class="px-check"><input type="checkbox" name="json" ${(int?.alert_format || "") === "json" ? "checked" : ""}> <span>Send the alert as JSON</span></label>
+      <label class="px-field" data-int-std><span>Rule IDs (comma separated)</span><input class="in" name="rule_id" value="${esc(int?.rule_id || "")}" placeholder="100100,100101" autocomplete="off" spellcheck="false"></label>
+      <label class="px-check" data-int-std><input type="checkbox" name="json" ${(int?.alert_format || "") === "json" ? "checked" : ""}> <span>Send the alert as JSON</span></label>
     </div>
     <div class="confirm__actions"><button type="button" class="btn btn--ghost" data-dlg-close>Cancel</button><button class="btn btn--primary" type="submit">${edit ? "Save" : "Add"}</button></div></form>`;
+  detIntTypeUi(body);
   $("[data-det-dialog]").showModal();
-  $(edit ? "[name=hook_url]" : "[name=type]", body).focus();
+  $(edit ? (n8n ? "[name=n8n_hook]" : "[name=hook_url]") : "[name=type]", body).focus();
+}
+function detIntTypeUi(root) {
+  const t = $("[data-int-type]", root).value;
+  $("[data-int-idbox]", root).hidden = t !== "custom";
+  $$("[data-int-n8n]", root).forEach((e) => { e.hidden = t !== "n8n"; });
+  $$("[data-int-std]", root).forEach((e) => { e.hidden = t === "n8n"; });
 }
 async function detIntSubmit(f) {
   const v = Object.fromEntries(new FormData(f)), edit = f.dataset.mode === "edit";
   const type = edit ? $("[name=type]", f).value : v.type;
   let name = type;
+  if (type === "n8n") {
+    const hook = (v.n8n_hook || "").trim() || "vexor-alerts";
+    if (/\s/.test(hook) || hook.length > 300 || (/:\/\//.test(hook) && !/^https?:\/\//.test(hook))) { toast("Webhook: a path like vexor-alerts or a full http(s):// URL, no spaces.", "bad"); return; }
+    const body = { action: edit ? "edit" : "add", name: "custom-n8n", hook_url: hook, group: String(v.group || "").trim() };
+    if (String(v.level ?? "").trim() !== "") body.level = String(v.level).trim();
+    $("[data-det-dialog]").close();
+    const job = await postConfirm("/api/detection/integration", body, { text: "Connects the stack to n8n: sends alerts at or above the level to the webhook, installs the integration script on every manager and restarts them to load it." });
+    if (job) openJob(job, () => { if (PAGE.key === "detection") route(true); });
+    return;
+  }
   if (type === "custom") {
     const cid = (v.cid || "").trim();
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$/.test(cid)) { $("[data-int-err=cid]", f).textContent = "Letters, digits, - and _."; return; }
@@ -1795,7 +1829,7 @@ function detLtHtml(r) {
     if (at("data-int-add")) return detIntForm(null);
     if ((b = at("data-int-edit"))) return detIntForm((DET.ints || []).find((i) => i.name === b.dataset.intEdit));
     if ((b = at("data-int-test"))) return run(["wazuh", "integrations", "test", b.dataset.intTest], { text: "Sends a sample alert through this integration." });
-    if ((b = at("data-int-rm"))) return run(["wazuh", "integrations", "rm", b.dataset.intRm], { text: `Removes ${b.dataset.intRm} from ossec.conf on every manager and restarts them.` });
+    if ((b = at("data-int-rm"))) return run(["wazuh", "integrations", "rm", b.dataset.intRm], { text: b.dataset.intRm === "custom-n8n" ? "Stops sending alerts to n8n: removes the integration from ossec.conf on every manager and restarts them." : `Removes ${b.dataset.intRm} from ossec.conf on every manager and restarts them.` });
     if ((b = at("data-cfg-addrow"))) { b.insertAdjacentHTML("beforebegin", detCfgItem()); $$("[data-cfg-item]", b.parentElement).at(-1).focus(); return detDirtyUi(); }
     if ((b = at("data-cfg-del"))) { b.closest(".cfg-item").remove(); return detDirtyUi(); }
     if (at("data-cfg-reset")) return detCfgLoad();
@@ -1807,7 +1841,7 @@ function detLtHtml(r) {
     if (t.closest("[data-ed], [data-cfg-form]")) detDirtyUi();
   });
   on("change", (e) => {
-    if (e.target.matches("[data-int-type]")) $("[data-int-idbox]").hidden = e.target.value !== "custom";
+    if (e.target.matches("[data-int-type]")) detIntTypeUi(e.target.closest("form"));
     if (e.target.closest("[data-cfg-form]")) detDirtyUi();
   });
   on("submit", (e) => {
