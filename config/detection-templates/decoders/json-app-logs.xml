@@ -1,10 +1,13 @@
-<!-- vexor-template: id=json-app-logs; title=JSON application logs; description=Decode one-line JSON logs from an app, found by a fixed text in the line -->
+<!-- vexor-template: id=json-app-logs; title=JSON application logs; description=Decode JSON logs an app writes after a fixed prefix, e.g. "billing-app: {...}" -->
 <!--
-  Change the prematch to text that every line of this app contains. The
-  JSON_Decoder then turns each key into a field (action becomes data.action).
+  For lines like:  billing-app: {"action":"purge","user":"bob"}
+  The prematch is the fixed prefix (change it to your app's); the JSON_Decoder
+  then turns each key after it into a field (action, user, ...).
   Rules reach this decoder with decoded_as vexor-json-app (see rules/json-field-match.xml).
+  Lines that are pure JSON (starting with "{") are already decoded by Wazuh's
+  built-in "json" decoder: write rules with <decoded_as>json</decoded_as> instead.
 -->
 <decoder name="vexor-json-app">
-  <prematch>"app":"billing"</prematch>
-  <plugin_decoder>JSON_Decoder</plugin_decoder>
+  <prematch>^billing-app: </prematch>
+  <plugin_decoder offset="after_prematch">JSON_Decoder</plugin_decoder>
 </decoder>

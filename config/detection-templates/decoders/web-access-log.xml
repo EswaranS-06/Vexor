@@ -2,10 +2,12 @@
 <!--
   Read the access log file with a localfile entry (log_format syslog takes the
   raw line). The regex expects the common log format: client, identity, user,
-  [time], "method url protocol", status, size. It has no prematch, so it is
-  tried on every line that reaches it. Change the regex when your format adds fields.
+  [time], "method url protocol", status, size. A top-level decoder needs a
+  prematch: here the client address followed by the bracketed time. Change both
+  when your format adds fields.
 -->
 <decoder name="vexor-web-access">
-  <regex>^(\S+) \S+ \S+ \[\S+ \S+\] "(\w+) (\S+) \S+" (\d+) (\d+)</regex>
+  <prematch type="pcre2">^\S+ \S+ \S+ \[[^\]]+\] "</prematch>
+  <regex type="pcre2">^(\S+) \S+ \S+ \[\S+ \S+\] "(\w+) (\S+) \S+" (\d+) (\d+)</regex>
   <order>srcip,protocol,url,id,size</order>
 </decoder>

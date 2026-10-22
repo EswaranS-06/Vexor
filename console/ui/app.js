@@ -1659,12 +1659,14 @@ async function detIntSubmit(f) {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$/.test(cid)) { $("[data-int-err=cid]", f).textContent = "Letters, digits, - and _."; return; }
     name = "custom-" + cid;
   }
-  const args = ["wazuh", "integrations", edit ? "edit" : "add", name];
-  const opt = (flag, val) => { if (val != null && String(val).trim() !== "") args.push(flag, String(val).trim()); };
-  opt("--hook-url", v.hook_url); opt("--api-key", v.api_key); opt("--level", v.level); opt("--group", v.group); opt("--rule-id", v.rule_id);
-  if (v.json) args.push("--format", "json");
+  // the API key goes in the request body: the server hands it to vexor in a 0600 file, never on a command line
+  const body = { action: edit ? "edit" : "add", name };
+  for (const k of ["hook_url", "level", "group", "rule_id"]) if (v[k] != null && String(v[k]).trim() !== "") body[k] = String(v[k]).trim();
+  if (v.api_key) body.api_key = v.api_key;
+  if (v.json) body.format = "json";
   $("[data-det-dialog]").close();
-  await run(args, { mask: [v.api_key], text: `${edit ? "Updates" : "Adds"} the integration in ossec.conf on every manager, checks it and restarts the managers to load it.` });
+  const job = await postConfirm("/api/detection/integration", body, { text: `${edit ? "Updates" : "Adds"} the integration in ossec.conf on every manager, checks it and restarts the managers to load it.` });
+  if (job) openJob(job, () => { if (PAGE.key === "detection") route(true); });
 }
 
 // ---- manager config

@@ -4,12 +4,13 @@
   decoded_as names the decoder that handled the event. Here it is the custom
   JSON decoder vexor-json-app from decoders/json-app-logs.xml. Use the decoder
   name from your own decoder file.
-  JSON keys are fields: action below matches the JSON key "action".
+  JSON keys are fields. "action" is a built-in field with its own tag (<action>);
+  any other key uses <field name="key">, e.g. <field name="user.role">admin</field>.
 -->
 <group name="vexor,json,">
   <rule id="100105" level="8">
     <decoded_as>vexor-json-app</decoded_as>
-    <field name="action" type="pcre2">^(delete|purge)$</field>
-    <description>App: destructive action $(action) by $(user)</description>
+    <action type="pcre2">^(delete|purge)$</action>
+    <description>App: destructive action $(action)</description>
   </rule>
 </group>
