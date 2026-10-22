@@ -6364,6 +6364,14 @@ PY
     *) die "usage: vexor wazuh $k ls|show|put|rm|history|restore|templates$([ "$k" = lists ] && echo '|add|del') ..." ;;
   esac
 }
+det_integ_script_missing() {   # det_integ_script_missing <custom-id>: prints the first running manager that lacks its script (a missing one stops integratord, and the change is rolled back)
+  local m
+  for m in $(enabled_managers); do
+    is_running "$m" || continue
+    dc exec -T "$m" test -x "/var/ossec/integrations/$1" || { echo "$m"; return 0; }
+  done
+  return 1
+}
 det_integ_n8n() {              # det_integ_n8n add|edit|rm [--hook-url PATH|URL] [--level N] [--group G]: custom-n8n is owned by vexor n8n
   local act="$1"; shift
   if [ "$act" = rm ] || [ "$act" = remove ]; then cmd_n8n disconnect; det_rec integrations custom-n8n rm 1 "n8n disconnected"; return; fi
@@ -6472,13 +6480,14 @@ else:
         cur["group"] = "syscheck"            # VirusTotal only understands file integrity alerts
 json.dump(items, open(out, "w"))
 PY
-      if [ "$act" != rm ] && [[ "$n" == custom-* ]] && ! dc exec -T wazuh.master test -x "/var/ossec/integrations/$n"; then
-        bad "wazuh.master has no integration script /var/ossec/integrations/$n"
+      local miss; miss="$([ "$act" != rm ] && [[ "$n" == custom-* ]] && det_integ_script_missing "$n")"
+      if [ -n "$miss" ]; then
+        bad "$miss has no integration script /var/ossec/integrations/$n"
         hint "copy it into every manager: docker cp $n <container>:/var/ossec/integrations/$n, then chown root:wazuh and chmod 750 it"
-        det_rec integrations "$n" "$act" 0 "no script /var/ossec/integrations/$n in wazuh.master"; exit 1
+        det_rec integrations "$n" "$act" 0 "no script /var/ossec/integrations/$n in $miss"; exit 1
       fi
       det_py integ-write "$cd" "$js" $(n8n_conf_files)
-      DET_WANT_INTEGRATORD=0; [ "$(pj 'print(len(d))' < "$js")" -gt 0 ] && DET_WANT_INTEGRATORD=1
+      DET_WANT_INTEGRATORD=0; { [ "$(pj 'print(len(d))' < "$js")" -gt 0 ] || [ -n "$(n8n_hook)" ]; } && DET_WANT_INTEGRATORD=1
       if [ -z "$(ls -A "$cd")" ]; then ok "$n: nothing changed"; return 0; fi
       det_conf_apply "$cd" integrations "$n" "$act"
       det_rec integrations "$n" "$act" 1 "integration $n: $act"
@@ -6488,7 +6497,7 @@ PY
       case "$rv" in
         show) det_py integ-raw-show "$conf" ;;
         put)
-          local from="" f cd; while [ $# -gt 0 ]; do case "$1" in --from) from="${2:-}"; shift ;; *) die "unknown option $1" ;; esac; shift; done
+          local from="" f cd miss; while [ $# -gt 0 ]; do case "$1" in --from) from="${2:-}"; shift ;; *) die "unknown option $1" ;; esac; shift; done
           t="$(det_read_from "$from")" || exit 1
           det_master; take_lock
           rm -rf "$RUN_TMP/det-cand"; mkdir -p "$RUN_TMP/det-cand"; cd="$RUN_TMP/det-cand"
@@ -6497,7 +6506,7 @@ PY
           [ -n "$(n8n_hook)" ] && DET_WANT_INTEGRATORD=1
           if [ -z "$(ls -A "$cd")" ]; then ok "integrations unchanged"; return 0; fi
           for f in $(grep -o '<name>custom-[A-Za-z0-9_-]*</name>' "$t" | sed -E 's/<[^>]*>//g'); do
-            dc exec -T wazuh.master test -x "/var/ossec/integrations/$f" || { DET_ERR="no script /var/ossec/integrations/$f in wazuh.master"; det_problem integrations raw put "refused (nothing changed):"; }
+            miss="$(det_integ_script_missing "$f")" && { DET_ERR="no script /var/ossec/integrations/$f in $miss"; det_problem integrations raw put "refused (nothing changed):"; }
           done
           det_conf_apply "$cd" integrations raw put
           det_rec integrations raw put 1 "integrations edited by hand"
