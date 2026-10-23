@@ -334,7 +334,7 @@ LOGSTASH_BEATS_TLS=false       # true = TLS on the Beats input (vexor elk beats-
 N8N_NOTIFY_URL=
 N8N_ABUSEIPDB_KEY=
 N8N_AUTO_BLOCK=off             # approve = critical alerts with a public source IP ask in chat, then firewall-drop on the agent
-ENROLL_PASSWORD_ON_INSTALL=yes # fresh installs turn on the agent enrollment password
+ENROLL_PASSWORD_ON_INSTALL=no  # yes = fresh installs turn on the agent enrollment password (or later: vexor agents password on)
 NOTIFY_ON=fail                 # health alerts off the host: fail | warn | off (vexor notify)
 NOTIFY_URL=
 NOTIFY_REPEAT_HOURS=6          # re-send a problem that persists
@@ -1036,7 +1036,7 @@ cmd_install() {
   rm -f "$STATE_DIR/stopped"
   apply_all
   wait_stack || warn "some services are not ready yet - vexor wait-ready   |   vexor doctor"
-  if [ "$fresh" = 1 ] && soc_wazuh && [ -z "$(env_get AGENT_ENROLL_PASSWORD)" ] && [ "$(env_def ENROLL_PASSWORD_ON_INSTALL yes)" = yes ]; then
+  if [ "$fresh" = 1 ] && soc_wazuh && [ -z "$(env_get AGENT_ENROLL_PASSWORD)" ] && [ "$(env_def ENROLL_PASSWORD_ON_INSTALL no)" = yes ]; then
     agents_password on && say "agents need this password to enroll; vexor agents enroll-cmd includes it"
   fi
   cmd_info
@@ -4240,6 +4240,17 @@ cmd_soc() {
     *) die "usage: vexor soc [status] | wazuh | elk | both" ;;
   esac
 }
+enroll_password_sync() {       # use_password=yes without authd.pass: authd picks a random password nobody knows and no agent can enroll
+  local conf="$CLUSTER_DIR/wazuh_manager.conf" pw
+  grep -q '<use_password>yes</use_password>' "$conf" 2>/dev/null || return 0
+  is_running wazuh.master || return 0
+  pw="$(env_get AGENT_ENROLL_PASSWORD)"
+  if [ -z "$pw" ]; then pw="$(openssl rand -hex 16)"; env_set AGENT_ENROLL_PASSWORD "$pw"; fi
+  [ "$(dc exec -T wazuh.master cat /var/ossec/etc/authd.pass 2>/dev/null | tr -d '\r\n')" = "$pw" ] && return 0
+  dc exec -T wazuh.master bash -c "printf '%s\n' '$pw' > /var/ossec/etc/authd.pass && chown root:wazuh /var/ossec/etc/authd.pass && chmod 640 /var/ossec/etc/authd.pass" \
+    && dc_restart wazuh.master >/dev/null && ok "enrollment password restored (authd.pass was missing or different)"
+  return 0
+}
 apply_all() {                  # the one reconcile path: render everything, pull, up, post-steps
   tools_prepare; elk_prepare
   pull_missing_images || warn "some images are missing - their services will not start"
@@ -4247,6 +4258,7 @@ apply_all() {                  # the one reconcile path: render everything, pull
   run_step "Starting the containers" dc up -d || die "docker compose up failed - see the output above, then: vexor doctor"
   soc_wazuh && wait_indexer 300 && post_start      # users/roles below need a running indexer
   tools_post
+  soc_wazuh && enroll_password_sync   # authd.pass must exist whenever use_password is yes
   soc_wazuh && detection_sync      # custom rules/decoders/lists back into a master with a fresh volume
   elk_post
   soc_wazuh && wait_dashboard 240
