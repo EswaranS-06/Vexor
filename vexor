@@ -1256,6 +1256,23 @@ d_warn() { D_WARN=$((D_WARN + 1)); warn "$1"; [ -n "${2:-}" ] && hint "$2"; retu
 d_fail() { D_FAIL=$((D_FAIL + 1)); bad "$1"; [ -n "${2:-}" ] && hint "$2"; return 0; }
 d_fix()  { [ "$DO_FIX" = 1 ] || return 1; printf '      %sfixing:%s %s\n' "$C_B" "$C_0" "$1"; return 0; }
 
+local_agent_doctor() {         # a wazuh-agent on the vexor host itself: its manager address must be one of this host's (DHCP moves it)
+  local conf=/var/ossec/etc/ossec.conf a bad="" h
+  [ -r "$conf" ] && grep -q '<client>' "$conf" 2>/dev/null || return 0
+  for a in $(sed -n '/<client>/,/<\/client>/s#.*<address>\(.*\)</address>.*#\1#p' "$conf"); do
+    case "$a" in localhost|127.0.0.1|"$(hostname)"|"$(hostname -f 2>/dev/null)"|"$(public_host)") continue ;; esac
+    host_has_ip "$a" || bad="$bad $a"
+  done
+  if [ -z "$bad" ]; then d_pass "wazuh-agent on this host points at this manager"; return 0; fi
+  h="$(public_host)"
+  d_fail "wazuh-agent on this host sends to${bad} - not an address of this machine (address changed, e.g. DHCP), so it never enrolls" \
+    "vexor doctor --fix   (sets <address>$h</address> and restarts wazuh-agent; for a stable address set PUBLIC_HOST to a DNS name or reserve the IP in DHCP)"
+  if d_fix "point the local wazuh-agent at $h"; then
+    for a in $bad; do sed -i "s#<address>$a</address>#<address>$h</address>#" "$conf"; done
+    systemctl restart wazuh-agent 2>/dev/null
+  fi
+  return 0
+}
 cmd_doctor() {
   [ "${1:-}" = "--fix" ] && { DO_FIX=1; take_lock; }
   local dr dp warn_pct v
@@ -1567,6 +1584,7 @@ cmd_doctor() {
   else d_fail "agent port $(env_def AGENT_PORT 1514) closed ($who) - agents cannot send events" "vexor doctor --fix   (recreates the container that must publish it)"
        d_fix "recreate nginx" && { prune_disabled_containers; dc up -d --no-deps --force-recreate nginx >/dev/null 2>&1; }; fi
   tcp_open "$(local_ip)" "$(env_def ENROLL_PORT 1515)" && d_pass "enrollment port $(env_def ENROLL_PORT 1515)/tcp open" || d_fail "enrollment port $(env_def ENROLL_PORT 1515) closed" "vexor logs ossec master"
+  local_agent_doctor
   if command -v ufw >/dev/null && ufw status 2>/dev/null | has "Status: active"; then
     d_warn "ufw firewall active - make sure ports $port,$(env_def AGENT_PORT 1514),$(env_def ENROLL_PORT 1515)/tcp are allowed"
   fi
@@ -2747,6 +2765,10 @@ agents_enroll_cmd() {
   echo
   say "Options: --name <agent-name>  --group <group>   OS: linux | rpm | windows | macos"
   [ -z "$pw" ] && say "Enrollment is open to anyone who can reach port $ep - protect it: vexor agents password on"
+  say "Agent already installed? Reinstalling keeps its old ossec.conf. Point it here: sudo sed -i 's#<address>.*</address>#<address>$h</address>#' /var/ossec/etc/ossec.conf && sudo systemctl restart wazuh-agent"
+  if [ -z "$(env_get PUBLIC_HOST)" ] && ip -4 addr show 2>/dev/null | grep -F " $h/" | has dynamic; then
+    warn "$h comes from DHCP - when it changes, agents lose the manager. Reserve it in DHCP, use a static IP, or set PUBLIC_HOST to a DNS name"
+  fi
   return 0
 }
 agents_password() {
