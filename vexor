@@ -294,6 +294,7 @@ DISK_WARN_PCT=85               # doctor/watchdog warn above this disk usage (ind
 DISK_FAIL_PCT=95               # doctor fails above this disk usage on any disk Docker uses (indexers go read-only)
 DISK_WARN_FREE_GB=15           # install warns when a disk Docker uses has less free space than this
 DISK_MIN_FREE_GB=5             # install refuses below this free space (override: vexor install --force)
+WAZUH_SCA=false                # true = Security Configuration Assessment scans on every manager and agent (data.sca alerts); off by default
 WAZUH_VULN_DETECTION=false     # true = Wazuh vulnerability detection in every manager (its CVE feed needs about 13 GB of disk per manager)
 WATCHDOG_AUTOHEAL=yes          # watchdog restarts stopped containers / clears read-only index blocks
 BACKUP_TIME=01:30              # daily backup time (systemd timer, vexor daemon install)
@@ -1762,6 +1763,7 @@ cmd_config() {
         *PORT|RETENTION_DAYS|INDEX_RETENTION_DAYS|ELK_RETENTION_DAYS|MANAGER_LOG_RETENTION_DAYS|SNAPSHOT_RETENTION_DAYS|DISK_WARN_PCT|DISK_FAIL_PCT|DISK_WARN_FREE_GB|DISK_MIN_FREE_GB|CERT_DAYS|LOG_MAX_FILE|NGINX_WORKER_CONNECTIONS)
           [[ "$v" =~ ^[0-9]+$ ]] || die "$k must be a number" ;;
         WAZUH_VULN_DETECTION) [[ "$v" =~ ^(true|false)$ ]] || die "WAZUH_VULN_DETECTION must be true or false" ;;
+        WAZUH_SCA) [[ "$v" =~ ^(true|false)$ ]] || die "WAZUH_SCA must be true or false" ;;
         INDEXER_HEAP) [[ "$v" =~ ^[0-9]+[mg]$ ]] || die "INDEXER_HEAP like 1g or 2048m" ;;
         BIND_IP) [[ "$v" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || die "BIND_IP must be an IPv4 address (0.0.0.0 = all interfaces)" ;;
         BACKUP_TIME|MAINT_TIME) [[ "$v" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "$k must be HH:MM" ;;
@@ -3554,6 +3556,22 @@ if changed:
     print("changed")
 PY
 }
+sync_sca() {                   # WAZUH_SCA -> <enabled> of <sca> in every manager ossec.conf; prints "changed"
+  python3 -I - "$(env_def WAZUH_SCA false)" "$CLUSTER_DIR"/wazuh_*.conf <<'PY'
+import re, sys
+want = "yes" if sys.argv[1].strip().lower() in ("true", "yes", "1", "on") else "no"
+pat = re.compile(r"(<sca>\s*<enabled>)(yes|no)(</enabled>)", re.S)
+changed = False
+for path in sys.argv[2:]:
+    s = open(path).read()
+    n = pat.sub(lambda m: m.group(1) + want + m.group(3), s, count=1)
+    if n != s:
+        open(path, "w").write(n)          # in-place write keeps the bind-mounted inode
+        changed = True
+if changed:
+    print("changed")
+PY
+}
 write_tool_rules() {
   rm -f "$TOOLS_DIR/wazuh/wazuhctl_tools_rules.xml" "$TOOLS_DIR/zeek/wazuhctl.zeek"   # pre-rename names           # Wazuh rules for the sensors (mounted into the master only while a sensor is on)
   mkdir -p "$TOOLS_DIR/wazuh"
@@ -3766,6 +3784,7 @@ EOF
   TOOLS_MASTER_CHANGED=0 N8N_BLOCKS_CHANGED=0
   soc_wazuh && [ "$(sync_master_localfiles)" = changed ] && TOOLS_MASTER_CHANGED=1
   VULN_CHANGED=0; soc_wazuh && [ "$(sync_vuln_detection)" = changed ] && VULN_CHANGED=1
+  SCA_CHANGED=0; soc_wazuh && [ "$(sync_sca)" = changed ] && SCA_CHANGED=1
   [ "$(n8n_sync_blocks)" = changed ] && N8N_BLOCKS_CHANGED=1
   sync_profiles; render_override; render_nginx
 }
@@ -3775,6 +3794,7 @@ tools_post() {                 # after `docker compose up`: manager reload, user
   soc_wazuh && [ -n "$(n8n_hook)" ] && n8n_install_script
   if [ "${N8N_BLOCKS_CHANGED:-0}" = 1 ]; then again="$(enabled_managers)"
   else again="$N8N_INSTALLED"; [ "${TOOLS_MASTER_CHANGED:-0}" = 1 ] && again="$again wazuh.master"; fi
+  [ "${SCA_CHANGED:-0}" = 1 ] && again="$(enabled_managers)"      # the SCA switch lives in every manager's ossec.conf
   [ "${VULN_CHANGED:-0}" = 1 ] && again="$(enabled_managers)"     # the vulnerability feed switch lives in every manager's ossec.conf
   again="$(tr ' ' '\n' <<<"$again" | grep -v '^$' | sort -u | while read -r m; do is_running "$m" && echo "$m"; done | tr '\n' ' ')"
   if [ -n "${again// /}" ]; then
@@ -7094,6 +7114,50 @@ retention_apply() {            # Wazuh indexer: ISM policy, attached to wazuh-al
   done
   return 0
 }
+retention_purge() {            # vexor retention purge: delete DOCUMENTS inside the Wazuh indices (the indices themselves stay)
+  local older="" idx="wazuh-alerts-*,wazuh-archives-*" agent="" rule="" q="" sca=0 dry=0 compact=0 body n
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --older-than) older="${2:?days}"; shift ;;
+      --index)      idx="${2:?pattern}"; shift ;;
+      --agent)      agent="${2:?agent name}"; shift ;;
+      --rule-id)    rule="${2:?rule id}"; shift ;;
+      --query)      q="${2:?lucene query}"; shift ;;
+      --sca)        sca=1 ;;
+      --dry-run)    dry=1 ;;
+      --compact)    compact=1 ;;
+      *) die "unknown option $1 - vexor retention purge [--older-than DAYS] [--agent NAME] [--rule-id ID] [--sca] [--query LUCENE] [--index PATTERN] [--dry-run] [--compact]" ;;
+    esac; shift
+  done
+  [ -n "$older$agent$rule$q" ] || [ "$sca" = 1 ] || die "give at least one filter: --older-than, --agent, --rule-id, --sca or --query (deleting every document is not offered)"
+  [[ -z "$older" || "$older" =~ ^[0-9]+$ ]] || die "--older-than must be a whole number of days"
+  [[ -z "$rule" || "$rule" =~ ^[0-9]+$ ]] || die "--rule-id must be a number"
+  soc_wazuh || die "Wazuh is off (SOC=$(soc))"
+  [ "$(ix_code)" = 200 ] || die "Wazuh indexer unreachable"
+  body="$(python3 -I - "$older" "$agent" "$rule" "$q" "$sca" <<'PY'
+import json, sys
+older, agent, rule, q, sca = sys.argv[1:6]
+must = []
+if older: must.append({"range": {"timestamp": {"lt": f"now-{older}d"}}})
+if agent: must.append({"match_phrase": {"agent.name": agent}})
+if rule:  must.append({"term": {"rule.id": rule}})
+if sca == "1": must.append({"exists": {"field": "data.sca"}})
+if q:     must.append({"query_string": {"query": q}})
+print(json.dumps({"query": {"bool": {"filter": must}}}))
+PY
+)"
+  n="$(ix POST "/${idx}/_count?ignore_unavailable=true&allow_no_indices=true" -d "$body" | pj 'print(d.get("count", 0))')"
+  say "documents matching in $idx: ${n:-0}"
+  [ "${n:-0}" -gt 0 ] || { ok "nothing to delete"; return 0; }
+  [ "$dry" = 1 ] && { say "dry run - nothing deleted"; return 0; }
+  take_lock
+  confirm "Delete $n document(s) from $idx? The indices stay, the documents cannot be restored" || die "Aborted"
+  ix POST "/${idx}/_delete_by_query?conflicts=proceed&refresh=true&wait_for_completion=true&ignore_unavailable=true&allow_no_indices=true" -d "$body" \
+    | pj 'print("deleted", d.get("deleted", 0), "documents, version conflicts", d.get("version_conflicts", 0), "failures", len(d.get("failures", [])))' | sed 's/^/  /'
+  if [ "$compact" = 1 ]; then
+    ix POST "/${idx}/_forcemerge?only_expunge_deletes=true&ignore_unavailable=true&allow_no_indices=true" >/dev/null && ok "deleted documents compacted, disk space is freed"
+  else say "disk space is freed when Wazuh merges segments; --compact does it now"; fi
+}
 cmd_retention() {              # vexor retention [status|apply]: deletion policies for Wazuh and Elasticsearch data
   local rc=0 wd ed ri re
   case "${1:-status}" in
@@ -7132,7 +7196,8 @@ cmd_retention() {              # vexor retention [status|apply]: deletion polici
         hdr "Total size"
         ix GET "/_cat/indices/wazuh-*?h=store.size&bytes=b" | awk '{s+=$1} END {printf "  %.2f GB (all wazuh-* indices, incl. replicas)\n", s/1073741824}'
       fi ;;
-    *) die "usage: vexor retention status|apply  (sets: vexor config set RETENTION_DAYS 60; 0 = keep forever)" ;;
+    purge) shift; retention_purge "$@" ;;
+    *) die "usage: vexor retention status|apply|purge  (sets: vexor config set RETENTION_DAYS 60; 0 = keep forever; purge deletes documents, not indices)" ;;
   esac
 }
 prune_logs() {
@@ -8532,6 +8597,8 @@ if any(k.endswith("_PORT") for k in keys):
     notes.append("clients, agents and firewall rules must use the new ports; Vexor does not change firewall rules")
 if keys & {"SURICATA", "ZEEK", "ZEEK_WAZUH_LOGS", "N8N"}:
     notes.append("tools apply also updates the master's log sources / integration, which recreates the master")
+if "WAZUH_SCA" in keys:
+    notes.append("WAZUH_SCA changes ossec.conf, which recreates every manager; agents follow the manager's SCA setting only if their own ossec.conf has it enabled")
 if "WAZUH_VULN_DETECTION" in keys:
     notes.append("WAZUH_VULN_DETECTION changes ossec.conf, which recreates every manager (turning it off also deletes the downloaded CVE feed; on downloads it again, about 13 GB per manager)")
 orph = []
