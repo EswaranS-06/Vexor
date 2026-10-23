@@ -325,6 +325,7 @@ GRAFANA_ADMIN_PASSWORD=CHANGE_ME     # generated when GRAFANA=true (grafana logi
 GRAFANA_INDEXER_PASSWORD=CHANGE_ME   # read-only indexer user "grafana" used by the datasource
 PORTAINER_ADMIN_PASSWORD=CHANGE_ME   # portainer login: admin (applied on its first start)
 N8N_ENCRYPTION_KEY=CHANGE_ME         # encrypts n8n credentials - keep it, back it up
+N8N_EXTRA_HOOKS=                     # more custom-n8n blocks: url|level|groups;... (set by: vexor wazuh integrations raw put)
 N8N_ALERT_LEVEL=7                    # alerts with this level or higher go to n8n (vexor n8n connect)
 N8N_HOOK_URL=
 N8N_ALERT_GROUPS=
@@ -4679,20 +4680,27 @@ n8n_sync_blocks() {            # <integration> block in master + worker configs 
   local url="" lvl grp tok         # prints "changed" when a file was edited
   soc_wazuh && url="$(n8n_hook)"
   lvl="$(n8n_level)"; grp="$(env_get N8N_ALERT_GROUPS)"; tok="$(env_get N8N_HOOK_TOKEN)"
-  python3 -I - "$url" "$lvl" "$grp" "$tok" $(n8n_conf_files) <<'PY'
+  python3 -I - "$url" "$lvl" "$grp" "$tok" "$(env_get N8N_EXTRA_HOOKS)" $(n8n_conf_files) <<'PY'
 import re, sys
 from xml.sax.saxutils import escape
-url, level, groups, token, files = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
-grp = f"    <group>{escape(groups)}</group>\n" if groups else ""
-block = ("  <!-- vexor:n8n:begin (managed by: vexor n8n) -->\n"
-         "  <integration>\n"
-         "    <name>custom-n8n</name>\n"
-         f"    <hook_url>{escape(url)}</hook_url>\n"
-         f"    <api_key>{escape(token)}</api_key>\n"
-         f"    <level>{level}</level>\n{grp}"
-         "    <alert_format>json</alert_format>\n"
-         "  </integration>\n"
-         "  <!-- vexor:n8n:end -->\n")
+url, level, groups, token, extra, files = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:]
+
+
+def integ(u, lv, gr):
+    return ("  <integration>\n"
+            "    <name>custom-n8n</name>\n"
+            f"    <hook_url>{escape(u)}</hook_url>\n"
+            f"    <api_key>{escape(token)}</api_key>\n"
+            + (f"    <level>{lv}</level>\n" if lv not in ("", "0") else "")      # 0 = every alert: Wazuh needs no <level> for that
+            + (f"    <group>{escape(gr)}</group>\n" if gr else "")
+            + "    <alert_format>json</alert_format>\n"
+            "  </integration>\n")
+
+
+extras = [e.split("|") for e in extra.split(";") if e.count("|") == 2]
+block = ("  <!-- vexor:n8n:begin (managed by: vexor n8n) -->\n" + integ(url, level, groups)
+         + "".join(integ(u, lv, gr) for u, lv, gr in extras)
+         + "  <!-- vexor:n8n:end -->\n")
 changed = False
 for f in files:
     s = open(f).read(); o = s
@@ -5196,19 +5204,21 @@ cmd_n8n() {
       local target="vexor-alerts" lvl grp
       [ $# -gt 0 ] && [[ "$1" != --* ]] && { target="$1"; shift; }
       lvl="$(n8n_level)"; grp="$(env_get N8N_ALERT_GROUPS)"
-      while [ $# -gt 0 ]; do case "$1" in --level) lvl="${2:?}"; shift ;; --groups) grp="${2:-}"; shift ;; esac; shift; done
+      local extra; extra="$(env_get N8N_EXTRA_HOOKS)"
+      while [ $# -gt 0 ]; do case "$1" in --level) lvl="${2:?}"; shift ;; --groups) grp="${2:-}"; shift ;; --extra) extra="${2:-}"; shift ;; esac; shift; done
       [[ "$lvl" =~ ^([0-9]|1[0-5])$ ]] || die "--level must be 0-15"
       [[ "$target" == *://* ]] || tool_on n8n || die "N8N is not enabled: vexor n8n enable   (or give the full webhook URL of another n8n)"
       local url; url="$(n8n_hook_url "$target")"
       take_lock
       gen_secret N8N_HOOK_TOKEN hex
-      env_set N8N_HOOK_URL "$url"; env_set N8N_ALERT_LEVEL "$lvl"; env_set N8N_ALERT_GROUPS "$grp"
+      env_set N8N_HOOK_URL "$url"; env_set N8N_ALERT_LEVEL "$lvl"; env_set N8N_ALERT_GROUPS "$grp"; env_set N8N_EXTRA_HOOKS "$extra"
       ok "alerts -> $url  (level >= $lvl${grp:+, groups $grp}; header X-Vexor-Token)"
+      local e; for e in ${extra//;/ }; do IFS='|' read -r eu el eg <<<"$e"; ok "alerts -> $eu  (level >= ${el:-0}${eg:+, groups $eg})"; done
       n8n_apply
       [ "$(n8n_probe)" = registered ] || hint "no workflow listens on that path yet: vexor n8n workflow   (imports + publishes a starter)" ;;
     disconnect)
       take_lock
-      env_set N8N_HOOK_URL ""; n8n_apply; ok "the stack no longer sends alerts to n8n" ;;
+      env_set N8N_HOOK_URL ""; env_set N8N_EXTRA_HOOKS ""; n8n_apply; ok "the stack no longer sends alerts to n8n" ;;
     test) n8n_test "$@" ;;
     workflow)
       case "${1:-import}" in
@@ -6028,13 +6038,12 @@ def main():
         out = ""
         for i in integrations(a[0]):
             if i["n8n"]:
-                out += N8N_NOTE + "\n<integration>\n  <name>custom-n8n</name>\n"
+                out += ("" if out else N8N_NOTE + "\n") + "<integration>\n  <name>custom-n8n</name>\n"
                 for k, v in (("hook_url", i["hook_url"]), ("level", "" if i["level"] is None else str(i["level"])), ("group", i["group"]),
                              ("rule_id", i["rule_id"]), ("alert_format", i["alert_format"])):
                     if v:
                         out += "  <%s>%s</%s>\n" % (k, v, k)      # the values are already XML-escaped (read as they are in ossec.conf)
                 out += "</integration>\n"
-                break
         rest = textwrap.dedent(block_body(read(a[0]), "integrations") or "").strip("\n")
         print((out + ("\n" if out and rest else "") + rest).rstrip("\n"))
     elif op == "integ-raw-split":      # integ-raw-split <xml> <rest out> <n8n out (json)> <current n8n hook url>: custom-n8n apart from the other blocks
@@ -6053,22 +6062,19 @@ def main():
                 found.append(m.group(2)); spans.append(m.span())
             elif m.group(1):
                 print("the name of the n8n block must stay custom-n8n (found: %s)" % (nm or "none")); sys.exit(1)
-        if len(found) > 1:
-            print("custom-n8n is configured twice"); sys.exit(1)
         rest = body
         for s0, e0 in reversed(spans):
             rest = rest[:s0] + rest[e0:]
         rest = re.sub(r"<!--\s*custom-n8n is managed.*?-->[ \t]*\n?", "", rest, flags=re.S)       # a leftover note (its block was deleted)
         open(a[1], "w").write(rest)
         info = {"present": False}
-        if found:
-            b = found[0]
+        def n8n_check(b, first):
             tags = set(re.findall(r"<([A-Za-z_][\w-]*)", re.sub(r"<!--.*?-->", "", b, flags=re.S)))
             bad = sorted(tags - {"name", "hook_url", "api_key", "level", "group", "alert_format"})
             if bad:
                 print("custom-n8n: <%s> is not supported (use hook_url, level and group; the API key and format are managed)" % bad[0]); sys.exit(1)
             hook = unescape(child(b, "hook_url") or "")
-            cur = unescape(a[3]) if len(a) > 3 else ""
+            cur = unescape(a[3]) if len(a) > 3 and first else ""
             if not hook:
                 print("custom-n8n needs <hook_url>"); sys.exit(1)
             if hook != cur:
@@ -6081,13 +6087,24 @@ def main():
                 if not ok:
                     print("custom-n8n <hook_url> must be the n8n webhook of this stack (http://n8n:5678/webhook/<path>) or just the path (found: %s)" % hook[:80])
                     sys.exit(1)
-            lvl = (child(b, "level") or "").strip()
+            lvl = (child(b, "level") or "").strip() or "0"     # <level> is optional: without it every alert goes to n8n (same as 0)
             if not re.fullmatch(r"\d{1,2}", lvl) or int(lvl) > 15:
-                print("custom-n8n <level> must be a number from 0 to 15 (found: %s)" % (lvl or "none")); sys.exit(1)
+                print("custom-n8n <level> must be a number from 0 to 15 (found: %s)" % lvl); sys.exit(1)
             grp = unescape(child(b, "group") or "").strip()
             if grp and not re.fullmatch(r"[A-Za-z0-9_.,-]{1,256}", grp):
                 print("custom-n8n <group>: rule groups separated by commas (letters, digits, _ . -)"); sys.exit(1)
-            info = {"present": True, "hook": hook, "level": int(lvl), "groups": grp}
+            return {"hook": hook, "level": int(lvl), "groups": grp}
+        seen_hooks = set()
+        for i, b in enumerate(found):
+            h = n8n_check(b, i == 0)
+            key = (h["hook"], h["level"], h["groups"])
+            if key in seen_hooks:
+                print("custom-n8n is configured twice with the same hook_url, level and group"); sys.exit(1)
+            seen_hooks.add(key)
+            if i == 0:
+                info = dict(h, present=True, extra=[])
+            else:
+                info["extra"].append(h)
         json.dump(info, open(a[2], "w"))
     elif op == "integ-raw-set":        # integ-raw-set <outdir> <xml file or ''> <conf..>: replace the managed block by hand-written XML
         body = read(a[1]) if a[1] else ""
@@ -6769,7 +6786,7 @@ PY
           # custom-n8n is owned by vexor n8n (its own marker block, the token in .env): it is split off here and applied with
           # cmd_n8n connect / disconnect; everything else goes through integ-raw-set + det_conf_apply as before.
           # Every check runs before the first change ("refused (nothing changed)").
-          local from="" f cd miss rest="$RUN_TMP/det-rest" nj="$RUN_TMP/det-n8n.json" conf_has=0 was=0 want=0 n8n_do="" nurl="" nlvl="" ngrp="" rest_changed=0
+          local from="" f cd miss rest="$RUN_TMP/det-rest" nj="$RUN_TMP/det-n8n.json" conf_has=0 was=0 want=0 n8n_do="" nurl="" nlvl="" ngrp="" nextra="" rest_changed=0
           while [ $# -gt 0 ]; do case "$1" in --from) from="${2:-}"; shift ;; *) die "unknown option $1" ;; esac; shift; done
           t="$(det_read_from "$from")" || exit 1
           det_master; take_lock
@@ -6780,7 +6797,11 @@ PY
           [ "$(pj 'print(1 if d.get("present") else 0)' < "$nj")" = 1 ] && want=1
           if [ "$want" = 1 ]; then
             nurl="$(n8n_hook_url "$(pj 'print(d["hook"])' < "$nj")")"; nlvl="$(pj 'print(d["level"])' < "$nj")"; ngrp="$(pj 'print(d["groups"])' < "$nj")"
-            if [ "$was" = 0 ] || [ "$nurl" != "$(n8n_hook)" ] || [ "$nlvl" != "$(n8n_level)" ] || [ "$ngrp" != "$(env_get N8N_ALERT_GROUPS)" ]; then
+            local eh el eg; nextra=""
+            while IFS='|' read -r eh el eg; do
+              [ -n "$eh" ] && nextra+="${nextra:+;}$(n8n_hook_url "$eh")|$el|$eg"
+            done < <(pj 'print("\n".join("%s|%s|%s" % (e["hook"], e["level"], e["groups"]) for e in d.get("extra", [])))' < "$nj")
+            if [ "$was" = 0 ] || [ "$nurl" != "$(n8n_hook)" ] || [ "$nlvl" != "$(n8n_level)" ] || [ "$ngrp" != "$(env_get N8N_ALERT_GROUPS)" ] || [ "$nextra" != "$(env_get N8N_EXTRA_HOOKS)" ]; then
               n8n_do=connect
               [[ "$nurl" == http://n8n:5678/* ]] && ! tool_on n8n && { DET_ERR="N8N is not enabled: vexor n8n enable"; det_problem integrations raw put "the integrations were refused (nothing changed):"; }
             fi
@@ -6801,7 +6822,7 @@ PY
           # 2) n8n: same code as the n8n card / vexor n8n (an own manager recreate only if its block changes)
           case "$n8n_do" in
             connect)
-              if ( cmd_n8n connect "$nurl" --level "$nlvl" --groups "$ngrp" ); then det_rec integrations custom-n8n raw 1 "n8n connected by hand: $nurl"
+              if ( cmd_n8n connect "$nurl" --level "$nlvl" --groups "$ngrp" --extra "$nextra" ); then det_rec integrations custom-n8n raw 1 "n8n connected by hand: $nurl"
               else det_rec integrations custom-n8n raw 0 "n8n change failed"; bad "n8n was not changed$([ "$rest_changed" = 1 ] && echo " (the other integrations are saved)")"; return 1; fi ;;
             disconnect)
               if ( cmd_n8n disconnect ); then det_rec integrations custom-n8n raw 1 "n8n disconnected by hand"
