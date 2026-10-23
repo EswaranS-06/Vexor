@@ -562,6 +562,12 @@ if n != 1:
 open(path, "w").write(s2)
 PY
 }
+dashboard_yml_perms() {        # the dashboard (uid 1000) writes wazuh.yml itself (server address, settings): a root-owned copy fails with EACCES
+  [ -f "$DASH_WAZUH_YML" ] || return 0
+  chown 1000:1000 "$DASH_WAZUH_YML" 2>/dev/null
+  chmod 600 "$DASH_WAZUH_YML" 2>/dev/null       # holds the API password
+  return 0
+}
 set_api_pw_yml() {
   python3 -I - "$DASH_WAZUH_YML" "$1" <<'PY'
 import re, sys
@@ -573,6 +579,7 @@ else:
     s = re.sub(r'^(\s+password:\s*).*$', lambda m: m.group(1) + '"' + pw + '"', s, count=1, flags=re.M)
 open(path, "w").write(s)
 PY
+  dashboard_yml_perms
 }
 DEMO_USERS=(kibanaro logstash readall snapshotrestore)   # OpenSearch demo users with publicly known passwords
 demo_users_present() { local u; for u in "${DEMO_USERS[@]}"; do grep -q "^$u:" "$INTERNAL_USERS" 2>/dev/null && echo "$u"; done; return 0; }
@@ -4275,6 +4282,7 @@ apply_all() {                  # the one reconcile path: render everything, pull
   tools_prepare; elk_prepare
   pull_missing_images || warn "some images are missing - their services will not start"
   prune_disabled_containers
+  dashboard_yml_perms
   run_step "Starting the containers" dc up -d || die "docker compose up failed - see the output above, then: vexor doctor"
   soc_wazuh && wait_indexer 300 && post_start      # users/roles below need a running indexer
   tools_post
