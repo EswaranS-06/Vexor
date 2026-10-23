@@ -4591,15 +4591,23 @@ n8n_hook_url() {               # <path | url> -> URL the managers / Logstash use
 import sys
 from urllib.parse import urlsplit
 v, host, port = sys.argv[1].strip(), sys.argv[2], sys.argv[3]
+TEST_NOTE = "n8n test URL (webhook-test) replaced by the production URL: the test URL answers only one call after 'Execute workflow'"
 if "://" not in v:
     v = v.strip("/")
-    if not v.startswith(("webhook/", "webhook-test/")):
+    if v.startswith("webhook-test/"):
+        v = "webhook/" + v[len("webhook-test/"):]
+        print(TEST_NOTE, file=sys.stderr)
+    if not v.startswith("webhook/"):
         v = "webhook/" + v
     print("http://n8n:5678/" + v)
     sys.exit()
 u = urlsplit(v)
 ours = u.hostname == "n8n" or (u.hostname in (host, "localhost", "127.0.0.1") and str(u.port) == port)
-print("http://n8n:5678" + u.path + ("?" + u.query if u.query else "") if ours else v)
+path = u.path
+if ours and path.startswith("/webhook-test/"):
+    path = "/webhook/" + path[len("/webhook-test/"):]
+    print(TEST_NOTE, file=sys.stderr)
+print("http://n8n:5678" + path + ("?" + u.query if u.query else "") if ours else v)
 PY
 }
 n8n_write_script() {           # the integration script installed into every manager
@@ -4698,6 +4706,14 @@ def integ(u, lv, gr):
 
 
 extras = [e.split("|") for e in extra.split(";") if e.count("|") == 2]
+
+
+def prod(u):                           # this stack's n8n: the test URL works for one call after "Execute workflow" only
+    return "http://n8n:5678/webhook/" + u[len("http://n8n:5678/webhook-test/"):] if u.startswith("http://n8n:5678/webhook-test/") else u
+
+
+url = prod(url)
+extras = [(prod(u), lv, gr) for u, lv, gr in extras]
 block = ("  <!-- vexor:n8n:begin (managed by: vexor n8n) -->\n" + integ(url, level, groups)
          + "".join(integ(u, lv, gr) for u, lv, gr in extras)
          + "  <!-- vexor:n8n:end -->\n")
