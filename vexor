@@ -8188,7 +8188,11 @@ _vexor() {
       install) words="--fresh --force --yes" ;;
       uninstall) words="--keep-data --images --yes" ;;
       logs)    words="$svcs ossec api cluster alerts archives errors size -f -n --since" ;;
-      config)  words="show get set edit validate plan apply --show-secrets" ;;
+      config)
+        if [ "${COMP_WORDS[2]:-}" = set ] || [ "${COMP_WORDS[2]:-}" = get ]; then
+          local envx; envx="$(dirname "$(readlink -f "$(command -v "${COMP_WORDS[0]}")" 2>/dev/null)")/.env.example"
+          words="$(sed -n 's/^#\{0,1\} \{0,1\}\([A-Z][A-Z0-9_]*\)=.*/\1/p' "$envx" 2>/dev/null | sort -u)"
+        else words="show get set edit validate plan apply --show-secrets"; fi ;;
       plan)    words="--json" ;;
       migrate) words="--yes" ;;
       notify)  words="status test send fail warn ok info" ;;
@@ -8200,7 +8204,9 @@ _vexor() {
       cert)    words="status create export-ca serve-ca import letsencrypt renew use-default internal-regen --force --email --staging --dns" ;;
       proxy)   words="ls show add edit rm cert cert-file apply --json --tls local letsencrypt off --websocket --no-websocket --max-body --target --renew ca cert" ;;
       passwd)  words="admin kibanaserver api --generate" ;;
-      agents)  words="list summary outdated remove enroll-cmd password linux rpm windows macos on off show --name --group" ;;
+      agents)
+        if [ "${COMP_WORDS[2]:-}" = password ]; then words="on off show"
+        else words="list summary outdated remove enroll-cmd password linux rpm windows macos --name --group"; fi ;;
       wazuh)   words="status alerts logtest rules decoders lists integrations config detection agents cluster ls show put rm reset history restore templates add del edit test set custom --from --json --format --location --hook-url --api-key --api-key-file --level --group --rule-id --scope -n --grep" ;;
       console) words="status enable disable restart url password logs --generate" ;;
       n8n)     words="status enable disable connect disconnect test workflow credentials backup reset-owner logs --level --groups --srcip import file" ;;
@@ -8214,7 +8220,7 @@ _vexor() {
       reminders) words="list done" ;;
       ai-context) words="--print" ;;
       backup)  words="run list register restore-snapshot restore-es restore-manager restore-config --rename --indices --kibana" ;;
-      retention) words="status show apply" ;;
+      retention) words="status show apply purge --older-than --agent --rule-id --sca --query --index --dry-run --compact" ;;
       volumes) words="ls backup restore rm prune all --stop --out" ;;
       reset)   words="containers data full purge" ;;
       daemon)  words="install uninstall status logs" ;;
@@ -8229,6 +8235,13 @@ _vexor() {
 }
 complete -F _vexor vexor ./vexor
 EOF
+}
+suggest_command() {            # suggest_command <typed>: " - did you mean: a, b?" from the completion's command list
+  local m
+  m="$(completion_script | sed -n 's/^    words="\([^"]*\)".*/\1/p' | head -n 1 \
+       | python3 -I -c "import difflib, sys; print(', '.join(difflib.get_close_matches(sys.argv[1], sys.stdin.read().split(), 3, 0.6)))" "$1" 2>/dev/null)"
+  [ -n "$m" ] && printf ' - did you mean: %s?' "$m"
+  return 0
 }
 cmd_completion() {
   if [ "${1:-}" = install ]; then completion_script > /etc/bash_completion.d/vexor && ok "installed - open a new shell"
@@ -9155,7 +9168,7 @@ main() {
     maintenance|maint)     cmd_maintenance ;;
     completion)            cmd_completion "${args[@]}" ;;
     help)                  cmd_help ;;
-    *)                     die "unknown command '$cmd' - see: vexor help" ;;
+    *)                     die "unknown command '$cmd'$(suggest_command "$cmd") - see: vexor help" ;;
   esac
 }
 
