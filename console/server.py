@@ -6,6 +6,7 @@ dashboard certificate, and lets an authenticated admin see and change the stack.
 `vexor` itself (an allowlist of commands, run without a shell), so the console and the CLI behave identically.
 Standard library only.
 """
+import difflib
 import email.utils
 import gzip
 import hashlib
@@ -984,6 +985,791 @@ def settings():
     return rows
 
 
+# ---------------------------------------------------------------- command suggestions (Terminal page)
+# GET /api/complete?line=<text before the caret> answers on every keystroke, so nothing here waits for docker or vexor:
+# the grammar is one static table (what the CLI accepts, from its bash completion, help and usage messages), and the
+# dynamic values (services, detection files, integrations, agents, routes, volumes) come from caches that peek()
+# refreshes in the background - the very first keystroke may see none of them. A value type is an enumeration, a
+# dynamic source, a hint (a free-form slot nobody can list: a URL, a log line, a key) or a mix. Never a .env value.
+COMPLETE_MAX = 12
+COMPLETE_TTL = {"agents": 30, "volumes": 30}
+ENV_EXAMPLE = ROOT / ".env.example"
+SVC_ALIASES = {      # vexor resolve_svc: short name -> compose service (managers / indexers: every enabled one)
+    "master": ("wazuh.master", "Wazuh master manager"), "nginx": ("nginx", "nginx: dashboard, agents, routes"),
+    "dashboard": ("wazuh.dashboard", "Wazuh dashboard"), "indexer1": ("wazuh1.indexer", "Wazuh indexer 1"),
+    "worker": ("wazuh.worker", "Wazuh worker manager"), "worker2": ("wazuh2.worker", "Wazuh worker 2"),
+    "worker3": ("wazuh3.worker", "Wazuh worker 3"), "indexer2": ("wazuh2.indexer", "Wazuh indexer 2"),
+    "indexer3": ("wazuh3.indexer", "Wazuh indexer 3"), "managers": (None, "every enabled manager"),
+    "indexers": (None, "every enabled indexer"),
+}
+WAZUH_LOGS = [("errors", "error lines of every container (--since, default 1h)"), ("alerts", "alerts.json of a manager"),
+              ("ossec", "ossec.log of a manager (default master)"), ("api", "api.log of a manager"),
+              ("cluster", "cluster.log of a manager"), ("integrations", "integrations.log (Slack, n8n ...)"),
+              ("archives", "archives.json (needs logall_json)"), ("size", "disk used by container and manager logs")]
+INTEGRATIONS = [("slack", "Slack incoming webhook"), ("custom-n8n", "alerts to n8n (= vexor n8n connect)"),
+                ("pagerduty", "PagerDuty (API key)"), ("virustotal", "VirusTotal file lookups (API key)"),
+                ("shuffle", "Shuffle SOAR webhook"), ("maltiverse", "Maltiverse IoC enrichment (API key)")]
+HOOK_EXAMPLES = {"slack": "https://hooks.slack.com/services/T0000/B0000/XXXXXXXX", "custom-n8n": "vexor-alerts",
+                 "shuffle": "https://shuffle.example.org/api/v1/hooks/webhook_0000", "maltiverse": "https://api.maltiverse.com"}
+
+
+def dyn(key, ttl, fn, default):
+    """Cached value of key without waiting (default until the first background refresh is done). Never raises."""
+    try:
+        v = peek(key, ttl, fn)
+    except Exception:  # noqa: BLE001 - a suggestion source must never break typing
+        return default
+    return default if v is None else v
+
+
+def agents_list():
+    """[{id, name, status}] through the Wazuh API (seconds: only ever run by the cache in the background)."""
+    out = run_quick([str(VEXOR), "--no-color", "api", "GET", "/agents?limit=1000&select=id,name,status"], timeout=40)
+    try:
+        items = json.loads(out[out.index("{"):]).get("data", {}).get("affected_items", [])
+    except (ValueError, AttributeError):
+        return []
+    return [{"id": str(a.get("id", "")), "name": str(a.get("name", "")), "status": str(a.get("status", ""))} for a in items]
+
+
+def project_volumes():
+    p = env_dict().get("COMPOSE_PROJECT_NAME") or "vexor"
+    out = run_quick(["docker", "volume", "ls", "-q", "--filter", f"label=com.docker.compose.project={p}"], timeout=20)
+    return sorted(v.strip() for v in out.splitlines() if v.strip())
+
+
+_env_keys = {}      # (mtimes) -> [(key, help)]
+
+
+def env_keys():
+    """Setting names with their help: .env.example in order, then keys only .env has. Keys, never values."""
+    files = [f for f in (ENV_EXAMPLE, ENV_FILE) if f.exists()]
+    try:
+        stamp = tuple(f.stat().st_mtime_ns for f in files)
+    except OSError:
+        return []
+    if stamp in _env_keys:
+        return _env_keys[stamp]
+    rows, seen, pending = [], set(), []
+    try:
+        lines = ENV_EXAMPLE.read_text(errors="replace").splitlines() if ENV_EXAMPLE.exists() else []
+    except OSError:
+        lines = []
+    for raw in lines:
+        line = raw.strip()
+        m = re.match(r"^#? ?([A-Z][A-Z0-9_]*)=", line)
+        if m:
+            k = m.group(1)
+            if k not in seen:
+                seen.add(k)
+                cm = re.search(r"\s+#\s?(.*)$", line[m.end():])
+                rows.append((k, (cm.group(1) if cm else " ".join(pending)).strip()))
+            pending = []
+        elif line.startswith("#") and not re.match(r"^#\s*(----|====)", line):
+            pending.append(line.lstrip("# ").strip())
+        else:
+            pending = []
+    try:
+        rows += [(k, "") for k, _, _ in read_env() if k not in seen]   # read_env: only its keys are used
+    except OSError:
+        pass
+    _env_keys.clear()
+    _env_keys[stamp] = rows
+    return rows
+
+
+def env_default(key):
+    """Default of a NON-secret setting from .env.example (an example value for the hint), else ''."""
+    if SECRET_RE.search(key):
+        return ""
+    try:
+        for raw in ENV_EXAMPLE.read_text(errors="replace").splitlines():
+            m = re.match(rf"^#? ?{re.escape(key)}=([^#\s]*)", raw.strip())
+            if m and m.group(1) and m.group(1) != "CHANGE_ME":
+                return m.group(1).strip("\"'")
+    except OSError:
+        pass
+    return ""
+
+
+# -- dynamic sources: fn(ctx) -> [(text, desc)]; ctx = {"words", "path", "positional"}
+def src_services(ctx):
+    rows = dyn("containers", TTL["containers"], containers, [])
+    have = {r.get("service") for r in rows}
+    out = [(a, d) for a, (svc, d) in SVC_ALIASES.items() if not have or svc is None or svc in have]
+    for r in rows:
+        if r.get("service"):
+            out.append((r["service"], " ".join(x for x in (r.get("state"), f"({r['health']})" if r.get("health") else "") if x)))
+    return out
+
+
+def src_log_targets(ctx):
+    svcs = src_services(ctx)
+    return svcs[:3] + WAZUH_LOGS[:3] + svcs[3:] + WAZUH_LOGS[3:]
+
+
+def det_files(kind, want=None):
+    files = ((dyn("detection", TTL["detection"], detection, {}) or {}).get(kind) or {}).get("files") or []
+    order = {"custom": 0, "vexor": 1, "wazuh": 2}
+    label = {"custom": "custom", "vexor": "Vexor", "wazuh": "built-in"}
+    what = {"rules": "rules", "decoders": "decoders", "lists": "entries"}.get(kind, "")
+    out = []
+    for f in sorted(files, key=lambda f: (order.get(f.get("source"), 3), not f.get("modified"))):
+        if not f.get("name") or (want and not want(f)):
+            continue
+        src, n = f.get("source") or "", f.get("rules")
+        out.append((f["name"], label.get(src, src) + (f", {n} {what}" if n is not None else "")
+                    + (", edited" if f.get("modified") else "") + (f" - error: {f['error']}" if f.get("error") else "")))
+    return out
+
+
+def src_det_versions(ctx):
+    kind = ctx["path"][1] if len(ctx["path"]) > 1 else ""
+    name = ctx["positional"][0] if ctx["positional"] else ""
+    fname = det_name(kind, name) or (name if kind != "lists" and name.endswith(".xml") else name + ("" if kind == "lists" else ".xml"))
+    if not fname or ".." in fname:
+        return []
+    try:
+        vers = sorted((p.name for p in (DET_HIST / kind / fname).iterdir() if DET_VERSION.match(p.name)), reverse=True)
+    except OSError:
+        return []
+    return [(v, "saved version") for v in vers]
+
+
+def det_integrations_list():
+    return vexor_json(["wazuh", "integrations", "ls", "--json"], default={"integrations": [], "error": "vexor wazuh integrations ls failed"})
+
+
+def det_config_list():
+    return vexor_json(["wazuh", "config", "ls", "--json"], default={"settings": [], "error": "vexor wazuh config ls failed"})
+
+
+def src_integrations(ctx):
+    rows = (dyn("det-integrations", TTL["detection"], det_integrations_list, {}) or {}).get("integrations") or []
+    seen, out = set(), []
+    for r in rows:
+        if r.get("name") and r["name"] not in seen:
+            seen.add(r["name"])
+            out.append((r["name"], "configured" + ("" if r.get("managed") else " (n8n / by hand)")))
+    return out or INTEGRATIONS
+
+
+def wconf_settings():
+    return (dyn("det-config", TTL["detection"], det_config_list, {}) or {}).get("settings") or []
+
+
+def src_wconf_keys(ctx):
+    used = set(ctx["positional"][0::2])
+    return [(s["key"], s.get("help") or "") for s in wconf_settings() if s.get("key") and s["key"] not in used]
+
+
+def src_wconf_values(ctx):
+    key = ctx["positional"][-1] if ctx["positional"] else ""
+    s = next((s for s in wconf_settings() if s.get("key") == key), None)
+    return [(str(c), "") for c in (s or {}).get("choices") or []]
+
+
+def src_agents(ids):
+    def fn(ctx):
+        rows = dyn("complete-agents", COMPLETE_TTL["agents"], agents_list, [])
+        if ids:
+            return [(a["id"], f"{a['name']} ({a['status']})") for a in rows if a["id"] != "000"]
+        return [(a["name"], f"agent {a['id']} ({a['status']})") for a in rows]
+    return fn
+
+
+def src_proxy_hosts(ctx):
+    rows = (dyn("proxy", TTL["proxy"], proxy_routes, {}) or {}).get("routes") or []
+    return [(r["host"], f"-> {r.get('target', '')} ({r.get('tls', '')})") for r in rows if r.get("host")]
+
+
+def src_proxy_targets(ctx):
+    sugg = (dyn("proxy", TTL["proxy"], proxy_routes, {}) or {}).get("suggestions") or []
+    base = ["wazuh.dashboard:5601", "n8n:5678", "grafana:3000", "kibana:5601", "portainer:9000"]
+    return [(t, "Vexor service") for t in dict.fromkeys(list(sugg) + base)]
+
+
+def src_volumes(ctx):
+    return [(v, "volume") for v in dyn("complete-volumes", COMPLETE_TTL["volumes"], project_volumes, [])]
+
+
+def src_zeek_logs(ctx):
+    try:
+        names = sorted(p.stem for p in (ROOT / "tools-data" / "zeek" / "logs").iterdir() if re.fullmatch(r"[a-z_]+\.log", p.name))
+    except OSError:
+        names = []
+    return [(n, "Zeek log") for n in names or ["conn", "dns", "http", "ssl", "ssh", "notice", "weird"]]
+
+
+def src_env_keys(ctx):
+    return [(k, (h + " (secret)" if SECRET_RE.search(k) else h)) for k, h in env_keys()]
+
+
+def integ_name(ctx):
+    return ctx["positional"][0] if ctx["positional"] else ""
+
+
+def hook_example(ctx):
+    return HOOK_EXAMPLES.get(integ_name(ctx), "https://example.org/hooks/vexor")
+
+
+def env_value_hint(ctx):
+    key = ctx["positional"][0] if ctx["positional"] else ""
+    if SECRET_RE.search(key):
+        return {"desc": f"secret {key}: the typed value shows in the job list and audit log - passwords: vexor passwd"}
+    return {"desc": f"new value of {key} (written to .env; then: vexor config apply)", "example": env_default(key)}
+
+
+def wconf_value_hint(ctx):
+    key = ctx["positional"][-1] if ctx["positional"] else ""
+    s = next((s for s in wconf_settings() if s.get("key") == key), {})
+    ex = {"int": "10", "bool": "yes"}.get(s.get("type"), "")
+    return {"desc": (s.get("help") or f"value of {key}") + " - lists: comma-separated", "example": ex}
+
+
+def hint(ph, desc, example="", **kw):
+    return dict(hint=ph, desc=desc, example=example, **kw)
+
+
+def enum(*pairs, **kw):
+    """Enumerated values [(text, desc)]; hint=... adds the free-form slot after them."""
+    return dict(values=[p if isinstance(p, tuple) else (p, "") for p in pairs], **kw)
+
+
+# value types: values (fixed), source (dynamic), hint (+ desc/example, either may be a fn(ctx) -> dict)
+VALUES = {
+    "service": dict(source=src_services, hint="<service>", desc="a compose service or a short name (master, nginx ...)", example="wazuh.master"),
+    "logs-target": dict(source=src_log_targets),
+    "wait-service": dict(source=lambda c: src_services(c) + [(s, "") for s in ("elasticsearch", "kibana", "logstash", "n8n", "grafana", "portainer")]),
+    "lines": enum(("20", ""), ("50", ""), ("200", "default"), ("1000", ""), hint="<N>", desc="number of lines", example="100"),
+    "duration": enum(("15m", "last 15 minutes"), ("1h", "last hour"), ("6h", "last 6 hours"), ("24h", "last day"),
+                     hint="<duration>", desc="10m, 1h, 24h ... or a timestamp like 2026-10-23T08:00", example="1h"),
+    "level": enum(("3", ""), ("7", "default for n8n"), ("10", ""), ("12", "high"), hint="<level>", desc="Wazuh rule level 0-15", example="10"),
+    "grep": hint("<text>", "only alerts containing this text (case-insensitive)", "sshd"),
+    "logline": hint('"<log-line>"', "one log line, quoted (no line: interactive - SSH only)",
+                    '"Oct 23 10:00:01 srv sshd[812]: Failed password for root from 203.0.113.9 port 22 ssh2"'),
+    "log-format": enum(*[(f, "") for f in ("syslog", "json", "eventchannel", "eventlog", "audit", "squid", "snort-full", "iis",
+                                           "mysql_log", "postgresql_log", "nmapg", "command", "full_command", "djb-multilog", "multi-line")]),
+    "location": hint("<location>", "location the line claims to come from", "/var/log/auth.log"),
+    "from": enum(("-", "read the content from stdin"), hint="<path>", desc="file on the Vexor host to load", example="/tmp/local_rules.xml"),
+    "det-rules": dict(source=lambda c: det_files("rules")), "det-decoders": dict(source=lambda c: det_files("decoders")),
+    "det-lists": dict(source=lambda c: det_files("lists")),
+    "det-put-rules": dict(source=lambda c: det_files("rules", lambda f: f.get("editable")), hint="<new-name>",
+                          desc="a new custom file: 1-64 letters, digits, _ or -", example="local-ssh"),
+    "det-put-decoders": dict(source=lambda c: det_files("decoders", lambda f: f.get("editable")), hint="<new-name>",
+                             desc="a new custom file: 1-64 letters, digits, _ or -", example="local-firewall"),
+    "det-put-lists": dict(source=lambda c: det_files("lists", lambda f: f.get("editable")), hint="<new-name>",
+                          desc="a new CDB list: 1-64 letters, digits, _ or -", example="blocked-ips"),
+    "det-custom-rules": dict(source=lambda c: det_files("rules", lambda f: f.get("source") == "custom")),
+    "det-custom-decoders": dict(source=lambda c: det_files("decoders", lambda f: f.get("source") == "custom")),
+    "det-custom-lists": dict(source=lambda c: det_files("lists", lambda f: f.get("source") == "custom")),
+    "det-builtin-rules": dict(source=lambda c: det_files("rules", lambda f: f.get("source") == "wazuh")),
+    "det-builtin-decoders": dict(source=lambda c: det_files("decoders", lambda f: f.get("source") == "wazuh")),
+    "det-builtin-lists": dict(source=lambda c: det_files("lists", lambda f: f.get("source") == "wazuh")),
+    "det-version": dict(source=src_det_versions, hint="<version>", desc="a saved version (vexor wazuh <kind> history <name>)", example="20261023T101500Z"),
+    "list-entry": hint("<key>[:<value>]", "CDB entry to add (IP, hash, user ...) with an optional value", "203.0.113.9:blocked"),
+    "list-key": hint("<key>", "CDB key to delete", "203.0.113.9"),
+    "integ-new": enum(*INTEGRATIONS, hint="custom-<id>", desc="your own integration script (custom-<id>)", example="custom-teams"),
+    "integ-name": dict(source=src_integrations),
+    "hook-url": hint("<hook-url>", "webhook URL (custom-n8n: path on the bundled n8n or a full URL)", hook_example),
+    "api-key": hint("<api-key>", "the key itself - never stored in history or the audit log (shown as ****)"),
+    "key-file": hint("<file>", "file holding the API key (keeps it out of the command line)", "/root/vt.key"),
+    "group": hint("<group>", "only alerts of these rule groups (comma-separated)", "authentication_failed,sshd"),
+    "rule-ids": hint("<rule-ids>", "only these rule ids (comma-separated)", "5710,5712"),
+    "integ-format": enum(("json", "alert format the script receives")),
+    "wconf-key": dict(source=src_wconf_keys, hint="<key>", desc="a curated ossec.conf setting (vexor wazuh config ls)", example="log_alert_level"),
+    "wconf-value": dict(source=src_wconf_values, hint="<value>", dynhint=wconf_value_hint),
+    "scope": enum(("master", "only the master (default)"), ("all", "every manager")),
+    "os": enum(("linux", "deb-based"), ("rpm", "rpm-based"), ("windows", "PowerShell"), ("macos", "pkg")),
+    "agent-name": dict(source=src_agents(False), hint="<agent-name>", desc="agent name", example="srv-linux"),
+    "agent-ids": dict(source=src_agents(True), hint="<id[,id..]>", desc="agent ids (vexor agents list)", example="003,004"),
+    "name": hint("<name>", "agent name to register", "web-01"),
+    "password": hint("[password]", "enrollment password (empty: one is generated); kept in .env"),
+    "n8n-path": hint("<path|url>", "webhook path on the bundled n8n (default vexor-alerts) or a full URL", "vexor-alerts"),
+    "extra-hooks": hint("<url|level|groups;..>", "more webhooks, ;-separated", "http://n8n:5678/webhook/vexor-crit|12|"),
+    "ip": hint("<ip>", "source IP of the fake alert", "203.0.113.9"),
+    "dir": hint("<dir>", "directory on the Vexor host", "/srv/backups"),
+    "file": hint("<file>", "file on the Vexor host", "/srv/backups/volumes/20261023-013000/vexor_n8n-data.tar.gz"),
+    "snapshot": hint("<snapshot-id>", "indexer snapshot (vexor backup list)", "vexor-20261023-013000"),
+    "es-snapshot": hint("<es-snap-id>", "Elasticsearch snapshot (vexor backup list)", "vexor-es-20261023-013000"),
+    "stamp": hint("<stamp>", "manager state backup (vexor backup list)", "20261015-013000"),
+    "config-archive": hint("<file>", "config backup archive", "backups/stack-config-20261015-013000.tar.gz"),
+    "index-pattern": hint("<pattern>", "index pattern", "wazuh-alerts-4.x-2026.10.*"),
+    "days": enum(("30", ""), ("90", ""), hint="<days>", desc="whole number of days", example="60"),
+    "rule-id": hint("<rule-id>", "one rule id", "5710"),
+    "lucene": hint("<query>", "Lucene query", "agent.name:srv-linux AND rule.level:>10"),
+    "query": hint("<query>", "Lucene query (empty: newest events)", "event.dataset:zeek.dns"),
+    "env-key": dict(source=src_env_keys, hint="<KEY>", desc="a .env setting", example="RETENTION_DAYS"),
+    "env-value": dict(hint="<value>", dynhint=env_value_hint),
+    "kv": hint("KEY=VALUE", "a setting to try (nothing is changed)", "WORKER_COUNT=2"),
+    "login-name": enum(*[(n, "") for n in ("dashboard", "indexer", "api", "enroll", "n8n", "grafana", "portainer", "console",
+                                           "kibana", "elasticsearch", "logstash", "wazuh", "elk")]),
+    "proxy-host": dict(source=src_proxy_hosts),
+    "proxy-host-ca": dict(source=lambda c: src_proxy_hosts(c) + [("ca", "the local CA")]),
+    "new-host": hint("<host>", "domain, subdomain or IPv4 address", "soc.example.com"),
+    "proxy-target": dict(source=src_proxy_targets, hint="<target>", desc="Vexor service:port or [http(s)://]IP:PORT", example="192.168.1.20:8443"),
+    "cert-what": enum(("cert", "the route certificate"), ("ca", "the local CA")),
+    "tls": enum(("local", "local CA (default)"), ("letsencrypt", "Let's Encrypt, http-01 on port 80"), ("off", "plain HTTP")),
+    "size": hint("<size>", "largest request body", "100m"),
+    "cert-name": hint("[name|ip ..]", "names / IPs the certificate covers (default: this host)", "soc.example.com"),
+    "port": hint("[port]", "temporary download port (default 8081)", "8081"),
+    "crt": hint("<cert.pem>", "certificate file", "/root/soc.crt"), "key": hint("<key.pem>", "private key file", "/root/soc.key"),
+    "chain": hint("[chain.pem]", "intermediate chain file", "/root/chain.pem"),
+    "domain": hint("<domain>", "public DNS name pointing to this host", "soc.example.com"),
+    "email": hint("<email>", "Let's Encrypt account address", "admin@example.com"),
+    "tool": enum(("n8n", "automation / SOAR"), ("grafana", "dashboards"), ("portainer", "Docker UI"), ("suricata", "network IDS"), ("zeek", "network logs")),
+    "zeek-log": dict(source=src_zeek_logs), "zeek-top": enum(("hosts", "top talkers"), ("ports", "top ports"), ("dns", "top DNS names")),
+    "es-method": enum("GET", "POST", "PUT", "DELETE"),
+    "es-path": enum(("/_cat/indices?v", ""), ("/_cluster/health?pretty", ""), ("/_cat/nodes?v", ""), hint="<path>", desc="Elasticsearch API path", example="/_cat/shards?v"),
+    "json-body": hint("['json']", "request body", '\'{"size": 1}\''),
+    "get": enum(("GET", "only GET in the console")),
+    "ix-path": enum(("/_cat/indices?v", "indices"), ("/_cluster/health?pretty", "cluster health"), ("/_cat/nodes?v", "nodes"),
+                    ("/_cat/shards?v", "shards"), hint="<path>", desc="indexer API path", example="/_cat/aliases?v"),
+    "api-path": enum(("/agents/summary/status", "agent counts"), ("/manager/info", "manager version"), ("/cluster/healthcheck", "cluster"),
+                     ("/manager/status", "daemons"), hint="<path>", desc="Wazuh API path", example="/agents?status=disconnected"),
+    "update-version": enum(("latest", "newest 4.x release"), hint="<version>", desc="a Wazuh 4.x version", example="4.14.8"),
+    "notify-level": enum("fail", "warn", "ok", "info"), "message": hint('"<message>"', "text of the alert", '"disk 90% full"'),
+    "reminder-id": hint("<id>", "reminder id (vexor reminders)", "indexer-cleanup"),
+    "number": hint("[N]", "number of lines", "100"), "seconds": hint("<seconds>", "how long to wait", "300"),
+    "scale-n": enum(("1", "one worker"), ("2", "two workers"), ("3", "three workers")), "indexer-count": enum("1", "3"),
+    "volume": dict(source=src_volumes, hint="<volume>", desc="volume name (the project prefix is optional)", example="n8n-data"),
+    "volume-all": dict(source=lambda c: [("all", "every volume of the project")] + src_volumes(c)),
+}
+
+
+def N(desc, subs=None, args=(), flags=None, repeat=0, aliases=None, usage=None, hidden=False):
+    """One grammar node: subcommands, positional slots (value types), flags {flag: (value type | None, desc[, when(ctx)])}."""
+    return {"desc": desc, "subs": subs or {}, "args": list(args), "flags": flags or {}, "repeat": repeat,
+            "aliases": aliases or {}, "usage": usage, "hidden": hidden}
+
+
+JSON_FLAG = {"--json": (None, "machine-readable output")}
+LOG_FLAGS = {"-f": (None, "follow (streams until you stop it)"), "-n": ("lines", "number of lines (default 200)"),
+             "--since": ("duration", "only lines newer than this")}
+FROM_FLAG = {"--from": ("from", "load the content from this file (- = stdin)")}
+no_n8n = lambda c: integ_name(c) != "custom-n8n"
+INTEG_FLAGS = {
+    "--hook-url": ("hook-url", "webhook URL (custom-n8n: path or URL)", lambda c: integ_name(c) not in ("pagerduty", "virustotal")),
+    "--level": ("level", "only alerts of this level or higher"),
+    "--group": ("group", "only these rule groups"),
+    "--rule-id": ("rule-ids", "only these rule ids", no_n8n),
+    "--api-key": ("api-key", "API key / token (never stored in history or audit)", no_n8n),
+    "--api-key-file": ("key-file", "read the API key from a file", no_n8n),
+    "--format": ("integ-format", "alert format", no_n8n),
+}
+
+
+def det_node(kind):
+    subs = {
+        "ls": N(f"custom and built-in {kind}", flags=JSON_FLAG),
+        "show": N(f"print one {kind[:-1]} file", args=[f"det-{kind}"]),
+        "put": N("save a file (checked by Wazuh, rolled back when refused)", args=[f"det-put-{kind}"], flags=FROM_FLAG),
+        "history": N("saved versions of a file", args=[f"det-{kind}"], flags=JSON_FLAG),
+        "restore": N("bring back a saved version", args=[f"det-{kind}", "det-version"]),
+        "templates": N("starter templates", flags=JSON_FLAG),
+        "reset": N("back to the shipped built-in file (history kept)", args=[f"det-builtin-{kind}"]),
+        "rm": N("delete a custom file", args=[f"det-custom-{kind}"]),
+    }
+    if kind == "lists":
+        subs["add"] = N("add an entry to a CDB list", args=["det-lists", "list-entry"])
+        subs["del"] = N("delete an entry from a CDB list", args=["det-lists", "list-key"])
+    return N(f"Wazuh {kind}: custom files and edited built-ins", subs=subs,
+             aliases={"list": "ls", "cat": "show", "save": "put", "remove": "rm", "delete": "rm"})
+
+
+AGENTS_NODE = N("Wazuh agents: list, enroll commands, remove", subs={
+    "list": N("every agent with status, version, OS"),
+    "summary": N("agent counts by status"),
+    "outdated": N("agents older than the manager"),
+    "enroll-cmd": N("copy-paste install commands", args=["os"], flags={"--name": ("name", "agent name"), "--group": ("group", "agent group")}),
+    "remove": N("remove agents (they must re-enroll)", args=["agent-ids"]),
+    "password": N("enrollment password", subs={"on": N("require a password", args=["password"]), "off": N("no password"),
+                                               "show": N("print the password")}),
+}, aliases={"ls": "list", "rm": "remove", "delete": "remove"})
+
+# Order = suggestion order on an empty line: the commands people use most first.
+GRAMMAR = {
+    "status": N("containers, manager/indexer cluster, agents, dashboard, disk"),
+    "doctor": N("~60 checks with hints; --fix repairs what is safe", flags={"--fix": (None, "repair what is safe")}),
+    "logs": N("container logs, Wazuh log files, recent errors", args=["logs-target"], repeat=1, flags=LOG_FLAGS,
+              usage="vexor logs [svc..|ossec|api|cluster|alerts [node]|errors|size] [-f] [-n N] [--since 10m]"),
+    "wazuh": N("Wazuh: alerts, logtest, rules, decoders, lists, integrations, ossec.conf", subs={
+        "status": N("indexer / manager cluster / API details"),
+        "alerts": N("newest alerts of every manager", flags={"-n": ("lines", "number of alerts (default 20)"),
+                                                            "--level": ("level", "only this level or higher"),
+                                                            "--grep": ("grep", "only alerts containing this text")}),
+        "rules": det_node("rules"), "decoders": det_node("decoders"), "lists": det_node("lists"),
+        "integrations": N("Slack, PagerDuty, VirusTotal, Shuffle, Maltiverse, n8n, custom scripts", subs={
+            "ls": N("configured integrations", flags=JSON_FLAG),
+            "add": N("add an integration", args=["integ-new"], flags=INTEG_FLAGS,
+                     usage="vexor wazuh integrations add <name> [--hook-url URL] [--api-key K] [--level N] [--group G] [--rule-id IDS] [--format json]"),
+            "edit": N("change an integration", args=["integ-name"], flags=INTEG_FLAGS,
+                      usage="vexor wazuh integrations edit <name> [--hook-url URL] [--api-key K] [--level N] [--group G] [--rule-id IDS] [--format json]"),
+            "test": N("send a test alert through it", args=["integ-name"]),
+            "rm": N("remove an integration", args=["integ-name"]),
+            "raw": N("the managed integrations as XML", subs={"show": N("print the XML"), "put": N("replace the XML", flags=FROM_FLAG)}),
+        }, aliases={"list": "ls", "remove": "rm", "delete": "rm", "del": "rm"},
+            usage="vexor wazuh integrations ls | add|edit <name> [--hook-url URL] [--api-key K] [--level N] [--group G] [--rule-id IDS] | rm|test <name> | raw show|put"),
+        "logtest": N("run one log line through the master's decoders and rules", args=["logline"],
+                     flags={"--format": ("log-format", "log format (default syslog)"), "--location": ("location", "claimed source"), **JSON_FLAG}),
+        "config": N("curated ossec.conf settings and a raw XML block", subs={
+            "ls": N("settings with their values", flags=JSON_FLAG),
+            "set": N("change settings (checked by Wazuh, managers recreated)", args=["wconf-key", "wconf-value"], repeat=2,
+                     usage="vexor wazuh config set <key> <value> [<key> <value> ..]"),
+            "custom": N("your own XML block in ossec.conf", subs={
+                "show": N("print the block"), "put": N("replace the block", flags={**FROM_FLAG, "--scope": ("scope", "master or all managers")}),
+                "rm": N("remove the block")}),
+        }, aliases={"list": "ls"}),
+        "detection": N("custom file counts, last change, last error", subs={"status": N("detection status", flags={**JSON_FLAG, "--all": (None, "with every file")})}),
+        "agents": AGENTS_NODE,
+        "cluster": N("manager cluster nodes"),
+    }, aliases={"integration": "integrations"}),
+    "agents": AGENTS_NODE,
+    "n8n": N("automation / SOAR: alert forwarding, workflow, credentials", subs={
+        "status": N("n8n, owner, alert forwarding, webhook, credentials"),
+        "connect": N("send alerts to an n8n webhook", args=["n8n-path"], flags={"--level": ("level", "lowest alert level (default 7)"),
+                                                                               "--groups": ("group", "only these rule groups"),
+                                                                               "--extra": ("extra-hooks", "more webhooks")},
+                     usage="vexor n8n connect [path|url] [--level N] [--groups G]"),
+        "workflow": N("import + publish the starter workflow", subs={"import": N("import and publish"), "file": N("write the workflow JSON")}),
+        "test": N("send a fake alert through the workflow", flags={"--level": ("level", "level of the fake alert (default 12)"), "--srcip": ("ip", "source IP")}),
+        "credentials": N("Wazuh API + Elasticsearch users for n8n"),
+        "disconnect": N("stop sending alerts to n8n"),
+        "enable": N("start n8n (N8N=true)"), "disable": N("remove n8n (data kept)"),
+        "backup": N("export workflows and credentials", args=["dir"]),
+        "reset-owner": N("remove every n8n user account"),
+        "logs": N("n8n container log", flags=LOG_FLAGS),
+    }),
+    "backup": N("snapshots, manager state and config; restores", subs={
+        "run": N("back up now"), "list": N("backups and snapshots"), "register": N("register the snapshot repository"),
+        "restore-snapshot": N("restore indexer indices", args=["snapshot"], flags={"--indices": ("index-pattern", "only these indices"),
+                                                                                 "--rename": (None, "restore as restored-*")}),
+        "restore-es": N("restore Elasticsearch indices", args=["es-snapshot"], flags={"--indices": ("index-pattern", "only these indices"),
+                                                                                  "--rename": (None, "restore as restored-*"), "--kibana": (None, "also Kibana")}),
+        "restore-manager": N("restore manager state", args=["stamp"]),
+        "restore-config": N("restore the stack config", args=["config-archive"]),
+    }, aliases={"ls": "list"}),
+    "health": N("detailed indexer / manager / API state"),
+    "restart": N("restart everything or the given services", args=["service"], repeat=1),
+    "start": N("start the stack (or services) and wait until ready", args=["service"], repeat=1),
+    "stop": N("stop containers", args=["service"], repeat=1),
+    "info": N("dashboard URL, login, agent ports, certificate mode", flags={"--show-secrets": (None, "print the passwords too")}),
+    "login": N("url, user and password of every managed login", args=["login-name"], repeat=1, flags=JSON_FLAG),
+    "config": N(".env settings: show, get, set, validate, apply", subs={
+        "show": N("every setting (secrets masked)", flags={"--show-secrets": (None, "print the secrets too")}),
+        "get": N("one setting", args=["env-key"]), "set": N("change one setting in .env", args=["env-key", "env-value"]),
+        "validate": N("check .env"), "plan": N("what an apply would change"), "apply": N("apply .env to the stack"),
+        "edit": N("open .env in an editor (terminal only)"),
+    }),
+    "plan": N("what an apply would change, without changing anything", args=["kv"], repeat=1, flags=JSON_FLAG),
+    "proxy": N("named hosts through nginx (TLS, websockets)", subs={
+        "ls": N("routes, target, TLS, certificate expiry", flags=JSON_FLAG), "show": N("one route", args=["proxy-host"]),
+        "add": N("add a route", args=["new-host", "proxy-target"], flags={"--tls": ("tls", "certificate mode"), "--websocket": (None, "pass websockets"),
+                                                                       "--max-body": ("size", "largest request body")}),
+        "edit": N("change a route", args=["proxy-host"], flags={"--target": ("proxy-target", "new target"), "--tls": ("tls", "certificate mode"),
+                                                               "--websocket": (None, "pass websockets"), "--no-websocket": (None, "no websockets"),
+                                                               "--max-body": ("size", "largest request body")}),
+        "rm": N("remove a route and its certificate", args=["proxy-host"]),
+        "cert": N("issue / re-issue the route certificate", args=["proxy-host"], flags={"--renew": (None, "renew now")}),
+        "cert-file": N("path of a route certificate or the local CA", args=["proxy-host-ca", "cert-what"]),
+        "apply": N("re-render, nginx -t, reload"),
+    }, aliases={"list": "ls", "remove": "rm", "del": "rm", "delete": "rm"}),
+    "cert": N("dashboard certificate: local CA, import, Let's Encrypt", subs={
+        "status": N("names, issuer, expiry"), "create": N("local CA + certificate for this host", args=["cert-name"], repeat=1),
+        "export-ca": N("CA file + install steps", args=["dir"]), "serve-ca": N("temporary http download of the CA", args=["port"]),
+        "import": N("use your own certificate", args=["crt", "key", "chain"]),
+        "letsencrypt": N("public certificate", args=["domain"], flags={"--email": ("email", "account address"),
+                                                                    "--staging": (None, "test CA"), "--dns": (None, "DNS challenge")}),
+        "renew": N("renew when < 30 days left", flags={"--force": (None, "renew now")}),
+        "use-default": N("back to the built-in self-signed certificate"),
+        "internal-regen": N("re-issue internal node certificates (restarts the stack)"),
+    }),
+    "tools": N("optional tools: n8n, Grafana, Portainer, Suricata, Zeek", subs={
+        "status": N("enabled, state, URL of every tool"), "apply": N("start enabled / remove disabled tools"),
+        "enable": N("turn a tool on", args=["tool"]), "disable": N("turn a tool off", args=["tool"]),
+        "update-rules": N("update Suricata rules"),
+    }),
+    "suricata": N("network IDS", subs={
+        "status": N("signatures, alerts in 24 h, top signatures"),
+        "alerts": N("newest alerts", flags={"-n": ("lines", "number of alerts"), "--since": ("duration", "only newer than")}),
+        "test": N("real test traffic -> Suricata -> Wazuh"), "update-rules": N("download new rules"),
+        "enable": N("SURICATA=true"), "disable": N("SURICATA=false"), "logs": N("Suricata container log", flags=LOG_FLAGS),
+    }),
+    "zeek": N("network logs", subs={
+        "status": N("log files, size, freshness"), "show": N("readable lines of one log", args=["zeek-log"], flags={"-n": ("lines", "number of lines")}),
+        "notices": N("notice.log", flags={"-n": ("lines", "number of lines")}), "top": N("top talkers, ports, DNS names", args=["zeek-top"]),
+        "test": N("generate test traffic"), "enable": N("ZEEK=true"), "disable": N("ZEEK=false"), "logs": N("Zeek container log", flags=LOG_FLAGS),
+    }),
+    "elk": N("Elasticsearch, Logstash, Kibana (SOC=elk|both)", subs={
+        "status": N("health, Kibana, events in the last hour"), "indices": N("vexor-* indices"),
+        "search": N("Lucene search, newest first", args=["query"], flags={"-n": ("lines", "number of hits"), "--index": ("index-pattern", "index pattern")}),
+        "data-views": N("re-create Kibana data views"), "retention": N("re-apply ILM retention"),
+        "beats-config": N("filebeat.yml for other machines"), "beats-ca": N("the CA Beats trust"),
+        "es": N("raw Elasticsearch API", args=["es-method", "es-path", "json-body"]),
+        "explain": N("shard allocation explain"), "reset-password": N("new elastic password (+ .env)"),
+        "logs": N("ELK container logs", args=["service"]),
+    }),
+    "soc": N("which SOC stacks run; switch them", subs={
+        "status": N("which stacks run"), "wazuh": N("Wazuh only"), "elk": N("ELK only"), "both": N("Wazuh + ELK")}),
+    "retention": N("delete Wazuh and ELK data older than RETENTION_DAYS", subs={
+        "status": N("policies and index sizes"), "apply": N("apply the retention policies"),
+        "purge": N("delete documents matching a filter", flags={
+            "--older-than": ("days", "older than N days"), "--agent": ("agent-name", "of this agent"), "--rule-id": ("rule-id", "of this rule"),
+            "--sca": (None, "SCA results"), "--query": ("lucene", "matching a Lucene query"), "--index": ("index-pattern", "only these indices"),
+            "--dry-run": (None, "count only"), "--compact": (None, "free the disk space afterwards")}),
+    }, aliases={"show": "status"}),
+    "volumes": N("Docker volumes: list, back up, restore, remove", subs={
+        "ls": N("volumes, size, users"), "orphans": N("volumes no service uses"),
+        "backup": N("tar.gz of a volume", args=["volume-all"], flags={"--stop": (None, "stop its users first"), "--out": ("dir", "target directory")}),
+        "restore": N("restore a volume from a tar.gz", args=["volume", "file"]), "rm": N("remove a volume", args=["volume"]),
+        "prune": N("remove orphan volumes", flags={"--yes": (None, "confirmed")}),
+    }, aliases={"list": "ls"}),
+    "disk": N("free/used space of every filesystem Docker uses", flags=JSON_FLAG),
+    "console": N("this web console", subs={
+        "status": N("is it up"), "url": N("where"), "restart": N("restart it"), "logs": N("its journal", args=["number"]),
+        "password": N("show / rotate the login", flags={"--generate": (None, "new random password")}),
+        "enable": N("start the service"), "disable": N("stop the service"),
+    }),
+    "cluster": N("manager cluster nodes"),
+    "version": N("vexor and Wazuh version"),
+    "update": N("Wazuh version upgrades", subs={
+        "check": N("current vs latest 4.x"), "apply": N("upgrade", args=["update-version"], flags={"--no-backup": (None, "skip the backup"), "--force": (None, "even with warnings")}),
+        "rollback": N("back to the version before"), "images": N("re-pull current images"),
+    }),
+    "notify": N("health alerts to NOTIFY_URL or n8n", subs={
+        "status": N("target and last alerts"), "test": N("send a test alert"), "send": N("send an alert", args=["notify-level", "message"])}),
+    "reminders": N("follow-up tasks", subs={"list": N("open reminders"), "done": N("close a reminder", args=["reminder-id"])}),
+    "indexer": N("raw indexer API (GET only here)", args=["get", "ix-path"], usage="vexor indexer GET <path>   e.g. vexor indexer GET '/_cat/indices?v'"),
+    "api": N("raw Wazuh API (GET only here)", args=["get", "api-path"], usage="vexor api GET <path>   e.g. vexor api GET /agents/summary/status"),
+    "wait-ready": N("wait until services are running and healthy", args=["wait-service"], repeat=1,
+                    flags={"--timeout": ("seconds", "give up after"), **JSON_FLAG}),
+    "wait": N("= wait-ready", args=["wait-service"], repeat=1, flags={"--timeout": ("seconds", "give up after"), **JSON_FLAG}, hidden=True),
+    "support-bundle": N("diagnostics archive (secrets masked)"),
+    "ai-context": N("one Markdown file for an AI diagnosis (masked)", flags={"--print": (None, "print instead of writing a file")}),
+    "maintenance": N("prune logs, retention, certificate renewal, image cleanup"),
+    "watchdog": N("one self-heal pass"),
+    "prune-logs": N("delete rotated manager logs older than MANAGER_LOG_RETENTION_DAYS"),
+    "daemon": N("boot service, timers, completion", subs={
+        "status": N("units and timers"), "install": N("install units and timers"), "uninstall": N("remove them"), "logs": N("journal", args=["number"])}),
+    "scale": N("number of worker managers (multi)", args=["scale-n"]),
+    "node-type": N("single or multi node layout", subs={
+        "status": N("applied layout"), "single": N("-> 1 manager, 1 indexer", flags={"--dry-run": (None, "show the plan"), "--no-backup": (None, "skip the backup")}),
+        "multi": N("-> master + workers, 3 indexers", flags={"--indexers": ("indexer-count", "1 or 3 indexers"), "--dry-run": (None, "show the plan"),
+                                                             "--no-backup": (None, "skip the backup")})}),
+    "indexers": N("indexer cluster size", subs={
+        "status": N("nodes, shards, leftovers"), "1": N("3 -> 1 indexer", flags={"--dry-run": (None, "show the plan"), "--no-backup": (None, "skip the backup")}),
+        "3": N("1 -> 3 indexers", flags={"--dry-run": (None, "show the plan"), "--no-backup": (None, "skip the backup")}),
+        "abort": N("undo an unfinished shrink"), "cleanup": N("delete the old wazuh2/3 volumes")}),
+    "passwd": N("change a password on the running stack (+ .env)", subs={
+        u: N(f"the {u} password", flags={"--generate": (None, "random password")}) for u in ("admin", "kibanaserver", "api")}),
+    "images": N("old image versions", subs={"prune": N("remove old image versions", flags={"--yes": (None, "confirmed")})}),
+    "reset": N("remove containers / data", subs={"containers": N("remove containers"), "data": N("remove data volumes"),
+                                                 "full": N("everything but .env"), "purge": N("everything (terminal only)")}),
+    "migrate": N("rename the old 'wazuh' Docker project to vexor", flags={"--yes": (None, "no prompt")}),
+    "uninstall": N("remove this project (plan + confirm first)", flags={"--keep-data": (None, "keep volumes and files"),
+                                                                        "--images": (None, "also images"), "--yes": (None, "confirmed")}),
+}
+GRAMMAR_ROOT = N("vexor", subs=GRAMMAR, usage="vexor <command> [args]")
+
+
+def split_line(line):
+    """Shell-like words [(start, value)] of line; tolerates an unterminated quote. The last word is the one being typed
+    (an empty one when the line ends with blank space)."""
+    words, i, n = [], 0, len(line)
+    while True:
+        while i < n and line[i].isspace():
+            i += 1
+        if i >= n:
+            words.append((n, ""))
+            return words
+        start, buf, quote = i, [], None
+        while i < n:
+            ch = line[i]
+            if quote:
+                if ch == quote:
+                    quote = None
+                elif ch == "\\" and quote == '"' and i + 1 < n:
+                    i += 1
+                    buf.append(line[i])
+                else:
+                    buf.append(ch)
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "\\" and i + 1 < n:
+                i += 1
+                buf.append(line[i])
+            elif ch.isspace():
+                break
+            else:
+                buf.append(ch)
+            i += 1
+        words.append((start, "".join(buf)))
+        if i >= n:
+            return words
+
+
+def line_level(words):
+    """read|change|danger of a (possibly unfinished) command line, None when the console refuses it."""
+    if not words:
+        return None
+    level, err = classify(words)
+    if not err:
+        return level
+    if any(f[:len(words)] == words for f in DANGER_EXACT.get(words[0], [])):
+        return "danger"
+    for extra in (["x"], ["GET", "/"], ["x", "x"]):        # still needs an argument (wazuh logtest <line>, api GET <path>)
+        level, e = classify(words + extra)
+        if not e:
+            return level
+    return None
+
+
+def match_rank(token, text):
+    """0 prefix, 1 word start, 2 substring, 3 subsequence, 4 close (typo); None = no match. Case-insensitive."""
+    t, s = token.lower(), text.lower()
+    if not t or s.startswith(t):
+        return 0
+    if any(seg.startswith(t) for seg in re.split(r"[-_./:=,<>\[\]]+", s) if seg):
+        return 1
+    if t in s:
+        return 2
+    if len(t) >= 2 and s.lstrip("-<[")[:1] == t.lstrip("-")[:1]:     # same first letter, then in order: dctr -> doctor
+        it = iter(s)
+        if all(c in it for c in t):
+            return 3
+    if len(t) >= 3 and difflib.SequenceMatcher(None, t, s[:len(t) + 2]).ratio() >= 0.75:
+        return 4
+    return None
+
+
+def walk(words):
+    """Follow the completed words through the grammar -> (node, path, stack, used flags, positional, pending value type)."""
+    node, path, stack, used, positional, pending = GRAMMAR_ROOT, [], [GRAMMAR_ROOT], set(), [], None
+    for w in words:
+        if pending is not None:
+            pending = None
+            continue
+        if w.startswith("-") and len(w) > 1:
+            name, eq, _ = w.partition("=")
+            spec = next((n["flags"][name] for n in reversed(stack) if name in n["flags"]), None)
+            used.add(name)
+            if spec and spec[0] and not eq:
+                pending = spec[0]
+            continue
+        key = node["aliases"].get(w, w)
+        if not positional and key in node["subs"]:
+            node = node["subs"][key]
+            path.append(key)
+            stack.append(node)
+            continue
+        positional.append(w)
+    return node, path, stack, used, positional, pending
+
+
+def slot_type(node, positional):
+    args, i, r = node["args"], len(positional), node["repeat"]
+    if i < len(args):
+        return args[i]
+    if r and args:
+        return args[len(args) - r + (i - len(args)) % r]
+    return None
+
+
+def value_items(vtype, ctx, exclude=()):
+    """-> (values [(text, desc)], hint item or None) of a value type."""
+    spec = VALUES.get(vtype) or {}
+    vals = list(spec.get("values") or [])
+    if spec.get("source"):
+        try:
+            vals += spec["source"](ctx)
+        except Exception:  # noqa: BLE001 - a broken source gives no suggestions, never an error
+            pass
+    vals = [(t, d) for t, d in dict((t, d) for t, d in vals if t not in exclude).items()]
+    h = None
+    if spec.get("hint"):
+        h = {"text": spec["hint"], "desc": spec.get("desc", ""), "example": spec.get("example", "")}
+        if callable(h["example"]):
+            h["example"] = h["example"](ctx)
+        if spec.get("dynhint"):
+            h.update(spec["dynhint"](ctx))
+    return vals, h
+
+
+def node_usage(path, node):
+    if node["usage"]:
+        return node["usage"]
+    parts = ["vexor", *path]
+    subs = [s for s, n in node["subs"].items() if not n["hidden"]]
+    if subs:
+        parts.append("|".join(subs[:9]) + ("|.." if len(subs) > 9 else ""))
+    for a in node["args"]:
+        parts.append((VALUES.get(a) or {}).get("hint") or f"<{a}>")
+    if node["repeat"]:
+        parts.append("..")
+    for f, spec in node["flags"].items():
+        parts.append(f"[{f}" + (f" {(VALUES.get(spec[0]) or {}).get('hint') or spec[0].upper()}" if spec[0] else "") + "]")
+    u = " ".join(parts)
+    return u if len(u) <= 160 else u[:157] + "..."
+
+
+def complete(line):
+    """Suggestions for the word under the end of line: {start, token, items, usage, level}. See /api/complete."""
+    line = line[:2000]
+    m = re.match(r"\s*vexor\s+", line)
+    off = m.end() if m else 0
+    parts = split_line(line[off:])
+    start, token = parts[-1][0] + off, parts[-1][1]
+    words = [w for _, w in parts[:-1]]
+    out = {"start": start, "token": token, "items": [], "usage": "", "level": None}
+    if words:
+        out["level"] = line_level(words) or "blocked"
+        if words[0] not in GRAMMAR or out["level"] == "blocked":
+            out["usage"] = classify(words)[1] or ""
+            return out
+    node, path, stack, used, positional, pending = walk(words)
+    ctx = {"words": words, "path": path, "positional": positional}
+    out["usage"] = node_usage(path, node) if words else ""
+    cands, hint_item = [], None          # (kind, text, desc, level words)
+    if pending is not None:
+        vals, hint_item = value_items(pending, ctx)
+        cands += [("value", t, d) for t, d in vals]
+    else:
+        if not token.startswith("-"):
+            if not positional:
+                cands += [("command" if not words else "sub", s, n["desc"]) for s, n in node["subs"].items() if not n["hidden"]]
+            vtype = slot_type(node, positional)
+            if vtype:
+                vals, hint_item = value_items(vtype, ctx, exclude=set(positional) if node["repeat"] else ())
+                cands += [("value", t, d) for t, d in vals]
+        for n in reversed(stack):
+            for f, spec in n["flags"].items():
+                if f not in used and (len(spec) < 3 or spec[2](ctx)):
+                    cands.append(("flag", f, spec[1]))
+            if n["flags"]:
+                break                     # the deepest node with flags owns them
+    ranked, seen = [], set()
+    for i, (kind, text, desc) in enumerate(cands):
+        r = match_rank(token, text)
+        if r is None or text in seen:
+            continue
+        lvl = line_level(words + [text])
+        if lvl is None:
+            continue                      # blocked or refused in the console: never suggested
+        seen.add(text)
+        ranked.append((r, i, {"text": shlex.quote(text) if kind == "value" and re.search(r"[\s'\"\\$`;&|<>()*?#]", text) else text,
+                              "kind": kind, "desc": (desc or "")[:90], "level": lvl, "insertable": True}))
+    ranked.sort(key=lambda x: (x[0], x[1]))
+    items = [x[2] for x in ranked]
+    if hint_item:
+        lvl = line_level(words + [hint_item["example"] or "x"])
+        if lvl is not None:
+            items = items[:COMPLETE_MAX - 1]
+            items.append({"text": hint_item["text"], "kind": "hint", "desc": (hint_item["desc"] or "")[:90], "level": lvl,
+                          "insertable": False, "example": hint_item["example"] or ""})
+    out["items"] = items[:COMPLETE_MAX]
+    return out
+
+
 # ---------------------------------------------------------------- auth
 SESSIONS = {}
 FAILS = {}
@@ -1239,11 +2025,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p == "/api/detection":
             return self.send_json(cached("detection", TTL["detection"], detection, fresh=fresh))
         if p == "/api/detection/integrations":
-            return self.send_json(cached("det-integrations", TTL["detection"], lambda: vexor_json(
-                ["wazuh", "integrations", "ls", "--json"], default={"integrations": [], "error": "vexor wazuh integrations ls failed"}), fresh=fresh))
+            return self.send_json(cached("det-integrations", TTL["detection"], det_integrations_list, fresh=fresh))
         if p == "/api/detection/config":
-            return self.send_json(cached("det-config", TTL["detection"], lambda: vexor_json(
-                ["wazuh", "config", "ls", "--json"], default={"settings": [], "error": "vexor wazuh config ls failed"}), fresh=fresh))
+            return self.send_json(cached("det-config", TTL["detection"], det_config_list, fresh=fresh))
         if p == "/api/detection/file":
             return self.det_file_get(q)
         if p == "/api/detection/template":
@@ -1252,6 +2036,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json({"error": "kind must be rules, decoders or lists"}, 400)
             t = next((t for t in (vexor_json(["wazuh", kind, "templates", "--json"], default={}) or {}).get("templates", []) if t.get("id") == tid), None)
             return self.send_json({"id": tid, "content": t["content"]} if t else {"error": "no such template"}, 200 if t else 404)
+        if p == "/api/complete":           # Terminal suggestions on every keystroke: cached data only, never waits
+            try:
+                return self.send_json(complete((q.get("line") or [""])[0]))
+            except Exception as e:  # noqa: BLE001 - a suggestion bug must not show as a failed request
+                print(f"complete failed: {e!r}", file=sys.stderr, flush=True)
+                return self.send_json({"start": 0, "token": "", "items": [], "usage": "", "level": None})
         if p == "/api/catalog":
             return self.send_json({"commands": CATALOG, "read": {k: sorted(v) for k, v in READ_SUBS.items()},
                                    "danger": {k: sorted(v) for k, v in DANGER_SUBS.items()}, "blocked": sorted(BLOCKED)})

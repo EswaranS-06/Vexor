@@ -674,8 +674,8 @@ async function vTerminal() {
   setTitle("Terminal");
   paint(`
     <p class="lede">Type any vexor command. Reading runs at once; changes ask first; commands that delete or switch layouts ask you to type their name. Interactive ones (shell, exec, logtest, config edit) stay in SSH.</p>
-    <form class="term" data-term><span class="term__p">vexor</span><input class="in in--term" name="cmd" list="vx-suggest" placeholder="suricata alerts --since 1h" autocomplete="off" spellcheck="false" autofocus><button type="button" class="btn btn--ghost btn--sm btn--icon" data-term-copy aria-label="Copy command" title="Copy command"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg></button><button class="btn btn--primary btn--sm">Run</button></form>
-    <datalist id="vx-suggest">${SUGGEST.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>
+    <div class="term-wrap"><form class="term" data-term><span class="term__p">vexor</span><input class="in in--term" name="cmd" role="combobox" aria-expanded="false" aria-controls="vx-sug" aria-autocomplete="list" aria-haspopup="listbox" aria-label="vexor command" placeholder="suricata alerts --since 1h" autocomplete="off" spellcheck="false" autofocus><button type="button" class="btn btn--ghost btn--sm btn--icon" data-term-copy aria-label="Copy command" title="Copy command"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg></button><button class="btn btn--primary btn--sm">Run</button></form>
+    <div class="sug" data-sug hidden><ul id="vx-sug" class="sug__list" role="listbox" aria-label="Command suggestions"></ul><div class="sug__use" data-sug-use></div></div></div>
     <div class="chips">${SUGGEST.slice(0, 14).map((s) => `<button type="button" class="chip" data-fill="${esc(s)}">${esc(s)}</button>`).join("")}</div>
     <h2 class="sub">History</h2><ol class="hist" data-hist></ol>
     <div class="sections" id="sec-activity" data-activity></div>`);
@@ -696,7 +696,103 @@ async function vTerminal() {
     const j = e.target.closest("[data-job]"); if (j) openJob(JSON.parse(j.dataset.job));
   };
   $("[data-term-copy]").addEventListener("click", (e) => { const v = inp.value.trim().replace(/^vexor\s+/, ""); if (v) copyText("vexor " + v, e.currentTarget); else toast("Type a command first.", "bad"); });
+  termSuggest(f, inp, () => [...new Set(hist)]);
   await termActivity();
+}
+// Suggestion dropdown under the command box: GET /api/complete?line=<text before the caret> -> {start, token, items[], usage}.
+// Debounced, one request in flight (older ones aborted, stale answers dropped). Enter only picks a row after an arrow key moved into the list.
+function termSuggest(f, inp, histOf) {
+  const box = $("[data-sug]", f.parentNode), ul = $(".sug__list", box), use = $("[data-sug-use]", box);
+  let items = [], sel = -1, nav = false, seq = 0, ctl = null, timer = 0, start = 0, isOpen = false;
+  const pick = (it) => it && it.kind !== "hint" && it.insertable !== false;
+  const SP = /^(command|sub|flag|value)$/;
+  const close = () => {
+    clearTimeout(timer); seq++; ctl?.abort(); ctl = null;
+    isOpen = false; sel = -1; nav = false; box.hidden = true;
+    inp.setAttribute("aria-expanded", "false"); inp.removeAttribute("aria-activedescendant");
+  };
+  const mark = () => {
+    $$(".sug__row[data-i]", ul).forEach((li) => { const on = +li.dataset.i === sel; li.classList.toggle("is-sel", on); li.setAttribute("aria-selected", on); if (on) li.scrollIntoView({ block: "nearest" }); });
+    if (sel >= 0) inp.setAttribute("aria-activedescendant", "vx-sg-" + sel); else inp.removeAttribute("aria-activedescendant");
+  };
+  const bold = (t, pre) => { const n = pre && t.toLowerCase().startsWith(pre.toLowerCase()) ? pre.length : 0; return `<b>${esc(t.slice(0, n))}</b>${esc(t.slice(n))}`; };
+  const draw = (line, usage) => {
+    ul.innerHTML = items.map((it, i) => {
+      if (it.kind === "hint") return `<li class="sug__row sug__row--hint" role="presentation"><span class="sug__t">${esc(it.text)}</span><span class="sug__d">${esc(it.desc || "")}${it.example ? ` · e.g. ${esc(it.example)}` : ""}</span></li>`;
+      const lv = it.level === "danger" ? "bad" : it.level === "change" ? "warn" : "";
+      return `<li class="sug__row" role="option" id="vx-sg-${i}" aria-selected="false" data-i="${i}"><span class="sug__t">${bold(it.text, it.kind === "history" ? line : it.token)}</span><span class="sug__k">${esc(it.kind || "")}</span>${lv ? `<span class="pill pill--${lv} sug__lv">${it.level}</span>` : ""}<span class="sug__d">${esc(it.desc || "")}</span></li>`;
+    }).join("");
+    use.textContent = usage || ""; use.hidden = !usage;
+    isOpen = true; box.hidden = false; inp.setAttribute("aria-expanded", "true"); mark();
+  };
+  const go = async () => {
+    const line = inp.value.slice(0, inp.selectionStart ?? inp.value.length), my = ++seq;
+    ctl?.abort(); ctl = new AbortController();
+    let d;
+    try {
+      if (/(^|\s)--api-key(\s|=)/.test(line)) throw 0;   // a key is being typed: never send it to the server
+      const r = await api("/api/complete?line=" + encodeURIComponent(line), { signal: ctl.signal });
+      d = r.status === 200 && r.data && typeof r.data === "object" ? r.data : null;
+    } catch { d = null; }
+    if (my !== seq || PAGE.key !== "terminal") return;
+    const be = Array.isArray(d?.items) ? d.items.slice(0, 12).map((x) => ({ ...x, token: d.token || "" })) : [];
+    start = Number.isInteger(d?.start) ? d.start : 0;
+    const blank = line.trim() === "";
+    const hs = histOf().filter((h) => blank || (h.startsWith(line) && h !== line)).slice(0, blank ? 5 : 3);
+    const rest = be.filter((x) => !hs.includes((line.slice(0, start) + x.text).trim()));
+    items = [...hs.map((h) => ({ text: h, kind: "history" })), ...rest]; sel = -1; nav = false;
+    if (!items.length) return close();
+    draw(line, d?.usage);
+  };
+  const q = (ms = 80) => { clearTimeout(timer); timer = setTimeout(go, ms); };
+  const accept = (it) => {
+    if (!pick(it)) return;
+    const v = inp.value, c = inp.selectionStart ?? v.length;
+    if (it.kind === "history") { inp.value = it.text; inp.setSelectionRange(it.text.length, it.text.length); }
+    else {
+      let t = it.text;
+      if (/\s/.test(t) && !/^["']/.test(v.slice(start, c))) t = '"' + t.replace(/"/g, '\\"') + '"';
+      const tail = v.slice(c), add = SP.test(it.kind), sp = add && !tail.startsWith(" ") ? " " : "";
+      inp.value = v.slice(0, start) + t + sp + tail;
+      const p = start + t.length + (add ? 1 : 0);
+      inp.setSelectionRange(p, p);
+    }
+    inp.focus(); sel = -1; nav = false; q(0);
+  };
+  const move = (d) => {
+    const ok = items.map((it, i) => (pick(it) ? i : -1)).filter((i) => i >= 0);
+    if (!ok.length) return;
+    const k = ok.indexOf(sel);
+    sel = ok[k < 0 ? (d > 0 ? 0 : ok.length - 1) : (k + d + ok.length) % ok.length]; nav = true; mark();
+  };
+  inp.addEventListener("input", () => q());
+  inp.addEventListener("focus", () => q());
+  inp.addEventListener("click", () => q());
+  inp.addEventListener("keyup", (e) => { if (/^(ArrowLeft|ArrowRight|Home|End)$/.test(e.key)) q(); });
+  inp.addEventListener("blur", close);
+  f.addEventListener("submit", close);
+  inp.addEventListener("keydown", (e) => {
+    if (e.isComposing) return;
+    if (e.key === " " && e.ctrlKey) { e.preventDefault(); return go(); }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      if (e.altKey || e.shiftKey || e.ctrlKey || e.metaKey) return;
+      e.preventDefault();
+      if (!isOpen) return e.key === "ArrowDown" ? go() : undefined;
+      return move(e.key === "ArrowDown" ? 1 : -1);
+    }
+    if (!isOpen) return;
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); return close(); }
+    if (e.key === "Enter") { if (nav && sel >= 0) { e.preventDefault(); accept(items[sel]); } return; }
+    const tab = e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
+    const right = e.key === "ArrowRight" && !e.shiftKey && inp.selectionStart === inp.selectionEnd && inp.selectionStart === inp.value.length;
+    if (tab || right) {
+      const it = sel >= 0 ? items[sel] : items.find(pick);
+      if (it) { e.preventDefault(); accept(it); }
+    }
+  });
+  box.addEventListener("mousedown", (e) => e.preventDefault());
+  box.addEventListener("click", (e) => { const li = e.target.closest(".sug__row"); if (!li) return; if (li.dataset.i != null) accept(items[+li.dataset.i]); else inp.focus(); });
+  if (document.activeElement === inp) q(0);
 }
 // The Terminal's activity sections (commands run from this console, audit log). Only this part is re-read: on open,
 // after a command starts or ends, and on Refresh. The command box and history above it are never touched.

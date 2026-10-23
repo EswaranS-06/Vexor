@@ -150,6 +150,20 @@ body.has-out .app { grid-template-columns: var(--side-w) minmax(0, 1fr) minmax(0
 .term__p { font: 500 var(--text-sm)/1 var(--font-mono); color: var(--color-accent-on-dark); }
 .in--term { background: transparent; border: 0; color: var(--color-on-graphite); font-size: var(--text-md); }
 .in--term:focus-visible { outline: none; }
+.term-wrap { position: relative; }
+.sug { position: absolute; z-index: 30; left: 0; right: 0; top: calc(100% + 2px); background: var(--color-graphite-2); color: var(--color-on-graphite); border: var(--rule-w) solid var(--color-graphite-rule); border-radius: var(--radius-md); box-shadow: var(--shadow-pop); overflow: hidden; }
+.sug[hidden], .sug__use[hidden] { display: none; }
+.sug__list { list-style: none; margin: 0; padding: var(--space-1); max-height: min(22rem, 55vh); overflow-y: auto; overscroll-behavior: contain; }
+.sug__row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); min-height: 32px; padding: 0.3rem var(--space-2); border-radius: var(--radius-sm); cursor: pointer; border-left: 2px solid transparent; }
+.sug__row:hover { background: var(--color-graphite-3); }
+.sug__row.is-sel { background: var(--color-graphite-3); border-left-color: var(--color-accent); }
+.sug__row--hint { cursor: default; opacity: 0.7; } .sug__row--hint:hover { background: transparent; }
+.sug__t { font: 500 var(--text-sm)/1.3 var(--font-mono); overflow-wrap: anywhere; } .sug__t b { font-weight: 700; color: var(--color-accent-on-dark); }
+.sug__k { font: 500 var(--text-xs)/1 var(--font-mono); opacity: 0.6; text-transform: lowercase; }
+.sug__lv { padding: 0.2rem 0.35rem; }
+.sug__d { flex: 1 1 10rem; min-width: 0; text-align: right; font-size: var(--text-xs); opacity: 0.65; }
+.sug__use { padding: var(--space-1) var(--space-3); border-top: var(--rule-w) solid var(--color-graphite-rule); font: 500 var(--text-xs)/1.4 var(--font-mono); opacity: 0.75; }
+@media (max-width: 30em) { .sug__d { text-align: left; flex-basis: 100%; } }
 .hist { margin: 0; padding-left: var(--space-5); display: grid; gap: var(--space-1); }
 .audit { margin: 0; max-height: 22rem; overflow: auto; font-size: var(--text-xs); background: var(--color-paper-2); border: var(--rule-w) solid var(--color-rule); border-radius: var(--radius-md); padding: var(--space-3); white-space: pre-wrap; }
 
