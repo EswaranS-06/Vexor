@@ -521,3 +521,7 @@ body.nav-open { overflow: hidden; }
 /* the output drawer overlays the page below 1700px: on Detection keep the editor's buttons clear of it */
 @media (min-width: 1081px) and (max-width: 1700px) { body:has([data-page="detection"]).has-out .main { padding-right: calc(min(34rem, 100vw) + var(--space-4)); } }
 @media (min-width: 1081px) and (max-width: 1700px) { body:has([data-page="detection"]).has-out .det-split { grid-template-columns: minmax(0, 1fr); } body:has([data-page="detection"]).has-out .det-list { max-height: 12rem; } }
+
+/* warning after "Skip for now": still on the generated console password */
+.pwwarn { display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; justify-content: space-between; border: var(--rule-w) solid var(--color-warn); border-left-width: 3px; border-radius: var(--radius-md); padding: var(--space-3) var(--space-4); background: var(--color-paper); margin-bottom: var(--space-4); }
+.pwwarn a { font-weight: 500; }

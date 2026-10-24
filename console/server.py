@@ -1808,6 +1808,12 @@ def password_temp():
     return temp
 
 
+def pw_gate(s):
+    """True while this session must still choose a new console password: the password is the generated one and the
+    user did not press "Skip for now" in this session (the flag lives in the session only, never on disk)."""
+    return password_temp() and not s.get("skip_pw")
+
+
 def write_env_value(key, value):
     lines = ENV_FILE.read_text().split("\n")
     hits = [i for i, ln in enumerate(lines) if ln.startswith(key + "=")]
@@ -1977,11 +1983,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.static(p)
         if p == "/api/session":
             s = self.session()
-            return self.send_json({"user": s["user"], "csrf": s["csrf"], "mustChange": password_temp()} if s else {"user": None})
+            return self.send_json({"user": s["user"], "csrf": s["csrf"], "mustChange": pw_gate(s),
+                                   "pwSkipped": bool(s.get("skip_pw")) and password_temp()} if s else {"user": None})
         s = self.require()
         if not s:
             return
-        if password_temp():
+        if pw_gate(s):
             return self.must_change()
         q = urllib.parse.parse_qs(u.query)
         fresh = "fresh" in q        # the Refresh button: wait for new data instead of the cached value
@@ -2114,7 +2121,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json({"error": "bad JSON"}, 400)
         if p == "/api/password":
             return self.change_password(s, data)
-        if password_temp():
+        if p == "/api/password-skip":
+            return self.skip_password(s)
+        if pw_gate(s):
             return self.must_change()
         if p == "/api/run":
             args = data.get("args")
@@ -2292,6 +2301,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         job = start_job(args, s["user"], "change", cleanup=cleanup)
         return self.send_json(dict(job.summary(), cmd="vexor " + shlex.join(shown)))
 
+    def skip_password(self, s):
+        """Skip the forced password change for THIS session only (in-memory flag; a new sign-in asks again)."""
+        if not password_temp():
+            return self.send_json({"error": "the console password is already your own - nothing to skip"}, 409)
+        if not s.get("skip_pw"):
+            s["skip_pw"] = True
+            audit(s["user"], f"skipped the default-password change (this session) from {self.client_address[0]}")
+        return self.send_json({"ok": True})
+
     def change_password(self, s, data):
         ip = self.client_address[0]
         now = time.time()
@@ -2332,6 +2350,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json({"error": f"could not write .env: {e}"}, 500)
         PW_FAILS.pop(ip, None)
         _pw_seen.clear()
+        s.pop("skip_pw", None)
         for tok in [t for t, v in SESSIONS.items() if v is not s]:
             SESSIONS.pop(tok, None)      # every other session must sign in again
         audit(s["user"], "console password changed")
@@ -2468,7 +2487,7 @@ def reload_watch(httpd):
             STATE.mkdir(exist_ok=True)
             fd = os.open(SESSIONS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
-                json.dump(SESSIONS, f)
+                json.dump({k: {a: b for a, b in v.items() if a != "skip_pw"} for k, v in SESSIONS.items()}, f)   # the skip never survives a reload
         except OSError:
             pass
         audit("(console)", "server.py changed - reloading")

@@ -24,17 +24,59 @@ async function api(path, opts = {}) {
 
 // ---------------------------------------------------------------- login
 function showLogin() { stopLive(); $("[data-app]").hidden = true; $("[data-pw]").hidden = true; $("[data-login]").hidden = false; $("[name=password]").focus(); }
-function showPasswordChange() { stopLive(); $("[data-app]").hidden = true; $("[data-login]").hidden = true; $("[data-pw]").hidden = false; $("[name=current]").focus(); }
+let PW_SKIPPED = false;    // this session skipped the forced change and still uses the generated password
+function showPasswordChange() {
+  stopLive(); $("[data-app]").hidden = true; $("[data-login]").hidden = true; $("[data-pw]").hidden = false;
+  const skip = $("[data-pw-skip]");
+  skip.textContent = PW_SKIPPED ? "Back to the console" : "Skip for now";
+  $("[data-pw-skip-note]").hidden = PW_SKIPPED;
+  $("[name=current]").focus();
+}
+// Controls added here: the forced-change screen's "Skip for now" and the warning banner shown after skipping.
+(() => {
+  const submit = $("button[type=submit]", $("[data-pw-form]"));
+  submit.insertAdjacentHTML("afterend",
+    `<button class="btn btn--ghost" type="button" data-pw-skip>Skip for now</button>
+     <p class="login__hint" data-pw-skip-note id="pw-skip-note">You can change it any time in Settings → Security. Until then anyone who knows the generated password can sign in.</p>`);
+  $("[data-pw-skip]").setAttribute("aria-describedby", "pw-skip-note");
+  $("#main").insertAdjacentHTML("afterbegin",
+    `<div class="pwwarn" data-pwwarn role="region" aria-label="Password warning" hidden>
+       <p><b>You are still using the generated console password.</b> <a href="#security" data-pwwarn-link>Change it</a></p>
+       <button type="button" class="btn btn--ghost btn--xs" data-pwwarn-close aria-label="Dismiss the password warning">Dismiss</button>
+     </div>`);
+})();
+let pwWarnClosed = false;      // dismissed for this page load only
+function pwWarn() {
+  const b = $("[data-pwwarn]");
+  b.hidden = !PW_SKIPPED || pwWarnClosed;
+}
+$("[data-pwwarn-close]").addEventListener("click", () => { pwWarnClosed = true; pwWarn(); const h = $("[data-title]"); h.tabIndex = -1; h.focus(); });
+$("[data-pw-skip]").addEventListener("click", async (e) => {
+  const btn = e.currentTarget, err = $("[data-pw-err]");
+  err.textContent = "";
+  if (!PW_SKIPPED) {
+    btn.disabled = true;
+    const { status, data } = await api("/api/password-skip", { body: {} }).catch(() => ({ status: 0, data: {} }));
+    btn.disabled = false;
+    if (status !== 200) { err.textContent = data.error || "Could not skip."; btn.focus(); return; }
+  }
+  boot();
+});
+// Settings -> Security: reopen the change form after skipping.
+$("[data-view]").addEventListener("click", (e) => { if (e.target.closest("[data-pw-open]")) showPasswordChange(); });
 async function boot() {
   const { data } = await api("/api/session");
   if (!data.user) return showLogin();
   CSRF = data.csrf;
+  PW_SKIPPED = !!data.pwSkipped;
   if (data.mustChange) return showPasswordChange();
+  pwWarn();
   $("[data-whoami]").textContent = data.user;
   $("[data-login]").hidden = true;
   $("[data-pw]").hidden = true;
   $("[data-app]").hidden = false;
   route();
+  if (PW_SKIPPED && !pwWarnClosed) $("[data-pwwarn-link]").focus();
 }
 $("[data-login-form]").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -661,7 +703,7 @@ function settingsHtml(ps, rows) {
           <td class="small muted">${esc(r.help || "")}</td></tr>`).join("")}</tbody></table></div>
         <div class="actions sticky-bar"><button class="btn btn--sm btn--primary" type="submit" data-set-apply disabled>Apply changes</button><span class="muted small" data-set-msg>No changes.</span></div>
       </form></section>
-    <section class="block" id="sec-security"><h2>Security</h2><div class="actions">
+    <section class="block" id="sec-security"><h2>Security</h2>${PW_SKIPPED ? '<p class="muted">You skipped the console password change for this sign-in. <button type="button" class="btn btn--sm btn--primary" data-pw-open>Change console password</button></p>' : ""}<div class="actions">
       ${btn("New admin password", ["passwd", "admin", "--generate"], "btn--danger-ghost")}${btn("New API password", ["passwd", "api", "--generate"], "btn--danger-ghost")}${btn("New dashboard password", ["passwd", "kibanaserver", "--generate"], "btn--danger-ghost")}${btn("Enrollment password on", ["agents", "password", "on"])}${btn("New console password", ["console", "password", "--generate"], "btn--danger-ghost")}
     </div><p class="muted small">New passwords appear in the output once; they are also stored in .env.</p></section>
     <section class="block" id="sec-remove"><h2>Remove Vexor</h2>
@@ -2004,7 +2046,7 @@ function detLtHtml(r) {
 
 const ROUTES = { overview: vOverview, map: vMap, containers: vContainers, stacks: vStacks, detection: vDetection, storage: vStorage, proxy: vProxy, logins: vLogins, settings: vSettings, terminal: vTerminal };
 // Pages that were merged into others: the old address opens the new page at the matching section.
-const MOVED = { health: ["overview", "sec-health"], ports: ["settings", "sec-ports"], volumes: ["storage", "sec-volumes"], activity: ["terminal", "sec-activity"], reset: ["settings", "sec-remove"] };
+const MOVED = { health: ["overview", "sec-health"], ports: ["settings", "sec-ports"], volumes: ["storage", "sec-volumes"], activity: ["terminal", "sec-activity"], reset: ["settings", "sec-remove"], security: ["settings", "sec-security"] };
 // Scroll a section of the page on screen into view (below the sticky bar on phones) and move focus there for keyboards.
 function jumpTo(id) {
   const el = id && document.getElementById(id);
