@@ -1,0 +1,4 @@
+# ShellCheck settings for vexor + lib/*.sh (CI: shellcheck --severity=error --shell=bash -x vexor lib/*.sh)
+# vexor sources lib/*.sh with `# shellcheck source=lib/<file>` hints; resolve them next to the script.
+source-path=SCRIPTDIR
+external-sources=true

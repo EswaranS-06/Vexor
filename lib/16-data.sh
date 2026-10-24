@@ -263,7 +263,7 @@ backup_run() {
   done
   es_snapshot_run "$stamp" || true
   local extra=(); [ -d "$DET_HIST" ] && extra+=(.state/detection-history)   # versions of config/wazuh_custom (vexor wazuh rules history)
-  tar czf "$dir/config/stack-config-${stamp}.tar.gz" -C "$ROOT" config .env docker-compose.yml generate-indexer-certs.yml vexor "${extra[@]}" 2>/dev/null \
+  tar czf "$dir/config/stack-config-${stamp}.tar.gz" -C "$ROOT" config .env docker-compose.yml generate-indexer-certs.yml vexor lib "${extra[@]}" 2>/dev/null \
     && ok "stack config (.env, config/ with config/wazuh_custom, certs)"
   chmod 600 "$dir"/config/*"${stamp}"* 2>/dev/null
   # retention
@@ -338,7 +338,7 @@ print(json.dumps(b))' "$idx" "$rename" "$kib")"
       take_lock
       local pre; pre="$(backup_dir)/config/stack-config-pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
       tar czf "$pre" -C "$ROOT" config .env docker-compose.yml && chmod 600 "$pre" && ok "current config saved to $pre"
-      tar xzf "$file" -C "$ROOT" --exclude=vexor && ok "config restored - apply with: vexor restart" ;;
+      tar xzf "$file" -C "$ROOT" --exclude=vexor --exclude=lib && ok "config restored - apply with: vexor restart" ;;
     *) die "usage: vexor backup [run]|list|register|restore-snapshot|restore-manager|restore-config" ;;
   esac
 }

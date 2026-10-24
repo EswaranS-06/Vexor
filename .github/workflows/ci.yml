@@ -16,10 +16,11 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Bash syntax
-        run: bash -n vexor
+        run: for f in vexor lib/*.sh; do bash -n "$f" || exit 1; done
 
       - name: ShellCheck (errors)
-        run: shellcheck --severity=error --shell=bash vexor
+        # -x follows the `# shellcheck source=lib/..` lines of vexor; settings in .shellcheckrc
+        run: shellcheck --severity=error --shell=bash -x vexor lib/*.sh
 
       - name: Help and version run without a stack
         run: |
@@ -38,8 +39,8 @@ jobs:
       - name: Generated compose files match the committed ones
         run: |
           python3 - <<'EOF'
-          import re, sys
-          src = open("vexor").read()
+          import glob, re, sys
+          src = "".join(open(f).read() for f in ["vexor"] + sorted(glob.glob("lib/*.sh")))
           bad = 0
           for fn, path in (("ensure_tools_compose", "docker-compose.tools.yml"),
                            ("ensure_elk_compose", "docker-compose.elk.yml")):

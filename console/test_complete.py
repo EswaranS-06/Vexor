@@ -251,7 +251,8 @@ class Complete(unittest.TestCase):
                 self.assertTrue(spec[0] is None or spec[0] in server.VALUES, (path, f))
 
     def test_grammar_matches_bash_completion(self):
-        src = (server.ROOT / "vexor").read_text(errors="replace")
+        src = "".join(p.read_text(errors="replace")             # the entry script + its lib/ modules
+                      for p in [server.ROOT / "vexor", *sorted((server.ROOT / "lib").glob("*.sh"))])
         body = src[src.index("completion_script() {"):]
         top = set(re.search(r'words="([^"]+)"', body).group(1).split())
         aliases = {"wait"}                                 # vexor accepts it (= wait-ready); the completion lists wait-ready
