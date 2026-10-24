@@ -1,7 +1,7 @@
 # shellcheck shell=bash
-# vexor lib/04-passwords-nginx.sh - password generation/hashing, cluster key, nginx rendering
+# vexor lib/04-passwords-nginx.sh - password generation / hashing / internal users, cluster key, nginx rendering, compose profiles / override / layout migration
 # Sourced by ./vexor in a fixed order (see the loader there); not executable on its own.
-# ============================================================== passwords
+# ============================================================== password generation / hashing / internal users
 gen_pw() { echo "$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 20)Aa1.-"; }
 valid_pw() {
   local p="$1" re_chars='^[A-Za-z0-9.*+?-]+$' re_sym='[.*+?-]'
@@ -93,7 +93,7 @@ securityadmin_users() {        # push internal_users.yml into the running indexe
       -h wazuh1.indexer -p 9200 -nhnv -icl'
 }
 
-# ============================================================== cluster key / nginx
+# ============================================================== cluster key / nginx / compose profiles, override and layout migration
 ensure_cluster_key() {         # ensure_cluster_key [new]
   python3 -I - "$CLUSTER_DIR" "${1:-keep}" <<'PY'
 import glob, re, secrets, sys
@@ -111,7 +111,7 @@ print(changed)
 PY
 }
 render_nginx() {
-  local n conns ups i profiles=""
+  local n conns ups i
   n="$(active_workers)"; conns="$(env_def NGINX_WORKER_CONNECTIONS 1024)"
   ups=""                                   # the master is always in the template; add active workers
   [ "$n" -ge 1 ] && ups="        server wazuh.worker:1514;"
@@ -246,7 +246,6 @@ render_override() {            # write it only when it changed (docker compose r
   [ -f "$OVERRIDE_FILE" ] && [ "$(cat "$OVERRIDE_FILE")" = "$s" ] && return 0
   printf '%s\n' "$s" > "$OVERRIDE_FILE"
 }
-proxy_key_path() { local p; p="$(env_get PROXY_KEY)"; abspath "${p:-./config/wazuh_indexer_ssl_certs/wazuh.dashboard-key.pem}"; }
 prune_disabled_containers() {  # stop + remove containers of services the applied layout does not use (volumes kept)
   local svc rm=() en; en=" $(enabled_services | tr '\n' ' ') "
   for svc in wazuh.master wazuh.worker wazuh2.worker wazuh3.worker wazuh1.indexer wazuh2.indexer wazuh3.indexer wazuh.dashboard nginx "${ELK_SERVICES[@]}" "${TOOLS[@]}"; do

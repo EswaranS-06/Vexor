@@ -222,7 +222,7 @@ elk_prepare() {                # before `docker compose up`
 }
 elk_post() {                   # after `docker compose up`: users, roles, retention, data views
   soc_elk || return 0
-  local i c=""
+  local c=""
   wait_ready_run 300 0 elasticsearch >/dev/null 2>&1; c="$(es_code /_cluster/health)"
   if [ "$c" = 401 ]; then
     bad "Elasticsearch rejects ELASTIC_PASSWORD (it is set only on the FIRST start of the data volume)"

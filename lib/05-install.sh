@@ -204,7 +204,6 @@ cmd_install() {
     case "$a" in
       --fresh)  fresh_req=1 ;;
       --force)  INSTALL_FORCE=1 ;;      # install even when a disk is nearly full
-      -y|--yes) ASSUME_YES=1 ;;
       *) die "usage: vexor install [--fresh] [--force] [--yes]" ;;
     esac
   done

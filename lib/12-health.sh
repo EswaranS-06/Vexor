@@ -15,7 +15,6 @@ reminders_due() {              # "message|command" lines that are due now
   awk -F'\t' -v now="$(date +%s)" '$2 <= now {print $3 "|" $4}' "$REMINDERS_FILE"
 }
 show_due_reminders() {
-  local line
   while IFS='|' read -r msg cmd; do
     [ -n "$msg" ] || continue
     warn "Reminder: $msg"; hint "$cmd"

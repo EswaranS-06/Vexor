@@ -134,7 +134,7 @@ local_agent_doctor() {         # a wazuh-agent on the vexor host itself: its man
 }
 cmd_doctor() {
   [ "${1:-}" = "--fix" ] && { DO_FIX=1; take_lock; }
-  local dr dp warn_pct v
+  local warn_pct v
   warn_pct="$(env_def DISK_WARN_PCT 85)"
 
   hdr "Host"
@@ -355,7 +355,7 @@ cmd_doctor() {
 
   hdr "Managers"
   if is_running wazuh.master; then
-    local cl want got miss
+    local cl want got
     cl="$(dc exec -T wazuh.master /var/ossec/bin/cluster_control -l 2>&1)"
     want=$(( $(active_workers) + 1 )); got="$(awk 'NR>1 && NF' <<<"$cl" | wc -l)"
     if [ "$got" -ge "$want" ]; then d_pass "manager cluster: $got/$want nodes connected$(is_single && echo ' (single: master only)')"

@@ -338,7 +338,7 @@ print(json.dumps(b))' "$idx" "$rename" "$kib")"
       take_lock
       local pre; pre="$(backup_dir)/config/stack-config-pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
       tar czf "$pre" -C "$ROOT" config .env docker-compose.yml && chmod 600 "$pre" && ok "current config saved to $pre"
-      tar xzf "$file" -C "$ROOT" --exclude=vexor --exclude=lib && ok "config restored - apply with: vexor restart" ;;
+      tar xzf "$file" -C "$ROOT" --anchored --exclude=vexor --exclude=lib && ok "config restored - apply with: vexor restart" ;;
     *) die "usage: vexor backup [run]|list|register|restore-snapshot|restore-manager|restore-config" ;;
   esac
 }

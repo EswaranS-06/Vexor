@@ -204,7 +204,6 @@ cmd_uninstall() {
     case "$a" in
       --keep-data) keep=1 ;;
       --images)    imgs=1 ;;
-      -y|--yes)    ASSUME_YES=1 ;;
       *) die "usage: vexor uninstall [--keep-data] [--images] [--yes]" ;;
     esac
   done

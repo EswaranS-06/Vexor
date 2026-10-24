@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # vexor lib/09-cluster.sh - passwd, agents / cluster, indexer count (3 <-> 1), node type (multi <-> single)
 # Sourced by ./vexor in a fixed order (see the loader there); not executable on its own.
-# ============================================================== passwords
+# ============================================================== vexor passwd
 cmd_passwd() {
   local who="${1:-}" pw="" gen=0; shift || true
   [ "${1:-}" = "--generate" ] && gen=1
@@ -87,7 +87,7 @@ for e in dd.get("failed_items", []): print("  failed:", e.get("id"), e.get("erro
   esac
 }
 agents_enroll_cmd() {
-  local os="all" name="" group="" a
+  local os="all" name="" group=""
   while [ $# -gt 0 ]; do
     case "$1" in --name) name="${2:?}"; shift ;; --group) group="${2:?}"; shift ;; *) os="$1" ;; esac; shift
   done
@@ -565,7 +565,7 @@ nt_apply_layout() {            # nt_apply_layout <single|multi>: managers, nginx
   ok "$(layout_desc)"
 }
 node_type_verify() {
-  local want got i svc
+  local want got svc
   wait_indexer 300 || warn "indexer not ready yet - vexor doctor"
   wait_dashboard 300 || true
   want=$(( $(active_workers) + 1 ))

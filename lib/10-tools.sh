@@ -235,13 +235,13 @@ vuln_feed_clear() {            # detection off: delete the feed it downloaded (1
   [ "$total" -gt 0 ] && ok "vulnerability feed removed from the managers ($((total / 1048576)) MB freed)"
   return 0
 }
-sync_vuln_detection() {        # WAZUH_VULN_DETECTION -> <enabled> of <vulnerability-detection> in every manager ossec.conf; prints "changed"
-  python3 -I - "$(env_def WAZUH_VULN_DETECTION false)" "$CLUSTER_DIR"/wazuh_*.conf <<'PY'
+sync_ossec_flag() {            # sync_ossec_flag <ENV_KEY> <regex up to the <enabled> tag>: env flag -> <enabled> in every manager ossec.conf; prints "changed"
+  python3 -I - "$(env_def "$1" false)" "$2" "$CLUSTER_DIR"/wazuh_*.conf <<'PY'
 import re, sys
 want = "yes" if sys.argv[1].strip().lower() in ("true", "yes", "1", "on") else "no"
-pat = re.compile(r"(<vulnerability-detection>.*?<enabled>)(yes|no)(</enabled>)", re.S)
+pat = re.compile(r"(" + sys.argv[2] + r")(yes|no)(</enabled>)", re.S)
 changed = False
-for path in sys.argv[2:]:
+for path in sys.argv[3:]:
     s = open(path).read()
     n = pat.sub(lambda m: m.group(1) + want + m.group(3), s, count=1)
     if n != s:
@@ -251,22 +251,8 @@ if changed:
     print("changed")
 PY
 }
-sync_sca() {                   # WAZUH_SCA -> <enabled> of <sca> in every manager ossec.conf; prints "changed"
-  python3 -I - "$(env_def WAZUH_SCA false)" "$CLUSTER_DIR"/wazuh_*.conf <<'PY'
-import re, sys
-want = "yes" if sys.argv[1].strip().lower() in ("true", "yes", "1", "on") else "no"
-pat = re.compile(r"(<sca>\s*<enabled>)(yes|no)(</enabled>)", re.S)
-changed = False
-for path in sys.argv[2:]:
-    s = open(path).read()
-    n = pat.sub(lambda m: m.group(1) + want + m.group(3), s, count=1)
-    if n != s:
-        open(path, "w").write(n)          # in-place write keeps the bind-mounted inode
-        changed = True
-if changed:
-    print("changed")
-PY
-}
+sync_vuln_detection() { sync_ossec_flag WAZUH_VULN_DETECTION '<vulnerability-detection>.*?<enabled>'; }   # <enabled> of <vulnerability-detection>
+sync_sca() { sync_ossec_flag WAZUH_SCA '<sca>\s*<enabled>'; }                                             # <enabled> of <sca>
 write_tool_rules() {
   rm -f "$TOOLS_DIR/wazuh/wazuhctl_tools_rules.xml" "$TOOLS_DIR/zeek/wazuhctl.zeek"   # pre-rename names           # Wazuh rules for the sensors (mounted into the master only while a sensor is on)
   mkdir -p "$TOOLS_DIR/wazuh"

@@ -165,7 +165,7 @@ cmd_daemon() {
 
 # ============================================================== support bundle / completion
 cmd_support_bundle() {
-  local stamp dir out; stamp="$(date +%Y%m%d-%H%M%S)"; dir="$RUN_TMP/wazuh-support-$stamp"; mkdir -p "$dir/logs"
+  local stamp dir out; stamp="$(date +%Y%m%d-%H%M%S)"; dir="$RUN_TMP/vexor-support-$stamp"; mkdir -p "$dir/logs"
   hdr "Collecting diagnostics"
   { echo "vexor $VEXOR_VERSION  $(date)"; uname -a; cat /etc/os-release 2>/dev/null; free -h; df -h; } > "$dir/host.txt" 2>&1
   docker info > "$dir/docker-info.txt" 2>&1
@@ -191,7 +191,7 @@ cmd_support_bundle() {
   { echo "applied: $(node_type)   .env NODE_TYPE: $(desired_node_type)   unfinished switch: $(cat "$NODE_SWITCH_FILE" 2>/dev/null || echo none)"; } > "$dir/node-type.txt"
   grep -rlZ . "$dir/config" | xargs -0 sed -i -E 's/((password|hash|<key>)[":[:space:]]*)[^<[:space:]]+/\1***masked***/I'
   out="$ROOT/support-$stamp.tar.gz"
-  tar czf "$out" -C "$RUN_TMP" "wazuh-support-$stamp" && chmod 600 "$out"
+  tar czf "$out" -C "$RUN_TMP" "vexor-support-$stamp" && chmod 600 "$out"
   ok "$out  (passwords, hashes and the cluster key are masked - review before sharing)"
 }
 completion_script() {
@@ -219,7 +219,7 @@ _vexor() {
       notify)  words="status test send fail warn ok info" ;;
       login)   words="dashboard indexer api enroll kibana elasticsearch logstash grafana portainer n8n console wazuh elk --json" ;;
       update)  words="check apply rollback images latest --no-backup --force" ;;
-      volumes) words="ls orphans backup restore rm prune --stop --out --yes" ;;
+      volumes) words="ls orphans backup restore rm prune all --stop --out --yes" ;;
       disk)    words="--json" ;;
       images)  words="prune --yes" ;;
       cert)    words="status create export-ca serve-ca import letsencrypt renew use-default internal-regen --force --email --staging --dns" ;;
@@ -242,7 +242,6 @@ _vexor() {
       ai-context) words="--print" ;;
       backup)  words="run list register restore-snapshot restore-es restore-manager restore-config --rename --indices --kibana" ;;
       retention) words="status show apply purge --older-than --agent --rule-id --sca --query --index --dry-run --compact" ;;
-      volumes) words="ls backup restore rm prune all --stop --out" ;;
       reset)   words="containers data full purge" ;;
       daemon)  words="install uninstall status logs" ;;
       doctor)  words="--fix" ;;
@@ -410,7 +409,7 @@ migrate_shuffle_images() {
   else say "kept - remove them later with: vexor migrate --yes"; fi
 }
 cmd_migrate() {
-  case "${1:-}" in ""|--yes|-y) ;; *) die "usage: vexor migrate [--yes]" ;; esac
+  case "${1:-}" in "") ;; *) die "usage: vexor migrate [--yes]" ;; esac
   [ -f "$ENV_FILE" ] || die ".env not found - nothing to migrate (new installs use project $(project_target))"
   docker_ok || die "Docker daemon is not running"
   local from to was=0 rc

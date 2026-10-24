@@ -212,6 +212,11 @@ Service names: master worker worker2 worker3 indexer1 indexer2 indexer3 dashboar
 EOF
 }
 
+is_info_cmd() {                # help/version/completion: no root needed, nothing logged (used twice in main)
+  case "$1" in help|version|--version|-v|completion) return 0 ;; esac
+  return 1
+}
+
 main() {
   local args=() a cmd=""
   for a in "$@"; do
@@ -230,19 +235,15 @@ main() {
   cmd="${cmd:-help}"
   setup_colors
 
-  case "$cmd" in
-    help|version|--version|-v|completion) ;;
-    *)
-      if [ "$(id -u)" -ne 0 ]; then
-        command -v sudo >/dev/null || die "run as root"
-        exec sudo -E "$SELF" "$@"
-      fi ;;
-  esac
+  if ! is_info_cmd "$cmd" && [ "$(id -u)" -ne 0 ]; then
+    command -v sudo >/dev/null || die "run as root"
+    exec sudo -E "$SELF" "$@"
+  fi
   RUN_TMP="$(mktemp -d /tmp/vexor.XXXXXX)"; trap 'spin_stop; rm -rf "$RUN_TMP"' EXIT
   if [ -f "$ENV_FILE" ] && [ "$(id -u)" -eq 0 ] && [[ "$cmd" != help && "$cmd" != completion ]]; then
     project_resolve; ensure_env_defaults >/dev/null; env_drop_legacy >/dev/null; migrate_layout
-    case "$cmd" in   # action history (feeds ai-context); read-only commands are not logged
-      help|version|--version|-v|completion|status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check|suricata|zeek|json|plan|login|logins|creds|disk|uninstall) ;;
+    is_info_cmd "$cmd" || case "$cmd" in   # action history (feeds ai-context); read-only commands are not logged
+      status|st|ps|health|info|urls|logs|log|motd|reminders|ai-context|indexer|ix|api|cluster|watchdog|autoheal|health-check|suricata|zeek|json|plan|login|logins|creds|disk|uninstall) ;;
       wazuh) [[ "${args[1]:-}" =~ ^(put|save|rm|remove|delete|restore|add|del|edit|set|custom)$ ]] && { mkdir -p "$STATE_DIR"; echo "$(ts) wazuh ${args[*]:0:3}" | mask_secrets >> "$HISTORY_FILE"; } ;;
       doctor|troubleshoot|check) [ "${args[0]:-}" = --fix ] && echo "$(ts) doctor --fix" >> "$HISTORY_FILE" ;;
       proxy|proxies|routes) [[ "${args[0]:-ls}" =~ ^(ls|list|status|show|cert-file)$ ]] || { mkdir -p "$STATE_DIR"; echo "$(ts) proxy ${args[*]:0:3}" >> "$HISTORY_FILE"; } ;;
