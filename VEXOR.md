@@ -1,6 +1,6 @@
 # vexor: command reference
 
-`vexor` is one bash script that manages the whole stack described in [README.md](README.md): Wazuh, ELK, n8n, Suricata, Zeek, Grafana and Portainer. It handles setup, what runs, alert forwarding between the stacks, certificates, passwords, agents, upgrades, backups, troubleshooting and self-healing.
+`vexor` is a bash CLI (the `vexor` entry script plus its modules in `lib/`) that manages the whole stack described in [README.md](README.md): Wazuh, ELK, n8n, Suricata, Zeek, Grafana and Portainer. It handles setup, what runs, alert forwarding between the stacks, certificates, passwords, agents, upgrades, backups, troubleshooting and self-healing.
 
 ```
 vexor <command> [subcommand] [options]
@@ -19,7 +19,7 @@ vexor <command> [subcommand] [options]
 
 ## Installation
 
-The script lives in the repository root, next to `docker-compose.yml` and `.env`:
+The script lives in the repository root, next to `docker-compose.yml` and `.env`, with its code in `lib/` beside it (keep the two together; `/usr/local/bin/vexor` is a symlink, so `lib/` is found through it):
 
 ```bash
 sudo ./vexor install          # first time; creates .env from .env.example
@@ -417,11 +417,11 @@ vexor --no-color doctor > /tmp/doctor.txt || mail -s "Vexor doctor failed" admin
 
 ## Extending vexor
 
-The script is divided into sections, each starting with a `# ====` header.
+`vexor` only resolves its own location and sources `lib/01-core.sh` .. `lib/20-main.sh` in a fixed order (the list is in `vexor`); the modules are not executable on their own. Inside each module the code is divided into sections, each starting with a `# ====` header. A new module goes into both lists in `vexor` (the existence check and the `source` lines with their `# shellcheck source=` hint).
 
 - **A doctor check:** add it to `cmd_doctor`, `elk_doctor` or `n8n_doctor` with `d_pass`, `d_warn` or `d_fail "<message>" "<hint>"`. If a safe repair exists, add `d_fix "<what>" && <repair>`.
 - **A command:** add `cmd_<name>()`, a line in the `case` of `main`, a line in `cmd_help` and the words in `completion_script`. Call `take_lock` when the command changes anything.
 - **A `.env` key:** add it to `ensure_env_defaults` and `.env.example` (never with a comment after an empty value).
 - **A tool:** add it to `TOOLS`, a service with its own profile in `ensure_tools_compose`, and its wiring in `tools_prepare` / `tools_post`.
 
-CI runs `bash -n`, ShellCheck, compose validation for every SOC mode and a secret scan on each push. Test anything that changes a cluster on a sandbox copy with its own `COMPOSE_PROJECT_NAME` and ports.
+CI runs `bash -n` and ShellCheck on `vexor` and `lib/*.sh`, compose validation for every SOC mode and a secret scan on each push. Test anything that changes a cluster on a sandbox copy with its own `COMPOSE_PROJECT_NAME` and ports.
